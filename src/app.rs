@@ -54,6 +54,7 @@ use crate::settings::Settings;
 use crate::ui::preferences::show_preferences;
 use crate::ui::rebase_dialog::show_rebase_dialog;
 use crate::ui::status_view::{StatusView, StatusViewInput, StatusViewOutput};
+use crate::ui::update_check_dialog::{CheckResult, show_update_check_dialog};
 use crate::update_worker::{SimulationScenario, UpdateEvent, UpdateWorker, run_simulated};
 
 /// Application-level state.
@@ -107,6 +108,12 @@ pub struct App {
 pub enum AppMsg {
     /// User clicked "Update" — optionally bypass the metered-network confirmation.
     StartUpdate { skip_metered_check: bool },
+    /// User clicked "Check" on the main view — open the check dialog.
+    OpenCheckDialog,
+    /// The check dialog completed with results.
+    CheckComplete(CheckResult),
+    /// User clicked "Install all" in the check dialog.
+    InstallFromCheck,
     /// A line of output arrived from the subprocess.
     OutputLine(String),
     /// The subprocess exited successfully.
@@ -221,6 +228,7 @@ impl SimpleComponent for App {
                     StatusViewOutput::CancelUpdate => AppMsg::CancelUpdate,
                     StatusViewOutput::Reboot => AppMsg::RequestReboot,
                     StatusViewOutput::ShowRebase => AppMsg::ShowRebaseDialog,
+                    StatusViewOutput::OpenCheckDialog => AppMsg::OpenCheckDialog,
                 });
 
         let toast_overlay = adw::ToastOverlay::new();
@@ -477,6 +485,50 @@ impl SimpleComponent for App {
                             }
                         }
                     });
+                });
+            }
+
+            AppMsg::OpenCheckDialog => {
+                if let Some(root) = self.status_view.widget().root() {
+                    if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
+                        let result_sender = sender.input_sender().clone();
+                        let install_sender = sender.input_sender().clone();
+                        show_update_check_dialog(
+                            window,
+                            self.settings.dev_mode,
+                            self.sim_scenario,
+                            move |result| {
+                                result_sender.emit(AppMsg::CheckComplete(result));
+                            },
+                            move || {
+                                install_sender.emit(AppMsg::InstallFromCheck);
+                            },
+                        );
+                    }
+                }
+            }
+
+            AppMsg::CheckComplete(result) => {
+                tracing::info!(
+                    system_update = result.system_update,
+                    sources = result.sources_with_updates,
+                    "Update check completed"
+                );
+                if result.sources_with_updates > 0 {
+                    self.preflight_status = PreflightStatus::UpdateAvailable;
+                } else {
+                    self.preflight_status = PreflightStatus::UpToDate;
+                }
+                self.status_view.emit(StatusViewInput::PreflightResult(
+                    self.preflight_status.clone(),
+                ));
+            }
+
+            AppMsg::InstallFromCheck => {
+                // Trigger a full update (same as StartUpdate but skip metered check since
+                // user explicitly chose to install from the dialog).
+                sender.input(AppMsg::StartUpdate {
+                    skip_metered_check: true,
                 });
             }
 

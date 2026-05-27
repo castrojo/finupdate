@@ -8,4 +8,5 @@ pub mod preferences;
 pub mod rebase_dialog;
 pub mod segmented_progress;
 pub mod status_view;
+pub mod update_check_dialog;
 pub mod update_list;

@@ -2,18 +2,19 @@
 //!
 //! Pattern: State-driven view switching
 //! Uses a `gtk::Stack` to switch between different visual states:
-//! - Idle: AdwStatusPage with "ready to update" messaging + last update time + image badge
+//! - Idle: Card-based overview with hero, update banner, and settings actions
 //! - Updating: Progress indicator + image badge + UpdateList + live log + timer + cancel
 //! - Complete: Success status page with reboot option
 //! - UpToDate: "You're already up to date" status page
 //! - Error: Error status page with retry option
 
-use gtk::prelude::*;
+use adw::prelude::*;
 use relm4::prelude::*;
+use std::process::Command;
 use std::time::Instant;
 
 use crate::app::{AppState, PreflightStatus};
-use crate::config;
+use crate::settings::Settings;
 use crate::ui::log_view::{LogView, LogViewInput};
 use crate::ui::segmented_progress::{SegmentedProgress, same_segment};
 use crate::ui::update_list::{UpdateList, UpdateListInput};
@@ -31,6 +32,8 @@ pub enum StatusViewInput {
     TimerTick,
     /// Result of the startup preflight update check.
     PreflightResult(PreflightStatus),
+    /// Dismiss the staged reboot banner.
+    DismissBanner,
     /// Copy log to clipboard.
     CopyLog,
 }
@@ -46,6 +49,8 @@ pub enum StatusViewOutput {
     Reboot,
     /// User wants to open the rollback/rebase dialog.
     ShowRebase,
+    /// User wants to open the update check dialog.
+    OpenCheckDialog,
 }
 
 /// The status view model.
@@ -63,8 +68,24 @@ pub struct StatusView {
     log_text: String,
     /// Toast overlay for copy confirmation.
     toast_overlay: adw::ToastOverlay,
-    /// Reference to idle page for dynamic description.
-    idle_page: adw::StatusPage,
+    /// Root widget for the idle page.
+    idle_page: gtk::ScrolledWindow,
+    /// Hero row showing the current image summary.
+    hero_row: adw::ActionRow,
+    /// Status pill shown in the hero row suffix.
+    status_pill: gtk::Label,
+    /// Banner group shown when action is needed.
+    update_banner_group: adw::PreferencesGroup,
+    /// Banner row with dynamic title/subtitle.
+    banner_title_row: adw::ActionRow,
+    /// Banner install button.
+    banner_install_btn: gtk::Button,
+    /// Banner restart button.
+    banner_restart_btn: gtk::Button,
+    /// Banner discard button.
+    banner_discard_btn: gtk::Button,
+    /// Automatic updates toggle in the settings card.
+    auto_update_switch: gtk::Switch,
     /// Preflight check result.
     preflight_status: PreflightStatus,
     /// Cached last-update text.
@@ -75,32 +96,84 @@ pub struct StatusView {
     seg_progress: SegmentedProgress,
     /// The module key that is currently active (drives segment coloring).
     active_module: Option<&'static str>,
+    /// Whether an update has been staged and needs a reboot.
+    reboot_pending: bool,
 }
 
 impl StatusView {
-    /// Build the idle page description from current state.
-    fn idle_description(&self) -> String {
+    fn hero_title(&self) -> String {
+        self.image_info
+            .clone()
+            .unwrap_or_else(|| "System Image".to_string())
+    }
+
+    fn idle_subtitle(&self) -> String {
         let mut parts = Vec::new();
 
-        match &self.preflight_status {
-            PreflightStatus::UpdateAvailable => parts.push("Update available".to_string()),
-            PreflightStatus::UpToDate => parts.push("System is up to date".to_string()),
-            _ => parts.push("Your system is managed by uupd".to_string()),
+        if self.reboot_pending {
+            parts.push("Restart pending".to_string());
+        } else {
+            match self.preflight_status {
+                PreflightStatus::UpdateAvailable => {
+                    parts.push("Updates are ready to install".to_string())
+                }
+                PreflightStatus::UpToDate => parts.push("System image is current".to_string()),
+                PreflightStatus::Checking => parts.push("Checking update status".to_string()),
+                PreflightStatus::Unknown => {}
+            }
         }
 
         if let Some(ref text) = self.last_update_text {
             parts.push(text.clone());
         }
 
-        if let Some(ref info) = self.image_info {
-            parts.push(info.clone());
+        if parts.is_empty() {
+            parts.push("Your system is managed by uupd".to_string());
         }
 
-        parts.join("\n")
+        parts.join(" · ")
     }
 
     fn refresh_idle_description(&self) {
-        self.idle_page.set_description(Some(&self.idle_description()));
+        self.hero_row.set_title(&self.hero_title());
+        self.hero_row.set_subtitle(&self.idle_subtitle());
+
+        for class in ["accent", "success", "warning", "dim-label"] {
+            self.status_pill.remove_css_class(class);
+        }
+
+        let (pill_text, pill_class) = if self.reboot_pending {
+            ("Staged", "warning")
+        } else {
+            match self.preflight_status {
+                PreflightStatus::UpdateAvailable => ("Update ready", "accent"),
+                PreflightStatus::UpToDate => ("Up to date", "success"),
+                PreflightStatus::Checking => ("Checking", "dim-label"),
+                PreflightStatus::Unknown => ("Ready", "dim-label"),
+            }
+        };
+        self.status_pill.set_label(pill_text);
+        self.status_pill.add_css_class(pill_class);
+
+        if self.reboot_pending {
+            self.update_banner_group.set_visible(true);
+            self.banner_title_row.set_title("Reboot to finish updating");
+            self.banner_title_row
+                .set_subtitle("Restart now to boot into the updated image.");
+            self.banner_install_btn.set_visible(false);
+            self.banner_restart_btn.set_visible(true);
+            self.banner_discard_btn.set_visible(true);
+        } else if matches!(self.preflight_status, PreflightStatus::UpdateAvailable) {
+            self.update_banner_group.set_visible(true);
+            self.banner_title_row.set_title("Update available");
+            self.banner_title_row
+                .set_subtitle("A new system image is ready to install.");
+            self.banner_install_btn.set_visible(true);
+            self.banner_restart_btn.set_visible(false);
+            self.banner_discard_btn.set_visible(false);
+        } else {
+            self.update_banner_group.set_visible(false);
+        }
     }
 }
 
@@ -117,7 +190,7 @@ impl SimpleComponent for StatusView {
             set_transition_duration: 200,
 
             // ─── Idle page ──────────────────────────────────────────────
-            add_child = &model.idle_page.clone() -> adw::StatusPage {} -> {
+            add_child = &model.idle_page.clone() -> gtk::ScrolledWindow {} -> {
                 set_name: "idle",
             },
 
@@ -229,36 +302,136 @@ impl SimpleComponent for StatusView {
         let toast_overlay = adw::ToastOverlay::new();
 
         // ── Idle page (built imperatively) ──────────────────────────────
-        let idle_page = adw::StatusPage::builder()
-            .icon_name(config::APP_ID)
-            .title("System Update")
-            .build();
+        let initial_image_info = read_image_info();
+        let initial_last_update = get_last_update_time();
+        let auto_updates_enabled = read_auto_updates_enabled();
 
-        let idle_buttons = gtk::Box::new(gtk::Orientation::Vertical, 8);
-        idle_buttons.set_halign(gtk::Align::Center);
+        let idle_page = gtk::ScrolledWindow::new();
+        idle_page.set_hscrollbar_policy(gtk::PolicyType::Never);
+        idle_page.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+        idle_page.set_vexpand(true);
 
-        let check_btn = gtk::Button::builder()
-            .label("Check for Updates")
+        let idle_clamp = adw::Clamp::new();
+        idle_clamp.set_maximum_size(600);
+        idle_clamp.set_tightening_threshold(400);
+        idle_page.set_child(Some(&idle_clamp));
+
+        let idle_content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        idle_content.set_margin_start(24);
+        idle_content.set_margin_end(24);
+        idle_content.set_margin_top(24);
+        idle_content.set_margin_bottom(24);
+        idle_clamp.set_child(Some(&idle_content));
+
+        let hero_group = adw::PreferencesGroup::new();
+        let hero_row = adw::ActionRow::builder()
+            .title(initial_image_info.as_deref().unwrap_or("System Image"))
+            .subtitle(
+                initial_last_update
+                    .as_deref()
+                    .unwrap_or("Your system is managed by uupd"),
+            )
             .build();
+        hero_row.set_activatable(false);
+        let hero_icon = gtk::Image::from_icon_name("drive-harddisk-symbolic");
+        hero_icon.set_pixel_size(32);
+        hero_row.add_prefix(&hero_icon);
+
+        let status_pill = gtk::Label::new(Some("Checking"));
+        status_pill.add_css_class("caption");
+        status_pill.add_css_class("pill");
+        status_pill.add_css_class("dim-label");
+        status_pill.set_valign(gtk::Align::Center);
+        hero_row.add_suffix(&status_pill);
+        hero_group.add(&hero_row);
+        idle_content.append(&hero_group);
+
+        let update_banner_group = adw::PreferencesGroup::new();
+        let banner_title_row = adw::ActionRow::builder()
+            .title("Update available")
+            .subtitle("A new system image is ready to install.")
+            .build();
+        banner_title_row.set_activatable(false);
+        let banner_icon = gtk::Image::from_icon_name("software-update-available-symbolic");
+        banner_icon.set_pixel_size(24);
+        banner_title_row.add_prefix(&banner_icon);
+
+        let banner_action_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let banner_install_btn = gtk::Button::with_label("Install");
+        banner_install_btn.add_css_class("suggested-action");
+        banner_install_btn.add_css_class("pill");
+        let install_sender = sender.output_sender().clone();
+        banner_install_btn.connect_clicked(move |_| {
+            let _ = install_sender.send(StatusViewOutput::StartUpdate);
+        });
+
+        let banner_restart_btn = gtk::Button::with_label("Restart");
+        banner_restart_btn.add_css_class("suggested-action");
+        banner_restart_btn.add_css_class("pill");
+        let restart_sender = sender.output_sender().clone();
+        banner_restart_btn.connect_clicked(move |_| {
+            let _ = restart_sender.send(StatusViewOutput::Reboot);
+        });
+
+        let banner_discard_btn = gtk::Button::with_label("Discard");
+        banner_discard_btn.add_css_class("flat");
+        let discard_sender = sender.input_sender().clone();
+        banner_discard_btn.connect_clicked(move |_| {
+            discard_sender.emit(StatusViewInput::DismissBanner);
+        });
+
+        banner_action_box.append(&banner_install_btn);
+        banner_action_box.append(&banner_restart_btn);
+        banner_action_box.append(&banner_discard_btn);
+        banner_title_row.add_suffix(&banner_action_box);
+        update_banner_group.add(&banner_title_row);
+        update_banner_group.set_visible(false);
+        idle_content.append(&update_banner_group);
+
+        let settings_group = adw::PreferencesGroup::builder().title("Settings").build();
+
+        let check_row = adw::ActionRow::builder()
+            .title("Check for updates")
+            .subtitle("System image, Flatpak, Homebrew, and Distrobox")
+            .build();
+        let check_btn = gtk::Button::with_label("Check");
         check_btn.add_css_class("suggested-action");
         check_btn.add_css_class("pill");
-        let start_sender = sender.output_sender().clone();
+        let check_sender = sender.output_sender().clone();
         check_btn.connect_clicked(move |_| {
-            let _ = start_sender.send(StatusViewOutput::StartUpdate);
+            let _ = check_sender.send(StatusViewOutput::OpenCheckDialog);
         });
+        check_row.add_suffix(&check_btn);
+        settings_group.add(&check_row);
 
-        let rebase_btn = gtk::Button::builder()
-            .label("Previous Versions…")
+        let auto_row = adw::ActionRow::builder()
+            .title("Automatic updates")
+            .subtitle("Allow uupd to run automatically on its scheduled timer")
             .build();
-        rebase_btn.add_css_class("flat");
+        let auto_update_switch = gtk::Switch::builder()
+            .active(auto_updates_enabled)
+            .valign(gtk::Align::Center)
+            .build();
+        auto_update_switch.connect_active_notify(move |switch| {
+            apply_auto_updates_setting(switch.is_active());
+        });
+        auto_row.add_suffix(&auto_update_switch);
+        settings_group.add(&auto_row);
+
+        let previous_versions_row = adw::ActionRow::builder()
+            .title("Previous Versions…")
+            .build();
+        let previous_versions_icon = gtk::Image::from_icon_name("go-next-symbolic");
+        previous_versions_icon.add_css_class("dim-label");
+        previous_versions_row.add_suffix(&previous_versions_icon);
+        previous_versions_row.set_activatable(true);
         let rebase_sender = sender.output_sender().clone();
-        rebase_btn.connect_clicked(move |_| {
+        previous_versions_row.connect_activated(move |_| {
             let _ = rebase_sender.send(StatusViewOutput::ShowRebase);
         });
+        settings_group.add(&previous_versions_row);
 
-        idle_buttons.append(&check_btn);
-        idle_buttons.append(&rebase_btn);
-        idle_page.set_child(Some(&idle_buttons));
+        idle_content.append(&settings_group);
 
         // Build the "updating" page content imperatively.
         let seg_progress = SegmentedProgress::new();
@@ -334,11 +507,20 @@ impl SimpleComponent for StatusView {
             log_text: String::new(),
             toast_overlay,
             idle_page,
+            hero_row,
+            status_pill,
+            update_banner_group,
+            banner_title_row,
+            banner_install_btn,
+            banner_restart_btn,
+            banner_discard_btn,
+            auto_update_switch,
             preflight_status: PreflightStatus::Checking,
-            last_update_text: get_last_update_time(),
-            image_info: read_image_info(),
+            last_update_text: initial_last_update,
+            image_info: initial_image_info,
             seg_progress,
             active_module: None,
+            reboot_pending: false,
         };
 
         let widgets = view_output!();
@@ -379,12 +561,16 @@ impl SimpleComponent for StatusView {
                         self.update_list.emit(UpdateListInput::Reset);
                         self.seg_progress.reset();
                         self.active_module = None;
+                        self.reboot_pending = false;
                     }
                     AppState::Complete => {
                         self.update_start = None;
                         self.update_list.emit(UpdateListInput::MarkAllComplete);
                         self.seg_progress.mark_all_complete();
                         self.active_module = None;
+                        self.preflight_status = PreflightStatus::UpToDate;
+                        self.reboot_pending = true;
+                        self.refresh_idle_description();
                     }
                     AppState::Error(_) => {
                         self.update_start = None;
@@ -396,10 +582,14 @@ impl SimpleComponent for StatusView {
                     }
                     AppState::UpToDate => {
                         self.update_start = None;
+                        self.preflight_status = PreflightStatus::UpToDate;
+                        self.reboot_pending = false;
+                        self.refresh_idle_description();
                     }
                     AppState::Idle => {
                         self.update_start = None;
                         self.last_update_text = get_last_update_time();
+                        self.image_info = read_image_info();
                         self.refresh_idle_description();
                     }
                 }
@@ -468,6 +658,12 @@ impl SimpleComponent for StatusView {
                 self.refresh_idle_description();
             }
 
+            StatusViewInput::DismissBanner => {
+                self.reboot_pending = false;
+                self.preflight_status = PreflightStatus::UpToDate;
+                self.refresh_idle_description();
+            }
+
             StatusViewInput::CopyLog => {
                 if let Some(display) = gtk::gdk::Display::default() {
                     let clipboard = display.clipboard();
@@ -500,6 +696,56 @@ fn extract_module_key(line: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn read_auto_updates_enabled() -> bool {
+    let output = if crate::update_worker::is_flatpak() {
+        Command::new("flatpak-spawn")
+            .args(["--host", "systemctl", "is-enabled", "uupd.timer"])
+            .output()
+    } else {
+        Command::new("systemctl")
+            .args(["is-enabled", "uupd.timer"])
+            .output()
+    };
+
+    match output {
+        Ok(output) => match String::from_utf8_lossy(&output.stdout).trim() {
+            "enabled" => true,
+            "disabled" => false,
+            _ => Settings::load().auto_updates,
+        },
+        Err(_) => Settings::load().auto_updates,
+    }
+}
+
+fn apply_auto_updates_setting(active: bool) {
+    let mut settings = Settings::load();
+    settings.auto_updates = active;
+    settings.save();
+
+    std::thread::spawn(move || {
+        let args = if active {
+            ["enable", "--now", "uupd.timer"]
+        } else {
+            ["disable", "--now", "uupd.timer"]
+        };
+
+        let status = if crate::update_worker::is_flatpak() {
+            Command::new("flatpak-spawn")
+                .args(["--host", "pkexec", "systemctl"])
+                .args(args)
+                .status()
+        } else {
+            Command::new("pkexec").arg("systemctl").args(args).status()
+        };
+
+        match status {
+            Ok(status) if status.success() => {}
+            Ok(status) => tracing::warn!("Failed to toggle uupd.timer: {}", status),
+            Err(err) => tracing::warn!("Failed to toggle uupd.timer: {}", err),
+        }
+    });
 }
 
 /// Read the current OS image name and variant from `/etc/os-release`.

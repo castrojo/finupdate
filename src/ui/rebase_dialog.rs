@@ -153,9 +153,8 @@ fn start_version_fetch(
                     stack.set_visible_child_name("error");
                 }
                 FetchResult::Err(_) => {
-                    error_page.set_description(Some(
-                        "Check your internet connection and try again.",
-                    ));
+                    error_page
+                        .set_description(Some("Check your internet connection and try again."));
                     stack.set_visible_child_name("error");
                 }
             }
@@ -772,7 +771,9 @@ fn run_rebase_simulated(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog
     glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
         let done_page = adw::StatusPage::builder()
             .title("Rebase Complete (simulated)")
-            .description("Developer mode — no changes were made.\nIn production, a restart would be needed.")
+            .description(
+                "Developer mode — no changes were made.\nIn production, a restart would be needed.",
+            )
             .icon_name("object-select-symbolic")
             .build();
         let close_btn = gtk::Button::builder()
