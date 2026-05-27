@@ -10,7 +10,7 @@
 //! This module demonstrates the canonical Bluefin app window structure.
 
 use adw::prelude::*;
-use relm4::actions::{RelmAction, RelmActionGroup};
+use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
 use relm4::prelude::*;
 
 use crate::config;
@@ -42,6 +42,8 @@ pub struct App {
     status_view: Controller<StatusView>,
     /// Handle to cancel a running update (sends kill signal to subprocess).
     cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Reference to header bar for dynamic subtitle updates.
+    header_bar: adw::HeaderBar,
 }
 
 /// Messages the App component can receive.
@@ -58,9 +60,15 @@ pub enum AppMsg {
     /// User wants to cancel the running update.
     CancelUpdate,
     /// User wants to reboot the system.
-    Reboot,
+    RequestReboot,
+    /// User confirmed reboot in the dialog.
+    ConfirmReboot,
     /// User requested the About dialog.
     ShowAbout,
+    /// Quit the application.
+    Quit,
+    /// Window close was requested — check if we should allow it.
+    CloseRequest,
 }
 
 #[relm4::component(pub)]
@@ -70,8 +78,6 @@ impl SimpleComponent for App {
     type Output = ();
 
     view! {
-        // AdwApplicationWindow is required (not gtk::ApplicationWindow) for
-        // libadwaita adaptive features and proper style inheritance.
         #[root]
         adw::ApplicationWindow {
             set_title: Some("System Update"),
@@ -83,8 +89,8 @@ impl SimpleComponent for App {
             // AdwToolbarView is the modern GNOME pattern for header + content layout.
             // It handles the header bar integration with scrolling content automatically.
             adw::ToolbarView {
-                // Top bar
-                add_top_bar = &adw::HeaderBar {
+                // Top bar — store reference for dynamic subtitle changes.
+                add_top_bar = &model.header_bar.clone() -> adw::HeaderBar {
                     pack_end = &gtk::MenuButton {
                         set_icon_name: "open-menu-symbolic",
                         set_tooltip_text: Some("Main Menu"),
@@ -105,6 +111,8 @@ impl SimpleComponent for App {
     menu! {
         main_menu: {
             "_About Finpilot" => AboutAction,
+            "_Keyboard Shortcuts" => ShortcutsAction,
+            "_Quit" => QuitAction,
         }
     }
 
@@ -120,10 +128,11 @@ impl SimpleComponent for App {
             .forward(sender.input_sender(), |output| match output {
                 StatusViewOutput::StartUpdate => AppMsg::StartUpdate,
                 StatusViewOutput::CancelUpdate => AppMsg::CancelUpdate,
-                StatusViewOutput::Reboot => AppMsg::Reboot,
+                StatusViewOutput::Reboot => AppMsg::RequestReboot,
             });
 
         let toast_overlay = adw::ToastOverlay::new();
+        let header_bar = adw::HeaderBar::new();
 
         let model = App {
             state: AppState::Idle,
@@ -131,11 +140,12 @@ impl SimpleComponent for App {
             toast_overlay: toast_overlay.clone(),
             status_view,
             cancel_tx: None,
+            header_bar,
         };
 
         let widgets = view_output!();
 
-        // Register the About action using relm4's action system.
+        // ─── Actions ────────────────────────────────────────────────────
         let about_action: RelmAction<AboutAction> = {
             let sender = sender.input_sender().clone();
             RelmAction::new_stateless(move |_| {
@@ -143,9 +153,39 @@ impl SimpleComponent for App {
             })
         };
 
+        let quit_action: RelmAction<QuitAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.emit(AppMsg::Quit);
+            })
+        };
+
+        let shortcuts_action: RelmAction<ShortcutsAction> = {
+            let root_clone = root.clone();
+            RelmAction::new_stateless(move |_| {
+                show_shortcuts_window(&root_clone);
+            })
+        };
+
         let mut group = RelmActionGroup::<WindowActionGroup>::new();
         group.add_action(about_action);
+        group.add_action(quit_action);
+        group.add_action(shortcuts_action);
         group.register_for_widget(&root);
+
+        // ─── Keyboard Shortcuts ─────────────────────────────────────────
+        let app = relm4::main_application();
+        app.set_accelerators_for_action::<QuitAction>(&["<primary>q"]);
+        app.set_accelerators_for_action::<ShortcutsAction>(&["<primary>question"]);
+
+        // ─── Close Request Handler ──────────────────────────────────────
+        // Intercept window close to warn if an update is in progress.
+        let close_sender = sender.input_sender().clone();
+        root.connect_close_request(move |_| {
+            close_sender.emit(AppMsg::CloseRequest);
+            // Inhibit default close — we handle it in update().
+            gtk::glib::Propagation::Stop
+        });
 
         ComponentParts { model, widgets }
     }
@@ -161,6 +201,9 @@ impl SimpleComponent for App {
                 tracing::info!("Starting system update via uupd");
                 self.state = AppState::Updating;
                 self.log_lines.clear();
+
+                // Update header subtitle to indicate activity.
+                self.update_subtitle();
 
                 // Forward state to the child view.
                 self.status_view
@@ -229,6 +272,7 @@ impl SimpleComponent for App {
                 tracing::info!("System update completed successfully");
                 self.state = AppState::Complete;
                 self.cancel_tx = None;
+                self.update_subtitle();
                 self.status_view
                     .emit(StatusViewInput::StateChanged(AppState::Complete));
 
@@ -243,6 +287,7 @@ impl SimpleComponent for App {
                 tracing::error!("System update failed: {}", err);
                 self.state = AppState::Error(err.clone());
                 self.cancel_tx = None;
+                self.update_subtitle();
                 self.status_view
                     .emit(StatusViewInput::StateChanged(AppState::Error(err)));
             }
@@ -254,9 +299,35 @@ impl SimpleComponent for App {
                 }
             }
 
-            AppMsg::Reboot => {
-                tracing::info!("User requested system reboot");
-                // Use the same sandbox-aware pattern to invoke systemctl reboot.
+            AppMsg::RequestReboot => {
+                // HIG: Destructive actions require confirmation.
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Restart System?")
+                    .body("The system will restart to apply updates. Save any open work before continuing.")
+                    .build();
+
+                dialog.add_response("cancel", "_Cancel");
+                dialog.add_response("restart", "_Restart");
+                dialog.set_response_appearance("restart", adw::ResponseAppearance::Destructive);
+                dialog.set_default_response(Some("cancel"));
+                dialog.set_close_response("cancel");
+
+                let reboot_sender = sender.input_sender().clone();
+                dialog.connect_response(None, move |_, response| {
+                    if response == "restart" {
+                        reboot_sender.emit(AppMsg::ConfirmReboot);
+                    }
+                });
+
+                if let Some(root) = self.status_view.widget().root() {
+                    if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
+                        dialog.present(Some(window));
+                    }
+                }
+            }
+
+            AppMsg::ConfirmReboot => {
+                tracing::info!("User confirmed system reboot");
                 std::thread::spawn(|| {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -298,14 +369,111 @@ impl SimpleComponent for App {
 
                 if let Some(root) = self.status_view.widget().root() {
                     if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
-                        about.present(window);
+                        about.present(Some(window));
                     }
+                }
+            }
+
+            AppMsg::Quit => {
+                // If update in progress, treat like close request (ask first).
+                if self.state == AppState::Updating {
+                    sender.input(AppMsg::CloseRequest);
+                } else {
+                    relm4::main_application().quit();
+                }
+            }
+
+            AppMsg::CloseRequest => {
+                if self.state == AppState::Updating {
+                    // Warn user that an update is running.
+                    let dialog = adw::AlertDialog::builder()
+                        .heading("Update in Progress")
+                        .body("An update is currently running. Closing now may leave your system in an inconsistent state.")
+                        .build();
+
+                    dialog.add_response("cancel", "_Keep Waiting");
+                    dialog.add_response("close", "_Close Anyway");
+                    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "close" {
+                            relm4::main_application().quit();
+                        }
+                    });
+
+                    if let Some(root) = self.status_view.widget().root() {
+                        if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
+                            dialog.present(Some(window));
+                        }
+                    }
+                } else {
+                    // Not updating — close immediately.
+                    relm4::main_application().quit();
                 }
             }
         }
     }
 }
 
+impl App {
+    /// Update the header bar subtitle to reflect current state.
+    fn update_subtitle(&self) {
+        let subtitle = match &self.state {
+            AppState::Idle => None,
+            AppState::Updating => Some("Updating…"),
+            AppState::Complete => Some("Update complete"),
+            AppState::Error(_) => Some("Update failed"),
+        };
+        // AdwHeaderBar doesn't have subtitle — set window title instead.
+        if let Some(root) = self.status_view.widget().root() {
+            if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
+                let title = match subtitle {
+                    Some(s) => format!("System Update — {}", s),
+                    None => "System Update".to_string(),
+                };
+                window.set_title(Some(&title));
+            }
+        }
+    }
+}
+
+/// Show the keyboard shortcuts window.
+fn show_shortcuts_window(window: &adw::ApplicationWindow) {
+    let shortcuts = gtk::ShortcutsWindow::builder()
+        .transient_for(window)
+        .modal(true)
+        .build();
+
+    let section = gtk::ShortcutsSection::builder()
+        .section_name("shortcuts")
+        .visible(true)
+        .build();
+
+    let group = gtk::ShortcutsGroup::builder()
+        .title("Application")
+        .build();
+
+    let shortcut_quit = gtk::ShortcutsShortcut::builder()
+        .title("Quit")
+        .accelerator("<Primary>q")
+        .build();
+
+    let shortcut_shortcuts = gtk::ShortcutsShortcut::builder()
+        .title("Keyboard Shortcuts")
+        .accelerator("<Primary>question")
+        .build();
+
+    group.add_shortcut(&shortcut_quit);
+    group.add_shortcut(&shortcut_shortcuts);
+    section.add_group(&group);
+    shortcuts.add_section(&section);
+    shortcuts.set_visible(true);
+}
+
 // Action group and actions for the window-level menu.
 relm4::new_action_group!(WindowActionGroup, "win");
 relm4::new_stateless_action!(AboutAction, WindowActionGroup, "about");
+relm4::new_stateless_action!(QuitAction, WindowActionGroup, "quit");
+relm4::new_stateless_action!(ShortcutsAction, WindowActionGroup, "show-shortcuts");

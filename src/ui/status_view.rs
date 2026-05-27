@@ -213,10 +213,13 @@ impl SimpleComponent for StatusView {
         // Set initial visible page.
         root.set_visible_child_name("idle");
 
-        // Start a pulse timer for the progress bar.
+        // Pulse the progress bar only when updating page is visible.
         let progress_bar = widgets.progress_bar.clone();
+        let stack_ref = root.clone();
         gtk::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            progress_bar.pulse();
+            if stack_ref.visible_child_name().as_deref() == Some("updating") {
+                progress_bar.pulse();
+            }
             gtk::glib::ControlFlow::Continue
         });
 

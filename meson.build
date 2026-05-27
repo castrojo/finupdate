@@ -11,10 +11,10 @@ gnome = import('gnome')
 
 base_id = 'org.projectbluefin.Finpilot'
 
-dependency('glib-2.0', version: '>= 2.76')
-dependency('gio-2.0', version: '>= 2.76')
-dependency('gtk4', version: '>= 4.14')
-dependency('libadwaita-1', version: '>= 1.5')
+dependency('glib-2.0', version: '>= 2.80')
+dependency('gio-2.0', version: '>= 2.80')
+dependency('gtk4', version: '>= 4.16')
+dependency('libadwaita-1', version: '>= 1.7')
 
 cargo = find_program('cargo', required: true)
 desktop_file_validate = find_program('desktop-file-validate', required: false)

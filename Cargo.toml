@@ -1,24 +1,24 @@
 [package]
 name = "finpilot"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "A system update frontend for uupd — part of the Bluefin utility suite"
 license = "MIT"
 authors = ["Project Bluefin Contributors"]
 
-# Minimum Rust version for gtk4-rs 0.8.x compatibility
-rust-version = "1.75"
+rust-version = "1.85"
 
 [dependencies]
-# GTK4 Rust bindings — v0.8.x series maps to GTK 4.14+ / GNOME 46+
-gtk = { version = "0.8", package = "gtk4" }
+# GTK4 Rust bindings — v0.11.x maps to GTK 4.16+ / GNOME 47+
+# v4_16 feature enables modern APIs (ShortcutsWindow builder methods, etc.)
+gtk = { version = "0.11", package = "gtk4", features = ["v4_16"] }
 
-# libadwaita bindings — v0.6.x maps to libadwaita 1.5+ / GNOME 46+
-adw = { version = "0.6", package = "libadwaita", features = ["v1_5"] }
+# libadwaita bindings — v0.9.x maps to libadwaita 1.7+ / GNOME 47+
+adw = { version = "0.9", package = "libadwaita", features = ["v1_7"] }
 
 # Relm4 — component-based reactive framework for GTK4
 # The "libadwaita" feature replaces gtk::Application with adw::Application
-relm4 = { version = "0.8", features = ["libadwaita"] }
+relm4 = { version = "0.11", features = ["libadwaita"] }
 
 # Tokio for async subprocess management
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "macros"] }
