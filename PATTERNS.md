@@ -56,11 +56,39 @@ data/
 └── org.projectbluefin.<AppName>.metainfo.xml
 ```
 
-### Development Container
+### Build System (Meson + Flatpak)
 
-Use the `.devcontainer/` setup for reproducible builds:
-- Base: `mcr.microsoft.com/devcontainers/rust:latest`
-- Post-create: install `libgtk-4-dev` and `libadwaita-1-dev`
+Follow the standard GNOME Flatpak convention:
+
+```
+meson.build                   — top-level project definition + deps
+meson_options.txt             — build profile option
+src/meson.build               — cargo build integration via custom_target
+data/meson.build              — install desktop, metainfo, icons
+build-aux/
+├── org.projectbluefin.<App>.json       — release Flatpak manifest
+├── org.projectbluefin.<App>.Devel.json — dev Flatpak manifest
+└── dist-vendor.sh                      — vendor deps for `meson dist`
+```
+
+**Build & run locally (Flatpak):**
+```bash
+# One-time setup
+flatpak install flathub org.gnome.Sdk//47 org.gnome.Platform//47
+flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable//24.08
+
+# Build and run
+flatpak-builder --user --install --force-clean build \
+  build-aux/org.projectbluefin.Finpilot.Devel.json
+flatpak run org.projectbluefin.Finpilot.Devel
+```
+
+**Build without Flatpak (direct meson):**
+```bash
+meson setup _build
+meson compile -C _build
+./_build/src/finpilot
+```
 
 ---
 

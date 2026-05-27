@@ -11,14 +11,11 @@
 //! - libadwaita styles are loaded before any widgets are created
 
 mod app;
+mod config;
 mod update_worker;
 mod ui;
 
 use app::App;
-
-/// Application ID following GNOME conventions: reverse-DNS with org.projectbluefin prefix.
-/// Must match the .desktop file and metainfo basename exactly.
-const APP_ID: &str = "org.projectbluefin.Finpilot";
 
 fn main() {
     // Initialize structured logging — respects RUST_LOG env var.
@@ -30,12 +27,12 @@ fn main() {
         )
         .init();
 
-    tracing::info!("Starting Finpilot ({})", APP_ID);
+    tracing::info!("Starting Finpilot ({}) v{}", config::APP_ID, config::VERSION);
 
     // relm4::RelmApp handles:
     // - Creating the adw::Application (because we enabled the "libadwaita" feature)
     // - Calling adw::init() which loads Adwaita CSS and enables color scheme support
     // - Running the GLib main loop
-    let app = relm4::RelmApp::new(APP_ID);
+    let app = relm4::RelmApp::new(config::APP_ID);
     app.run::<App>(());
 }
