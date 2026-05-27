@@ -45,6 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
 src/
 ├── main.rs              # Entry point: logging + relm4 app launch
+├── config.rs            # Build-time constants (APP_ID, VERSION, PROFILE)
+├── config.rs.in         # Meson template that generates config.rs
 ├── app.rs               # Top-level component (owns the window)
 ├── ui/
 │   ├── mod.rs           # Re-exports child components
@@ -52,8 +54,11 @@ src/
 │   └── log_view.rs      # Scrollable text output
 └── <domain>_worker.rs   # Async logic (subprocess, network, etc.)
 data/
-├── org.projectbluefin.<AppName>.desktop
-└── org.projectbluefin.<AppName>.metainfo.xml
+├── org.projectbluefin.<AppName>.desktop.in   # Template with @APP_ID@
+├── org.projectbluefin.<AppName>.metainfo.xml.in
+└── icons/
+    ├── org.projectbluefin.<AppName>.svg
+    └── org.projectbluefin.<AppName>-symbolic.svg
 ```
 
 ### Build System (Meson + Flatpak)
@@ -73,15 +78,17 @@ build-aux/
 
 **Build & run locally (Flatpak):**
 ```bash
-# One-time setup
-flatpak install flathub org.gnome.Sdk//47 org.gnome.Platform//47
-flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable//24.08
+# One-time setup (GNOME 50 / freedesktop 25.08)
+flatpak install flathub org.gnome.Sdk//50 org.gnome.Platform//50
+flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable//25.08
 
 # Build and run
-flatpak-builder --user --install --force-clean build \
+flatpak run org.flatpak.Builder --user --install --force-clean _flatpak \
   build-aux/org.projectbluefin.Finpilot.Devel.json
 flatpak run org.projectbluefin.Finpilot.Devel
 ```
+
+**Data file templates**: Desktop and metainfo files use `.in` suffix and `@APP_ID@` / `@ICON@` placeholders. Meson's `configure_file()` substitutes these and renames the output to include the profile suffix (`.Devel`) so Flatpak export correctly associates files with the app ID.
 
 **Build without Flatpak (direct meson):**
 ```bash
@@ -211,6 +218,104 @@ std::thread::spawn(move || {
 ### Alternative: relm4 `CommandOutput`
 For simpler cases, relm4's `Component::CommandOutput` type + `sender.command()` works well. Use the thread + channel pattern when you need streaming (many events over time) rather than a single result.
 
+### Flatpak Sandbox Awareness
+
+When running inside Flatpak, commands targeting the host must use `flatpak-spawn --host`:
+
+```rust
+fn is_flatpak() -> bool {
+    std::path::Path::new("/.flatpak-info").exists()
+}
+
+fn build_command(program: &str, args: &[String]) -> tokio::process::Command {
+    if is_flatpak() {
+        let mut cmd = Command::new("flatpak-spawn");
+        cmd.arg("--host").arg(program).args(args);
+        cmd
+    } else {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        cmd
+    }
+}
+```
+
+**Manifest requirement**: The Flatpak manifest must include `--talk-name=org.freedesktop.Flatpak` in `finish-args` for `flatpak-spawn --host` to work.
+
+### Cancellation Pattern
+
+Use a `tokio::sync::oneshot` channel to signal cancellation to a running worker:
+
+```rust
+// In model:
+cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
+
+// When starting:
+let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+self.cancel_tx = Some(cancel_tx);
+
+// In the worker thread, use tokio::select!:
+tokio::select! {
+    event = rx.recv() => { /* handle event */ }
+    _ = &mut cancel_rx => { /* cancelled — clean up */ }
+}
+
+// To cancel:
+if let Some(tx) = self.cancel_tx.take() {
+    let _ = tx.send(());
+}
+```
+
+---
+
+## 5.5. Action Groups & Menus
+
+### relm4 action pattern for hamburger menus:
+
+```rust
+use relm4::actions::{RelmAction, RelmActionGroup};
+
+// Define action group and action types (at module level):
+relm4::new_action_group!(WindowActionGroup, "win");
+relm4::new_stateless_action!(AboutAction, WindowActionGroup, "about");
+
+// In view! macro — reference the action type directly:
+menu! {
+    main_menu: {
+        "_About" => AboutAction,
+    }
+}
+
+// In init() — create and register the action:
+let about_action: RelmAction<AboutAction> = {
+    let sender = sender.input_sender().clone();
+    RelmAction::new_stateless(move |_| {
+        sender.emit(AppMsg::ShowAbout);
+    })
+};
+let mut group = RelmActionGroup::<WindowActionGroup>::new();
+group.add_action(about_action);
+group.register_for_widget(&root);
+```
+
+### AdwAboutDialog:
+
+```rust
+let about = adw::AboutDialog::builder()
+    .application_name("App Name")
+    .application_icon(APP_ID)
+    .developer_name("Project Bluefin")
+    .version(VERSION)
+    .website("https://projectbluefin.io")
+    .issue_url("https://github.com/org/repo/issues")
+    .license_type(gtk::License::MitX11)
+    .developers(vec!["Contributors"])
+    .build();
+about.present(window);  // takes &impl IsA<gtk::Widget>
+```
+
+**Import**: Requires `use adw::prelude::*` for the `AdwDialogExt::present()` method.
+
 ---
 
 ## 5. Status/Feedback Pattern
@@ -290,10 +395,11 @@ Run through this before shipping any Bluefin utility app:
 - [ ] Errors are shown in-context (StatusPage), not as modal dialogs
 
 ### Metadata
-- [ ] `.desktop` file has correct `DBusActivatable=true`
+- [ ] `.desktop` file uses `@APP_ID@` template for icon and launcher
 - [ ] AppStream metainfo passes `appstreamcli validate`
 - [ ] App ID follows `org.projectbluefin.<AppName>` convention
 - [ ] Content rating (`oars-1.1`) is present even if empty
+- [ ] If `DBusActivatable=true`, a matching `.service` file is installed
 
 ### Dark Mode
 - [ ] App respects system color scheme (automatic with libadwaita)
@@ -329,5 +435,7 @@ cargo run
 | libadwaita-rs (`adw`) | 0.6.x | libadwaita 1.5+ (GNOME 46+) |
 | relm4 | 0.8.x | Stable macro syntax |
 | tokio | 1.x | Async runtime |
+
+**Flatpak SDK versions**: GNOME Sdk 50 maps to freedesktop-sdk 25.08. The rust-stable extension must match the SDK base version (e.g., `rust-stable//25.08` for GNOME 50).
 
 When GNOME 47+ ships new widgets, bump the `features = ["v1_6"]` in your libadwaita dep.
