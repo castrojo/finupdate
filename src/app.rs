@@ -337,35 +337,40 @@ impl SimpleComponent for App {
             gtk::glib::Propagation::Stop
         });
 
+        // Defer preflight check until the GLib main loop is running to avoid
+        // racing with component initialization (the thread could finish before
+        // the relm4 message loop processes the first idle).
         let input_sender = sender.input_sender().clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime");
-            rt.block_on(async move {
-                let mut cmd = if std::path::Path::new("/.flatpak-info").exists() {
-                    let mut c = tokio::process::Command::new("flatpak-spawn");
-                    c.arg("--host").arg("uupd").arg("update-check");
-                    c
-                } else {
-                    let mut c = tokio::process::Command::new("uupd");
-                    c.arg("update-check");
-                    c
-                };
-                let status = match cmd.status().await {
-                    Ok(s) => s,
-                    Err(_) => {
-                        input_sender.emit(AppMsg::PreflightResult(PreflightStatus::Unknown));
-                        return;
-                    }
-                };
-                let result = match status.code() {
-                    Some(0) => PreflightStatus::UpdateAvailable,
-                    Some(77) => PreflightStatus::UpToDate,
-                    _ => PreflightStatus::Unknown,
-                };
-                input_sender.emit(AppMsg::PreflightResult(result));
+        gtk::glib::idle_add_local_once(move || {
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime");
+                rt.block_on(async move {
+                    let mut cmd = if std::path::Path::new("/.flatpak-info").exists() {
+                        let mut c = tokio::process::Command::new("flatpak-spawn");
+                        c.arg("--host").arg("uupd").arg("update-check");
+                        c
+                    } else {
+                        let mut c = tokio::process::Command::new("uupd");
+                        c.arg("update-check");
+                        c
+                    };
+                    let status = match cmd.status().await {
+                        Ok(s) => s,
+                        Err(_) => {
+                            input_sender.emit(AppMsg::PreflightResult(PreflightStatus::Unknown));
+                            return;
+                        }
+                    };
+                    let result = match status.code() {
+                        Some(0) => PreflightStatus::UpdateAvailable,
+                        Some(77) => PreflightStatus::UpToDate,
+                        _ => PreflightStatus::Unknown,
+                    };
+                    input_sender.emit(AppMsg::PreflightResult(result));
+                });
             });
         });
 

@@ -32,6 +32,7 @@
 
 use adw::prelude::*;
 use gtk::cairo;
+use gtk::glib;
 use gtk::pango;
 use std::cell::{Cell, RefCell};
 use std::f64::consts::PI;
@@ -118,7 +119,9 @@ pub struct SegmentedProgress {
     /// Shared with the draw closure and the GLib animation timer.
     segments: Rc<RefCell<[Segment; 3]>>,
     /// Animation phase in [0.0, 1.0) — shared with the draw closure.
-    _phase: Rc<Cell<f64>>,
+    phase: Rc<Cell<f64>>,
+    /// Whether the animation timer is currently running.
+    animating: Rc<Cell<bool>>,
     /// When false the animation timer shuts itself down.
     alive: Rc<Cell<bool>>,
 }
@@ -130,16 +133,13 @@ impl SegmentedProgress {
         drawing_area.set_hexpand(true);
 
         let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        root.set_margin_start(12);
-        root.set_margin_end(12);
-        root.set_margin_top(8);
-        root.set_margin_bottom(4);
         root.append(&drawing_area);
 
         let segments: Rc<RefCell<[Segment; 3]>> =
             Rc::new(RefCell::new(std::array::from_fn(|_| Segment::default())));
         let phase = Rc::new(Cell::new(0.0_f64));
         let alive = Rc::new(Cell::new(true));
+        let animating = Rc::new(Cell::new(false));
 
         // ── Draw function ────────────────────────────────────────────────
         {
@@ -152,35 +152,48 @@ impl SegmentedProgress {
             });
         }
 
-        // ── Animation timer — runs every 50 ms, self-cancels when idle ───
-        {
-            let segs_ref = segments.clone();
-            let phase_ref = phase.clone();
-            let alive_ref = alive.clone();
-            let da = drawing_area.clone();
-            gtk::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
-                if !alive_ref.get() {
-                    return gtk::glib::ControlFlow::Break;
-                }
-                let is_active = segs_ref
-                    .borrow()
-                    .iter()
-                    .any(|s| matches!(s.status, SegStatus::Active | SegStatus::Downloading));
-                if is_active {
-                    phase_ref.set((phase_ref.get() + 0.040) % 1.0);
-                    da.queue_draw();
-                }
-                gtk::glib::ControlFlow::Continue
-            });
-        }
-
         Self {
             root,
             drawing_area,
             segments,
-            _phase: phase,
+            phase,
+            animating,
             alive,
         }
+    }
+
+    /// Start the animation timer if not already running.
+    fn ensure_animating(&self) {
+        if self.animating.get() {
+            return;
+        }
+        self.animating.set(true);
+
+        let segs_ref = self.segments.clone();
+        let phase_ref = self.phase.clone();
+        let alive_ref = self.alive.clone();
+        let animating_ref = self.animating.clone();
+        let da = self.drawing_area.clone();
+
+        glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+            if !alive_ref.get() {
+                animating_ref.set(false);
+                return glib::ControlFlow::Break;
+            }
+            let is_active = segs_ref
+                .borrow()
+                .iter()
+                .any(|s| matches!(s.status, SegStatus::Active | SegStatus::Downloading));
+            if is_active {
+                phase_ref.set((phase_ref.get() + 0.040) % 1.0);
+                da.queue_draw();
+                glib::ControlFlow::Continue
+            } else {
+                // No segments animating — stop the timer to save CPU.
+                animating_ref.set(false);
+                glib::ControlFlow::Break
+            }
+        });
     }
 
     /// The root widget — append this to the updating content box.
@@ -212,6 +225,7 @@ impl SegmentedProgress {
             };
             drop(segs);
             self.drawing_area.queue_draw();
+            self.ensure_animating();
         }
     }
 
@@ -275,7 +289,8 @@ fn draw_bar(
     );
 
     // Foreground text color — correct for both light and dark themes.
-    let fg = widget.style_context().color();
+    // GTK 4.10+ deprecated style_context().color(); use Widget::color() directly.
+    let fg = widget.color();
     let (fr, fg_g, fb) = (fg.red() as f64, fg.green() as f64, fg.blue() as f64);
 
     // ── 1. Background pill ───────────────────────────────────────────────

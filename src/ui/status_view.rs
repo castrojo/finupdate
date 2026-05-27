@@ -298,9 +298,17 @@ impl SimpleComponent for StatusView {
         bottom_bar.append(&cancel_btn);
 
         let updating_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        updating_content.append(&seg_progress.widget());
-        updating_content.append(&updating_image_box);
-        updating_content.append(update_list.widget());
+
+        // HIG: Clamp non-log content to consistent max-width (matches log_clamp).
+        let header_clamp = adw::Clamp::new();
+        header_clamp.set_maximum_size(800);
+        let header_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        header_box.append(&seg_progress.widget());
+        header_box.append(&updating_image_box);
+        header_box.append(update_list.widget());
+        header_clamp.set_child(Some(&header_box));
+
+        updating_content.append(&header_clamp);
         updating_content.append(&log_clamp);
         updating_content.append(&bottom_bar);
 
