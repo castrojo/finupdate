@@ -30,7 +30,7 @@ use crate::registry_client::{ImageVersion, RegistryClient};
 use crate::update_worker::is_flatpak;
 
 /// Open the rebase history dialog as a child of `parent`.
-pub fn show_rebase_dialog(parent: &adw::ApplicationWindow) {
+pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     let dialog = adw::Dialog::builder()
         .title("Rebase to Previous Version")
         .content_width(520)
@@ -99,6 +99,7 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow) {
             dialog_for_retry.clone(),
             parent_for_retry.clone(),
             error_page_for_retry.clone(),
+            dev_mode,
         );
     });
 
@@ -109,6 +110,7 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow) {
         dialog.clone(),
         parent.clone(),
         error_page.clone(),
+        dev_mode,
     );
 }
 
@@ -118,9 +120,20 @@ fn start_version_fetch(
     dialog: adw::Dialog,
     parent: adw::ApplicationWindow,
     error_page: adw::StatusPage,
+    dev_mode: bool,
 ) {
     stack.set_visible_child_name("loading");
     error_page.set_description(Some("Check your internet connection and try again."));
+
+    if dev_mode {
+        // In dev mode, use simulated data so the dialog is functional without bootc.
+        let versions = generate_mock_versions();
+        glib::idle_add_local_once(move || {
+            build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions, dev_mode);
+            stack.set_visible_child_name("loaded");
+        });
+        return;
+    }
 
     let result_slot: Arc<Mutex<Option<FetchResult>>> = Arc::new(Mutex::new(None));
     spawn_fetch_thread(result_slot.clone());
@@ -130,7 +143,7 @@ fn start_version_fetch(
         if let Some(result) = result_slot.lock().ok().and_then(|mut guard| guard.take()) {
             match result {
                 FetchResult::Ok(versions) => {
-                    build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions);
+                    build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions, dev_mode);
                     stack.set_visible_child_name("loaded");
                 }
                 FetchResult::DetectFailed => {
@@ -187,6 +200,7 @@ fn build_loaded_page(
     dialog: &adw::Dialog,
     parent: &adw::ApplicationWindow,
     versions: Vec<ImageVersion>,
+    dev_mode: bool,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -424,7 +438,11 @@ fn build_loaded_page(
 
             confirm.connect_response(None, move |_, response| {
                 if response == "rebase" {
-                    run_rebase(full_ref.clone(), stack.clone(), dialog_close.clone());
+                    if dev_mode {
+                        run_rebase_simulated(full_ref.clone(), stack.clone(), dialog_close.clone());
+                    } else {
+                        run_rebase(full_ref.clone(), stack.clone(), dialog_close.clone());
+                    }
                 }
             });
 
@@ -731,6 +749,78 @@ async fn run_bootc_switch(full_ref: &str) -> Result<(), String> {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Simulated rebase for dev mode — shows the progress UI then succeeds after a delay.
+fn run_rebase_simulated(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog) {
+    tracing::warn!(
+        "Rebase suppressed — developer mode is active. \
+         Would have called `bootc switch {}`.",
+        full_ref
+    );
+
+    let progress_page = adw::StatusPage::builder()
+        .title("Rebasing… (simulated)")
+        .description("Developer mode — no actual changes are being made.")
+        .build();
+    let spinner = gtk::Spinner::new();
+    spinner.set_spinning(true);
+    progress_page.set_child(Some(&spinner));
+    stack.add_named(&progress_page, Some("rebasing"));
+    stack.set_visible_child_name("rebasing");
+
+    // Simulate a short delay then show success.
+    glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
+        let done_page = adw::StatusPage::builder()
+            .title("Rebase Complete (simulated)")
+            .description("Developer mode — no changes were made.\nIn production, a restart would be needed.")
+            .icon_name("object-select-symbolic")
+            .build();
+        let close_btn = gtk::Button::builder()
+            .label("Close")
+            .halign(gtk::Align::Center)
+            .build();
+        close_btn.add_css_class("suggested-action");
+        close_btn.add_css_class("pill");
+        let dialog_close = dialog.clone();
+        close_btn.connect_clicked(move |_| {
+            dialog_close.close();
+        });
+        done_page.set_child(Some(&close_btn));
+        stack.add_named(&done_page, Some("done"));
+        stack.set_visible_child_name("done");
+    });
+}
+
+/// Generate mock image versions for the last 30 days (dev mode).
+fn generate_mock_versions() -> Vec<ImageVersion> {
+    use chrono::{Duration, Utc};
+
+    let today = Utc::now().date_naive();
+    let mut versions = Vec::new();
+
+    // Generate a version every 2-3 days over the last 60 days.
+    let mut day_offset = 2i64;
+    let mut build_num = 1u32;
+    while day_offset <= 60 {
+        let date = today - Duration::days(day_offset);
+        versions.push(ImageVersion {
+            date,
+            full_ref: format!(
+                "ghcr.io/ublue-os/bluefin:stable-daily-43.{}",
+                date.format("%Y%m%d")
+            ),
+            version: format!("43.{}", date.format("%Y%m%d")),
+            kernel: format!("6.12.{}-200.fc42.x86_64", build_num),
+            revision: format!("{:08x}", 0xdeadbe00 + build_num),
+            created: date.and_hms_opt(4, 30, 0).unwrap().and_utc(),
+        });
+        day_offset += if build_num % 3 == 0 { 3 } else { 2 };
+        build_num += 1;
+    }
+
+    versions.sort_by_key(|v| v.date);
+    versions
+}
 
 fn days_in_month(date: NaiveDate) -> u32 {
     let next = if date.month() == 12 {

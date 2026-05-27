@@ -152,9 +152,9 @@ impl SimpleComponent for App {
         adw::ApplicationWindow {
             set_title: Some("System Update"),
             // HIG: minimum window size ensures content is never clipped.
-            set_default_size: (600, 500),
-            set_width_request: 360,
-            set_height_request: 360,
+            set_default_size: (750, 700),
+            set_width_request: 400,
+            set_height_request: 500,
 
             // AdwToolbarView is the modern GNOME pattern for header + content layout.
             // It handles the header bar integration with scrolling content automatically.
@@ -220,6 +220,7 @@ impl SimpleComponent for App {
                     },
                     StatusViewOutput::CancelUpdate => AppMsg::CancelUpdate,
                     StatusViewOutput::Reboot => AppMsg::RequestReboot,
+                    StatusViewOutput::ShowRebase => AppMsg::ShowRebaseDialog,
                 });
 
         let toast_overlay = adw::ToastOverlay::new();
@@ -562,37 +563,47 @@ impl SimpleComponent for App {
             }
 
             AppMsg::ConfirmReboot => {
-                tracing::info!("User confirmed system reboot");
-                std::thread::spawn(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("Failed to create tokio runtime");
+                if self.settings.dev_mode {
+                    tracing::warn!(
+                        "Reboot suppressed — developer mode is active. \
+                         Would have called `systemctl reboot`."
+                    );
+                    let toast = adw::Toast::new("Reboot suppressed (developer mode)");
+                    toast.set_timeout(3);
+                    self.toast_overlay.add_toast(toast);
+                } else {
+                    tracing::info!("User confirmed system reboot");
+                    std::thread::spawn(|| {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("Failed to create tokio runtime");
 
-                    rt.block_on(async {
-                        let result = if crate::update_worker::is_flatpak() {
-                            tokio::process::Command::new("flatpak-spawn")
-                                .args(["--host", "systemctl", "reboot"])
-                                .status()
-                                .await
-                        } else {
-                            tokio::process::Command::new("systemctl")
-                                .arg("reboot")
-                                .status()
-                                .await
-                        };
+                        rt.block_on(async {
+                            let result = if crate::update_worker::is_flatpak() {
+                                tokio::process::Command::new("flatpak-spawn")
+                                    .args(["--host", "systemctl", "reboot"])
+                                    .status()
+                                    .await
+                            } else {
+                                tokio::process::Command::new("systemctl")
+                                    .arg("reboot")
+                                    .status()
+                                    .await
+                            };
 
-                        if let Err(e) = result {
-                            tracing::error!("Failed to initiate reboot: {}", e);
-                        }
+                            if let Err(e) = result {
+                                tracing::error!("Failed to initiate reboot: {}", e);
+                            }
+                        });
                     });
-                });
+                }
             }
 
             AppMsg::ShowRebaseDialog => {
                 if let Some(root) = self.status_view.widget().root() {
                     if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
-                        show_rebase_dialog(window);
+                        show_rebase_dialog(window, self.settings.dev_mode);
                     }
                 }
             }

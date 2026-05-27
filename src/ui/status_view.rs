@@ -44,6 +44,8 @@ pub enum StatusViewOutput {
     CancelUpdate,
     /// User wants to reboot the system.
     Reboot,
+    /// User wants to open the rollback/rebase dialog.
+    ShowRebase,
 }
 
 /// The status view model.
@@ -61,16 +63,45 @@ pub struct StatusView {
     log_text: String,
     /// Toast overlay for copy confirmation.
     toast_overlay: adw::ToastOverlay,
-    /// Label showing last update time on idle page.
-    last_update_label: gtk::Label,
-    /// Label showing startup preflight status on idle page.
-    preflight_label: gtk::Label,
-    /// Image info badge shown on the idle page.
-    idle_image_box: gtk::Box,
+    /// Reference to idle page for dynamic description.
+    idle_page: adw::StatusPage,
+    /// Preflight check result.
+    preflight_status: PreflightStatus,
+    /// Cached last-update text.
+    last_update_text: Option<String>,
+    /// Cached image info text.
+    image_info: Option<String>,
     /// Segmented progress bar shown while updating.
     seg_progress: SegmentedProgress,
     /// The module key that is currently active (drives segment coloring).
     active_module: Option<&'static str>,
+}
+
+impl StatusView {
+    /// Build the idle page description from current state.
+    fn idle_description(&self) -> String {
+        let mut parts = Vec::new();
+
+        match &self.preflight_status {
+            PreflightStatus::UpdateAvailable => parts.push("Update available".to_string()),
+            PreflightStatus::UpToDate => parts.push("System is up to date".to_string()),
+            _ => parts.push("Your system is managed by uupd".to_string()),
+        }
+
+        if let Some(ref text) = self.last_update_text {
+            parts.push(text.clone());
+        }
+
+        if let Some(ref info) = self.image_info {
+            parts.push(info.clone());
+        }
+
+        parts.join("\n")
+    }
+
+    fn refresh_idle_description(&self) {
+        self.idle_page.set_description(Some(&self.idle_description()));
+    }
 }
 
 #[relm4::component(pub)]
@@ -86,50 +117,11 @@ impl SimpleComponent for StatusView {
             set_transition_duration: 200,
 
             // ─── Idle page ──────────────────────────────────────────────
-            add_child = &adw::StatusPage {
-                set_icon_name: Some(config::APP_ID),
-                set_title: "System Up to Date",
-                set_description: Some("Your system is managed by uupd.\nClick below to check for and install updates now."),
-
-                #[wrap(Some)]
-                set_child = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_halign: gtk::Align::Center,
-                    set_spacing: 12,
-
-                    // Image info badge — shows e.g. "bluefin · dx"
-                    #[local_ref]
-                    idle_image_box -> gtk::Box {},
-
-                    gtk::Button {
-                        set_label: "Check for Updates",
-                        add_css_class: "suggested-action",
-                        add_css_class: "pill",
-                        set_tooltip_text: Some("Check for and install system updates"),
-                        connect_clicked[sender] => move |_| {
-                            sender.output(StatusViewOutput::StartUpdate).unwrap();
-                        },
-                    },
-
-                    #[local_ref]
-                    preflight_label -> gtk::Label {
-                        add_css_class: "caption",
-                    },
-
-                    // Show last update time if known.
-                    #[local_ref]
-                    last_update_label -> gtk::Label {
-                        add_css_class: "dim-label",
-                        add_css_class: "caption",
-                    },
-                },
-            } -> {
+            add_child = &model.idle_page.clone() -> adw::StatusPage {} -> {
                 set_name: "idle",
             },
 
             // ─── Updating page ──────────────────────────────────────────
-            // Built imperatively in init() — the view! macro cannot inline-
-            // construct children for pre-existing widget references.
             add_child = &model.toast_overlay.clone() -> adw::ToastOverlay {} -> {
                 set_name: "updating",
             },
@@ -138,28 +130,26 @@ impl SimpleComponent for StatusView {
             add_child = &adw::StatusPage {
                 set_icon_name: Some("object-select-symbolic"),
                 set_title: "Update Complete",
-                set_description: Some("Your system has been updated.\nRestart to apply changes."),
+                set_description: Some("Restart to apply changes."),
 
                 #[wrap(Some)]
                 set_child = &gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
                     set_halign: gtk::Align::Center,
-                    set_spacing: 12,
+                    set_spacing: 8,
 
                     gtk::Button {
                         set_label: "Restart…",
                         add_css_class: "suggested-action",
                         add_css_class: "pill",
-                        set_tooltip_text: Some("Restart the system to apply updates"),
                         connect_clicked[sender] => move |_| {
                             sender.output(StatusViewOutput::Reboot).unwrap();
                         },
                     },
 
                     gtk::Button {
-                        set_label: "Done",
-                        add_css_class: "pill",
-                        set_tooltip_text: Some("Dismiss and return to idle"),
+                        set_label: "Restart Later",
+                        add_css_class: "flat",
                         connect_clicked[sender] => move |_| {
                             sender.input(StatusViewInput::StateChanged(AppState::Idle));
                         },
@@ -171,24 +161,17 @@ impl SimpleComponent for StatusView {
 
             // ─── Up to date page ────────────────────────────────────────
             add_child = &adw::StatusPage {
-                set_icon_name: Some(config::APP_ID),
-                set_title: "Already Up to Date",
-                set_description: Some("Your system is current.\nNo updates are available right now."),
+                set_icon_name: Some("emblem-ok-symbolic"),
+                set_title: "Up to Date",
+                set_description: Some("No updates available."),
 
                 #[wrap(Some)]
-                set_child = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
+                set_child = &gtk::Button {
+                    set_label: "Done",
+                    add_css_class: "pill",
                     set_halign: gtk::Align::Center,
-                    set_spacing: 12,
-
-                    gtk::Button {
-                        set_label: "Done",
-                        add_css_class: "suggested-action",
-                        add_css_class: "pill",
-                        set_tooltip_text: Some("Return to the main screen"),
-                        connect_clicked[sender] => move |_| {
-                            sender.input(StatusViewInput::StateChanged(AppState::Idle));
-                        },
+                    connect_clicked[sender] => move |_| {
+                        sender.input(StatusViewInput::StateChanged(AppState::Idle));
                     },
                 },
             } -> {
@@ -199,19 +182,18 @@ impl SimpleComponent for StatusView {
             add_child = &adw::StatusPage {
                 set_icon_name: Some("dialog-warning-symbolic"),
                 set_title: "Update Failed",
-                set_description: Some("An unexpected error occurred"),
+                set_description: Some("Something went wrong."),
 
                 #[wrap(Some)]
                 set_child = &gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
                     set_halign: gtk::Align::Center,
-                    set_spacing: 12,
+                    set_spacing: 8,
 
                     gtk::Button {
                         set_label: "Retry",
                         add_css_class: "suggested-action",
                         add_css_class: "pill",
-                        set_tooltip_text: Some("Retry system update"),
                         connect_clicked[sender] => move |_| {
                             sender.output(StatusViewOutput::StartUpdate).unwrap();
                         },
@@ -219,8 +201,7 @@ impl SimpleComponent for StatusView {
 
                     gtk::Button {
                         set_label: "Dismiss",
-                        add_css_class: "pill",
-                        set_tooltip_text: Some("Dismiss error and return to idle"),
+                        add_css_class: "flat",
                         connect_clicked[sender] => move |_| {
                             sender.input(StatusViewInput::StateChanged(AppState::Idle));
                         },
@@ -245,22 +226,51 @@ impl SimpleComponent for StatusView {
         elapsed_label.add_css_class("caption");
         elapsed_label.add_css_class("monospace");
 
-        let last_update_label = gtk::Label::new(None);
-        let preflight_label = gtk::Label::new(None);
-        preflight_label.set_halign(gtk::Align::Center);
-        preflight_label.set_visible(false);
         let toast_overlay = adw::ToastOverlay::new();
 
-        // Image info badge for the idle page.
-        let idle_image_box = build_image_badge(read_image_info().as_deref());
+        // ── Idle page (built imperatively) ──────────────────────────────
+        let idle_page = adw::StatusPage::builder()
+            .icon_name(config::APP_ID)
+            .title("System Update")
+            .build();
+
+        let idle_buttons = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        idle_buttons.set_halign(gtk::Align::Center);
+
+        let check_btn = gtk::Button::builder()
+            .label("Check for Updates")
+            .build();
+        check_btn.add_css_class("suggested-action");
+        check_btn.add_css_class("pill");
+        let start_sender = sender.output_sender().clone();
+        check_btn.connect_clicked(move |_| {
+            let _ = start_sender.send(StatusViewOutput::StartUpdate);
+        });
+
+        let rebase_btn = gtk::Button::builder()
+            .label("Previous Versions…")
+            .build();
+        rebase_btn.add_css_class("flat");
+        let rebase_sender = sender.output_sender().clone();
+        rebase_btn.connect_clicked(move |_| {
+            let _ = rebase_sender.send(StatusViewOutput::ShowRebase);
+        });
+
+        idle_buttons.append(&check_btn);
+        idle_buttons.append(&rebase_btn);
+        idle_page.set_child(Some(&idle_buttons));
 
         // Build the "updating" page content imperatively.
         let seg_progress = SegmentedProgress::new();
 
-        // Image badge for the updating page header.
-        let updating_image_box = build_image_badge(read_image_info().as_deref());
-        updating_image_box.set_margin_top(8);
-        updating_image_box.set_margin_bottom(4);
+        // Image info label for the updating page header.
+        let updating_image_label = gtk::Label::new(read_image_info().as_deref());
+        updating_image_label.add_css_class("caption");
+        updating_image_label.add_css_class("dim-label");
+        updating_image_label.add_css_class("monospace");
+        updating_image_label.set_margin_top(8);
+        updating_image_label.set_margin_bottom(4);
+        updating_image_label.set_visible(read_image_info().is_some());
 
         let log_clamp = adw::Clamp::new();
         log_clamp.set_maximum_size(800);
@@ -304,7 +314,7 @@ impl SimpleComponent for StatusView {
         header_clamp.set_maximum_size(800);
         let header_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         header_box.append(&seg_progress.widget());
-        header_box.append(&updating_image_box);
+        header_box.append(&updating_image_label);
         header_box.append(update_list.widget());
         header_clamp.set_child(Some(&header_box));
 
@@ -313,14 +323,6 @@ impl SimpleComponent for StatusView {
         updating_content.append(&bottom_bar);
 
         toast_overlay.set_child(Some(&updating_content));
-
-        // Populate last update time on the idle page.
-        if let Some(text) = get_last_update_time() {
-            last_update_label.set_label(&text);
-            last_update_label.set_visible(true);
-        } else {
-            last_update_label.set_visible(false);
-        }
 
         let model = StatusView {
             state: init,
@@ -331,19 +333,18 @@ impl SimpleComponent for StatusView {
             elapsed_label: elapsed_label.clone(),
             log_text: String::new(),
             toast_overlay,
-            last_update_label: last_update_label.clone(),
-            preflight_label: preflight_label.clone(),
-            idle_image_box: idle_image_box.clone(),
+            idle_page,
+            preflight_status: PreflightStatus::Checking,
+            last_update_text: get_last_update_time(),
+            image_info: read_image_info(),
             seg_progress,
             active_module: None,
         };
 
-        let idle_image_box = &model.idle_image_box;
-        let preflight_label = &model.preflight_label;
-        let last_update_label = &model.last_update_label;
         let widgets = view_output!();
 
-        // Set initial visible page.
+        // Set initial idle description and visible page.
+        model.refresh_idle_description();
         root.set_visible_child_name("idle");
 
         // Update elapsed timer every 250ms while the "updating" page is visible.
@@ -398,10 +399,8 @@ impl SimpleComponent for StatusView {
                     }
                     AppState::Idle => {
                         self.update_start = None;
-                        if let Some(text) = get_last_update_time() {
-                            self.last_update_label.set_label(&text);
-                            self.last_update_label.set_visible(true);
-                        }
+                        self.last_update_text = get_last_update_time();
+                        self.refresh_idle_description();
                     }
                 }
 
@@ -465,25 +464,8 @@ impl SimpleComponent for StatusView {
             }
 
             StatusViewInput::PreflightResult(status) => {
-                self.preflight_label.remove_css_class("success");
-                self.preflight_label.remove_css_class("dim-label");
-
-                match status {
-                    PreflightStatus::Checking | PreflightStatus::Unknown => {
-                        self.preflight_label.set_visible(false);
-                        self.preflight_label.set_label("");
-                    }
-                    PreflightStatus::UpdateAvailable => {
-                        self.preflight_label.set_label("Update available");
-                        self.preflight_label.add_css_class("success");
-                        self.preflight_label.set_visible(true);
-                    }
-                    PreflightStatus::UpToDate => {
-                        self.preflight_label.set_label("System is up to date");
-                        self.preflight_label.add_css_class("dim-label");
-                        self.preflight_label.set_visible(true);
-                    }
-                }
+                self.preflight_status = status;
+                self.refresh_idle_description();
             }
 
             StatusViewInput::CopyLog => {
@@ -518,30 +500,6 @@ fn extract_module_key(line: &str) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-/// Build a pill-style image info badge widget.
-/// Returns a hidden, zero-height box if no text is available.
-fn build_image_badge(text: Option<&str>) -> gtk::Box {
-    let badge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    badge.set_halign(gtk::Align::Center);
-    badge.set_visible(text.is_some());
-
-    if let Some(label_text) = text {
-        badge.add_css_class("card");
-
-        let label = gtk::Label::new(Some(label_text));
-        label.add_css_class("caption");
-        label.add_css_class("monospace");
-        label.set_margin_start(12);
-        label.set_margin_end(12);
-        label.set_margin_top(4);
-        label.set_margin_bottom(4);
-
-        badge.append(&label);
-    }
-
-    badge
 }
 
 /// Read the current OS image name and variant from `/etc/os-release`.

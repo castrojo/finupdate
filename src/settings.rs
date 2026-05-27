@@ -57,12 +57,17 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
+        // Development builds (meson -Dprofile=development or cargo build without meson)
+        // default to dev_mode=true so destructive actions like reboot are never triggered
+        // during testing.
+        let is_dev_build = crate::config::PROFILE == "Devel" || crate::config::PROFILE.is_empty();
+
         Self {
             auto_updates: true,
             update_interval: UpdateInterval::Daily,
             pause_on_metered: true,
             custom_interval_hours: 6,
-            dev_mode: false,
+            dev_mode: is_dev_build,
         }
     }
 }
@@ -75,15 +80,29 @@ impl Settings {
     }
 
     /// Load settings from disk, falling back to defaults on any error.
+    /// In development builds, `dev_mode` is forced on regardless of the saved value.
     pub fn load() -> Self {
         let path = Self::config_path();
-        match std::fs::read_to_string(&path) {
+        let mut settings = match std::fs::read_to_string(&path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_else(|e| {
                 tracing::warn!("Failed to parse settings (using defaults): {}", e);
                 Self::default()
             }),
             Err(_) => Self::default(),
+        };
+
+        // Safety: development builds ALWAYS run in dev_mode to prevent
+        // destructive actions (like systemctl reboot) during testing.
+        let is_dev_build = crate::config::PROFILE == "Devel" || crate::config::PROFILE.is_empty();
+        if is_dev_build && !settings.dev_mode {
+            tracing::info!(
+                "Forcing dev_mode=true for development build (profile={:?})",
+                crate::config::PROFILE
+            );
+            settings.dev_mode = true;
         }
+
+        settings
     }
 
     /// Save settings to disk, logging errors but never panicking.
