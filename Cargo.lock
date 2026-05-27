@@ -110,7 +110,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "finpilot"
+name = "finupdate"
 version = "0.1.0"
 dependencies = [
  "gtk4",

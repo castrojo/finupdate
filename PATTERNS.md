@@ -1,6 +1,6 @@
 # Bluefin Utility App Patterns
 
-> Architectural patterns extracted from **Finpilot** — the first app in the Bluefin utility suite.
+> Architectural patterns extracted from **Finupdate** — the first app in the Bluefin utility suite.
 > Every future Bluefin app should start from these patterns for consistency.
 
 ---
@@ -86,8 +86,8 @@ flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable//25.08
 
 # Build and run
 flatpak run org.flatpak.Builder --user --install --force-clean _flatpak \
-  build-aux/org.projectbluefin.Finpilot.Devel.json
-flatpak run org.projectbluefin.Finpilot.Devel
+  build-aux/org.projectbluefin.Finupdate.Devel.json
+flatpak run org.projectbluefin.Finupdate.Devel
 ```
 
 **Data file templates**: Desktop and metainfo files use `.in` suffix and `@APP_ID@` / `@ICON@` placeholders. Meson's `configure_file()` substitutes these and renames the output to include the profile suffix (`.Devel`) so Flatpak export correctly associates files with the app ID.
@@ -96,7 +96,7 @@ flatpak run org.projectbluefin.Finpilot.Devel
 ```bash
 meson setup _build
 meson compile -C _build
-./_build/src/finpilot
+./_build/src/finupdate
 ```
 
 ---
@@ -488,13 +488,13 @@ Run through this before shipping any Bluefin utility app:
 ## Quick Start: New App
 
 ```bash
-# 1. Clone the template structure from finpilot
-cp -r finpilot/ my-new-app/
+# 1. Clone the template structure from finupdate
+cp -r finupdate/ my-new-app/
 cd my-new-app/
 
 # 2. Rename in Cargo.toml, APP_ID, desktop/metainfo files
-sed -i 's/Finpilot/MyNewApp/g' **/*.rs data/*
-sed -i 's/finpilot/my-new-app/g' Cargo.toml
+sed -i 's/Finupdate/MyNewApp/g' **/*.rs data/*
+sed -i 's/finupdate/my-new-app/g' Cargo.toml
 
 # 3. Replace the worker with your domain logic
 

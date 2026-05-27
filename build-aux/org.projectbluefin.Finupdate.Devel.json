@@ -1,18 +1,21 @@
 {
-    "id": "org.projectbluefin.Finpilot",
+    "id": "org.projectbluefin.Finupdate.Devel",
     "runtime": "org.gnome.Platform",
     "runtime-version": "50",
     "sdk": "org.gnome.Sdk",
     "sdk-extensions": [
         "org.freedesktop.Sdk.Extension.rust-stable"
     ],
-    "command": "finpilot",
+    "command": "finupdate",
     "finish-args": [
         "--device=dri",
         "--share=ipc",
         "--socket=fallback-x11",
         "--socket=wayland",
-        "--talk-name=org.freedesktop.Flatpak"
+        "--talk-name=org.freedesktop.Flatpak",
+        "--env=RUST_LOG=finupdate=debug",
+        "--env=G_MESSAGES_DEBUG=none",
+        "--env=RUST_BACKTRACE=1"
     ],
     "build-options": {
         "append-path": "/usr/lib/sdk/rust-stable/bin",
@@ -26,10 +29,12 @@
     },
     "modules": [
         {
-            "name": "finpilot",
+            "name": "finupdate",
             "buildsystem": "meson",
             "run-tests": false,
-            "config-opts": [],
+            "config-opts": [
+                "-Dprofile=development"
+            ],
             "sources": [
                 {
                     "type": "dir",

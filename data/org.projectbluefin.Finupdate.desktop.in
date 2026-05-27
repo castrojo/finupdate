@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=System Update
 Comment=Check for and install system updates
-Exec=finpilot
+Exec=finupdate
 Icon=@ICON@
 Terminal=false
 Type=Application

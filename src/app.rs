@@ -146,7 +146,7 @@ impl SimpleComponent for App {
 
     menu! {
         main_menu: {
-            "_About Finpilot" => AboutAction,
+            "_About Finupdate" => AboutAction,
             "_Keyboard Shortcuts" => ShortcutsAction,
             "_Quit" => QuitAction,
         }
@@ -406,7 +406,7 @@ impl SimpleComponent for App {
 
             AppMsg::ShowAbout => {
                 let about = adw::AboutDialog::builder()
-                    .application_name("Finpilot")
+                    .application_name("Finupdate")
                     .application_icon(config::APP_ID)
                     .developer_name("Project Bluefin")
                     .version(config::VERSION)

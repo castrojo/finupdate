@@ -1,6 +1,6 @@
-# Contributing to Finpilot
+# Contributing to Finupdate
 
-Thank you for your interest in contributing to Finpilot and the Bluefin utility app ecosystem!
+Thank you for your interest in contributing to Finupdate and the Bluefin utility app ecosystem!
 
 ## Development Setup
 
@@ -29,12 +29,12 @@ You need **one** of these environments:
 
 ```bash
 # Fast iteration (cargo):
-cargo build && ./target/debug/finpilot
+cargo build && ./target/debug/finupdate
 
 # Full integration test (Flatpak):
 flatpak run org.flatpak.Builder --user --install --force-clean _flatpak \
-  build-aux/org.projectbluefin.Finpilot.Devel.json
-flatpak run org.projectbluefin.Finpilot.Devel
+  build-aux/org.projectbluefin.Finupdate.Devel.json
+flatpak run org.projectbluefin.Finupdate.Devel
 ```
 
 ### Important: Flatpak + Container Conflict
@@ -100,7 +100,7 @@ Then implement using the `#[relm4::component(pub)]` macro. See `log_view.rs` for
 
 ### Modifying the Flatpak Manifest
 
-The manifest is at `build-aux/org.projectbluefin.Finpilot.Devel.json`. Key things:
+The manifest is at `build-aux/org.projectbluefin.Finupdate.Devel.json`. Key things:
 
 - **New D-Bus permissions**: add to `finish-args` → `--talk-name=...`
 - **New system access**: add to `finish-args` → `--filesystem=...`

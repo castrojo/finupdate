@@ -1,8 +1,8 @@
-# Finpilot
+# Finupdate
 
 **A modern GTK4/libadwaita system update frontend for [uupd](https://github.com/ublue-os/uupd)**
 
-Finpilot provides a graphical interface for running system updates on [Bluefin](https://projectbluefin.io) and Universal Blue systems. It's the first app in the Bluefin utility suite and serves as a reference implementation for future apps.
+Finupdate provides a graphical interface for running system updates on [Bluefin](https://projectbluefin.io) and Universal Blue systems. It's the first app in the Bluefin utility suite and serves as a reference implementation for future apps.
 
 ![GNOME 47+](https://img.shields.io/badge/GNOME-47%2B-blue)
 ![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)
@@ -57,10 +57,10 @@ flatpak install flathub org.flatpak.Builder
 
 # Build and install locally
 flatpak run org.flatpak.Builder --user --install --force-clean _flatpak \
-  build-aux/org.projectbluefin.Finpilot.Devel.json
+  build-aux/org.projectbluefin.Finupdate.Devel.json
 
 # Run
-flatpak run org.projectbluefin.Finpilot.Devel
+flatpak run org.projectbluefin.Finupdate.Devel
 ```
 
 ### Option B: Native Meson build
@@ -76,7 +76,7 @@ meson setup _build
 meson compile -C _build
 
 # Run
-./_build/src/finpilot
+./_build/src/finupdate
 ```
 
 ### Option C: Cargo only (dev iteration)
@@ -86,7 +86,7 @@ If you have GTK4/libadwaita headers available (e.g., in a devcontainer):
 ```bash
 cargo build          # Debug
 cargo build --release  # Release
-./target/release/finpilot
+./target/release/finupdate
 ```
 
 ## Development
@@ -151,7 +151,7 @@ When running in Flatpak, the app uses `flatpak-spawn --host` to execute commands
 
 | Variable | Effect |
 |----------|--------|
-| `RUST_LOG=finpilot=debug` | Enable debug logging |
+| `RUST_LOG=finupdate=debug` | Enable debug logging |
 | `RUST_LOG=trace` | Full trace output |
 | `GTK_DEBUG=interactive` | GTK Inspector |
 

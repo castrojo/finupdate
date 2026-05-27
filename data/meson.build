@@ -4,7 +4,7 @@ desktop_conf.set('APP_ID', application_id)
 desktop_conf.set('ICON', application_id)
 
 desktop_file = configure_file(
-  input: 'org.projectbluefin.Finpilot.desktop.in',
+  input: 'org.projectbluefin.Finupdate.desktop.in',
   output: application_id + '.desktop',
   configuration: desktop_conf,
 )
@@ -27,7 +27,7 @@ metainfo_conf = configuration_data()
 metainfo_conf.set('APP_ID', application_id)
 
 metainfo_file = configure_file(
-  input: 'org.projectbluefin.Finpilot.metainfo.xml.in',
+  input: 'org.projectbluefin.Finupdate.metainfo.xml.in',
   output: application_id + '.metainfo.xml',
   configuration: metainfo_conf,
 )
@@ -47,13 +47,13 @@ endif
 
 # Icons — install with application_id name so Flatpak export picks them up.
 install_data(
-  'icons' / 'org.projectbluefin.Finpilot.svg',
+  'icons' / 'org.projectbluefin.Finupdate.svg',
   install_dir: iconsdir / 'hicolor' / 'scalable' / 'apps',
   rename: application_id + '.svg',
 )
 
 install_data(
-  'icons' / 'org.projectbluefin.Finpilot-symbolic.svg',
+  'icons' / 'org.projectbluefin.Finupdate-symbolic.svg',
   install_dir: iconsdir / 'hicolor' / 'symbolic' / 'apps',
   rename: application_id + '-symbolic.svg',
 )

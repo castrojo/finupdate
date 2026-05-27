@@ -1,4 +1,4 @@
-//! Finpilot — system update frontend for uupd.
+//! Finupdate — system update frontend for uupd.
 //!
 //! Entry point pattern for Bluefin utility apps:
 //! 1. Initialize tracing (structured logging)
@@ -27,7 +27,7 @@ fn main() {
         )
         .init();
 
-    tracing::info!("Starting Finpilot ({}) v{}", config::APP_ID, config::VERSION);
+    tracing::info!("Starting Finupdate ({}) v{}", config::APP_ID, config::VERSION);
 
     // relm4::RelmApp handles:
     // - Creating the adw::Application (because we enabled the "libadwaita" feature)
