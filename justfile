@@ -28,8 +28,14 @@ flatpak:
 run:
     flatpak run {{ app_id }}
 
-# Build Flatpak then run it
-flatpak-run: flatpak run
+# Refresh GNOME dock/launcher after a Flatpak install
+dock:
+    update-desktop-database ~/.local/share/applications 2>/dev/null || true
+    gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor 2>/dev/null || true
+    @echo "Dock launcher refreshed — you may need to re-pin the app"
+
+# Build Flatpak, install it, then refresh the dock
+flatpak-run: flatpak dock run
 
 # Clean Flatpak build artifacts
 clean-flatpak:

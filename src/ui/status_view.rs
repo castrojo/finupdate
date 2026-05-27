@@ -2,13 +2,11 @@
 //!
 //! Pattern: State-driven view switching
 //! Uses a `gtk::Stack` to switch between different visual states:
-//! - Idle: AdwStatusPage with "ready to update" messaging + last update time
-//! - Updating: Progress indicator + live log + elapsed timer + cancel button
+//! - Idle: AdwStatusPage with "ready to update" messaging + last update time + image badge
+//! - Updating: Progress indicator + image badge + UpdateList + live log + timer + cancel
 //! - Complete: Success status page with reboot option
+//! - UpToDate: "You're already up to date" status page
 //! - Error: Error status page with retry option
-//!
-//! This pattern avoids manual show/hide logic and leverages GTK's
-//! built-in transition animations.
 
 use gtk::prelude::*;
 use relm4::prelude::*;
@@ -16,6 +14,7 @@ use std::time::Instant;
 
 use crate::app::AppState;
 use crate::ui::log_view::{LogView, LogViewInput};
+use crate::ui::update_list::{UpdateList, UpdateListInput};
 
 /// Input messages for the StatusView component.
 #[derive(Debug)]
@@ -47,6 +46,7 @@ pub enum StatusViewOutput {
 pub struct StatusView {
     state: AppState,
     log_view: Controller<LogView>,
+    update_list: Controller<UpdateList>,
     /// Direct reference to the root stack for page switching in update().
     stack: gtk::Stack,
     /// When the current update started (for elapsed timer).
@@ -59,6 +59,8 @@ pub struct StatusView {
     toast_overlay: adw::ToastOverlay,
     /// Label showing last update time on idle page.
     last_update_label: gtk::Label,
+    /// Image info badge shown on the idle page.
+    idle_image_box: gtk::Box,
 }
 
 #[relm4::component(pub)]
@@ -85,6 +87,10 @@ impl SimpleComponent for StatusView {
                     set_halign: gtk::Align::Center,
                     set_spacing: 12,
 
+                    // Image info badge — shows e.g. "bluefin · dx"
+                    #[local_ref]
+                    idle_image_box -> gtk::Box {},
+
                     gtk::Button {
                         set_label: "Check for Updates",
                         add_css_class: "suggested-action",
@@ -107,9 +113,8 @@ impl SimpleComponent for StatusView {
             },
 
             // ─── Updating page ──────────────────────────────────────────
-            // The toast_overlay + its child content are built in init()
-            // because the view! macro cannot inline-construct a child for
-            // a pre-existing widget reference.
+            // Built imperatively in init() — the view! macro cannot inline-
+            // construct children for pre-existing widget references.
             add_child = &model.toast_overlay.clone() -> adw::ToastOverlay {} -> {
                 set_name: "updating",
             },
@@ -149,9 +154,35 @@ impl SimpleComponent for StatusView {
                 set_name: "complete",
             },
 
+            // ─── Up to date page ────────────────────────────────────────
+            add_child = &adw::StatusPage {
+                set_icon_name: Some("emblem-ok-symbolic"),
+                set_title: "Already Up to Date",
+                set_description: Some("Your system is current.\nNo updates are available right now."),
+
+                #[wrap(Some)]
+                set_child = &gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_halign: gtk::Align::Center,
+                    set_spacing: 12,
+
+                    gtk::Button {
+                        set_label: "Done",
+                        add_css_class: "suggested-action",
+                        add_css_class: "pill",
+                        set_tooltip_text: Some("Return to the main screen"),
+                        connect_clicked[sender] => move |_| {
+                            sender.input(StatusViewInput::StateChanged(AppState::Idle));
+                        },
+                    },
+                },
+            } -> {
+                set_name: "up_to_date",
+            },
+
             // ─── Error page ─────────────────────────────────────────────
             add_child = &adw::StatusPage {
-                set_icon_name: Some("dialog-error-symbolic"),
+                set_icon_name: Some("dialog-warning-symbolic"),
                 set_title: "Update Failed",
                 set_description: Some("An unexpected error occurred"),
 
@@ -191,9 +222,8 @@ impl SimpleComponent for StatusView {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let log_view = LogView::builder()
-            .launch(())
-            .detach();
+        let log_view = LogView::builder().launch(()).detach();
+        let update_list = UpdateList::builder().launch(()).detach();
 
         let elapsed_label = gtk::Label::new(Some("0:00"));
         elapsed_label.add_css_class("dim-label");
@@ -203,11 +233,18 @@ impl SimpleComponent for StatusView {
         let last_update_label = gtk::Label::new(None);
         let toast_overlay = adw::ToastOverlay::new();
 
+        // Image info badge for the idle page.
+        let idle_image_box = build_image_badge(read_image_info().as_deref());
+
         // Build the "updating" page content imperatively.
-        // The view! macro can't inline-construct children for pre-existing widgets.
         let progress_bar = gtk::ProgressBar::new();
         progress_bar.set_show_text(false);
         progress_bar.add_css_class("osd");
+
+        // Image badge for the updating page header.
+        let updating_image_box = build_image_badge(read_image_info().as_deref());
+        updating_image_box.set_margin_top(8);
+        updating_image_box.set_margin_bottom(4);
 
         let log_clamp = adw::Clamp::new();
         log_clamp.set_maximum_size(800);
@@ -246,15 +283,16 @@ impl SimpleComponent for StatusView {
 
         let updating_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
         updating_content.append(&progress_bar);
+        updating_content.append(&updating_image_box);
+        updating_content.append(update_list.widget());
         updating_content.append(&log_clamp);
         updating_content.append(&bottom_bar);
 
         toast_overlay.set_child(Some(&updating_content));
 
-        // Try to read last update time from uupd state.
-        let last_update_text = get_last_update_time();
-        if let Some(text) = &last_update_text {
-            last_update_label.set_label(text);
+        // Populate last update time on the idle page.
+        if let Some(text) = get_last_update_time() {
+            last_update_label.set_label(&text);
             last_update_label.set_visible(true);
         } else {
             last_update_label.set_visible(false);
@@ -263,15 +301,17 @@ impl SimpleComponent for StatusView {
         let model = StatusView {
             state: init,
             log_view,
+            update_list,
             stack: root.clone(),
             update_start: None,
             elapsed_label: elapsed_label.clone(),
             log_text: String::new(),
             toast_overlay,
             last_update_label: last_update_label.clone(),
+            idle_image_box: idle_image_box.clone(),
         };
 
-        let _elapsed_label = &model.elapsed_label;
+        let idle_image_box = &model.idle_image_box;
         let last_update_label = &model.last_update_label;
         let widgets = view_output!();
 
@@ -295,28 +335,34 @@ impl SimpleComponent for StatusView {
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
         match msg {
             StatusViewInput::StateChanged(new_state) => {
-                // Switch the visible stack page based on current state.
                 let stack_name = match &new_state {
                     AppState::Idle => "idle",
                     AppState::Updating => "updating",
                     AppState::Complete => "complete",
+                    AppState::UpToDate => "up_to_date",
                     AppState::Error(_) => "error",
                 };
                 self.stack.set_visible_child_name(stack_name);
 
-                // Track timing.
                 match &new_state {
                     AppState::Updating => {
                         self.update_start = Some(Instant::now());
                         self.elapsed_label.set_label("0:00");
+                        self.update_list.emit(UpdateListInput::Reset);
                     }
-                    AppState::Complete | AppState::Error(_) => {
-                        // Keep final elapsed time visible.
+                    AppState::Complete => {
+                        self.update_start = None;
+                        self.update_list.emit(UpdateListInput::MarkAllComplete);
+                    }
+                    AppState::Error(_) => {
+                        self.update_start = None;
+                        self.update_list.emit(UpdateListInput::MarkCurrentFailed);
+                    }
+                    AppState::UpToDate => {
                         self.update_start = None;
                     }
                     AppState::Idle => {
                         self.update_start = None;
-                        // Refresh last update time when returning to idle.
                         if let Some(text) = get_last_update_time() {
                             self.last_update_label.set_label(&text);
                             self.last_update_label.set_visible(true);
@@ -324,7 +370,7 @@ impl SimpleComponent for StatusView {
                     }
                 }
 
-                // Update error description dynamically.
+                // Dynamically set error description from the error payload.
                 if let AppState::Error(ref err) = new_state {
                     if let Some(page) = self.stack.child_by_name("error") {
                         if let Ok(status_page) = page.downcast::<adw::StatusPage>() {
@@ -335,17 +381,21 @@ impl SimpleComponent for StatusView {
 
                 self.state = new_state;
             }
+
             StatusViewInput::AppendLog(line) => {
                 if !self.log_text.is_empty() {
                     self.log_text.push('\n');
                 }
                 self.log_text.push_str(&line);
+                self.update_list.emit(UpdateListInput::ProcessLine(line.clone()));
                 self.log_view.emit(LogViewInput::AppendLine(line));
             }
+
             StatusViewInput::ClearLog => {
                 self.log_text.clear();
                 self.log_view.emit(LogViewInput::Clear);
             }
+
             StatusViewInput::TimerTick => {
                 if let Some(start) = self.update_start {
                     let elapsed = start.elapsed();
@@ -356,6 +406,7 @@ impl SimpleComponent for StatusView {
                         .set_label(&format!("{}:{:02}", mins, remaining_secs));
                 }
             }
+
             StatusViewInput::CopyLog => {
                 if let Some(display) = gtk::gdk::Display::default() {
                     let clipboard = display.clipboard();
@@ -369,14 +420,69 @@ impl SimpleComponent for StatusView {
     }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Build a pill-style image info badge widget.
+/// Returns a hidden, zero-height box if no text is available.
+fn build_image_badge(text: Option<&str>) -> gtk::Box {
+    let badge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    badge.set_halign(gtk::Align::Center);
+    badge.set_visible(text.is_some());
+
+    if let Some(label_text) = text {
+        badge.add_css_class("card");
+
+        let label = gtk::Label::new(Some(label_text));
+        label.add_css_class("caption");
+        label.add_css_class("monospace");
+        label.set_margin_start(12);
+        label.set_margin_end(12);
+        label.set_margin_top(4);
+        label.set_margin_bottom(4);
+
+        badge.append(&label);
+    }
+
+    badge
+}
+
+/// Read the current OS image name and variant from `/etc/os-release`.
+/// Tries `/run/host/etc/os-release` first for Flatpak compatibility.
+fn read_image_info() -> Option<String> {
+    // /run/host/etc/os-release is populated when the Flatpak has host filesystem access.
+    let candidates = ["/run/host/etc/os-release", "/etc/os-release"];
+
+    for path in &candidates {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let mut image_id: Option<String> = None;
+            let mut variant_id: Option<String> = None;
+
+            for line in content.lines() {
+                if let Some(v) = line.strip_prefix("IMAGE_ID=") {
+                    image_id = Some(v.trim_matches('"').to_string());
+                } else if let Some(v) = line.strip_prefix("VARIANT_ID=") {
+                    variant_id = Some(v.trim_matches('"').to_string());
+                }
+            }
+
+            let result = match (image_id, variant_id) {
+                (Some(id), Some(var)) => Some(format!("{}  ·  {}", id, var)),
+                (Some(id), None) => Some(id),
+                _ => None,
+            };
+
+            if result.is_some() {
+                return result;
+            }
+        }
+    }
+
+    None
+}
+
 /// Try to determine when the last successful update ran.
-/// Checks uupd's state file or falls back to package timestamps.
 fn get_last_update_time() -> Option<String> {
-    // uupd stores state in /var/lib/uupd/ — check last-run timestamp.
-    let paths = [
-        "/var/lib/uupd/last-run",
-        "/var/lib/uupd/.last-run",
-    ];
+    let paths = ["/var/lib/uupd/last-run", "/var/lib/uupd/.last-run"];
 
     for path in &paths {
         if let Ok(metadata) = std::fs::metadata(path) {
@@ -395,7 +501,6 @@ fn get_last_update_time() -> Option<String> {
         }
     }
 
-    // Fallback: check rpm-ostree deployment timestamp.
     if let Ok(metadata) = std::fs::metadata("/sysroot/ostree/deploy") {
         if let Ok(modified) = metadata.modified() {
             if let Ok(elapsed) = modified.elapsed() {

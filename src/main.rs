@@ -12,6 +12,7 @@
 
 mod app;
 mod config;
+mod settings;
 mod update_worker;
 mod ui;
 

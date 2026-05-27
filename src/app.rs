@@ -50,8 +50,10 @@ use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
 use relm4::prelude::*;
 
 use crate::config;
+use crate::settings::Settings;
+use crate::ui::preferences::show_preferences;
 use crate::ui::status_view::{StatusView, StatusViewInput, StatusViewOutput};
-use crate::update_worker::{UpdateEvent, UpdateWorker};
+use crate::update_worker::{run_simulated, SimulationScenario, UpdateEvent, UpdateWorker};
 
 /// Application-level state.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -63,6 +65,8 @@ pub enum AppState {
     Updating,
     /// Update completed successfully.
     Complete,
+    /// uupd exited with code 77 — system is already current, nothing to do.
+    UpToDate,
     /// Update failed with an error message.
     Error(String),
 }
@@ -80,6 +84,10 @@ pub struct App {
     cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Reference to header bar for dynamic subtitle updates.
     header_bar: adw::HeaderBar,
+    /// Banner shown when developer mode is active.
+    dev_banner: adw::Banner,
+    /// Persistent user preferences.
+    settings: Settings,
 }
 
 /// Messages the App component can receive.
@@ -91,6 +99,8 @@ pub enum AppMsg {
     OutputLine(String),
     /// The subprocess exited successfully.
     UpdateComplete,
+    /// The subprocess reported that the system is already up to date (exit 77).
+    UpdateUpToDate,
     /// The subprocess failed.
     UpdateFailed(String),
     /// User wants to cancel the running update.
@@ -101,6 +111,12 @@ pub enum AppMsg {
     ConfirmReboot,
     /// User requested the About dialog.
     ShowAbout,
+    /// User requested the Preferences dialog.
+    ShowPreferences,
+    /// Settings were updated in the preferences dialog.
+    SettingsChanged(Settings),
+    /// Developer mode toggle from the hamburger menu.
+    ToggleDevMode(bool),
     /// Quit the application.
     Quit,
     /// Window close was requested — check if we should allow it.
@@ -134,6 +150,12 @@ impl SimpleComponent for App {
                     },
                 },
 
+                // Developer mode banner — shown when dev_mode is active.
+                add_top_bar = &model.dev_banner.clone() -> adw::Banner {
+                    set_title: "Developer Mode — updates are simulated",
+                    set_revealed: model.settings.dev_mode,
+                },
+
                 // Content area wrapped in ToastOverlay for transient notifications.
                 #[wrap(Some)]
                 set_content = &model.toast_overlay.clone() -> adw::ToastOverlay {
@@ -146,9 +168,13 @@ impl SimpleComponent for App {
 
     menu! {
         main_menu: {
-            "_About Finupdate" => AboutAction,
-            "_Keyboard Shortcuts" => ShortcutsAction,
-            "_Quit" => QuitAction,
+            "_Preferences" => PreferencesAction,
+            "_Developer Mode" => DeveloperModeAction,
+            section! {
+                "_About Finupdate" => AboutAction,
+                "_Keyboard Shortcuts" => ShortcutsAction,
+                "_Quit" => QuitAction,
+            }
         }
     }
 
@@ -169,6 +195,9 @@ impl SimpleComponent for App {
 
         let toast_overlay = adw::ToastOverlay::new();
         let header_bar = adw::HeaderBar::new();
+        let dev_banner = adw::Banner::new("Developer Mode — updates are simulated");
+
+        let settings = Settings::load();
 
         let model = App {
             state: AppState::Idle,
@@ -177,6 +206,8 @@ impl SimpleComponent for App {
             status_view,
             cancel_tx: None,
             header_bar,
+            dev_banner,
+            settings,
         };
 
         let widgets = view_output!();
@@ -186,6 +217,13 @@ impl SimpleComponent for App {
             let sender = sender.input_sender().clone();
             RelmAction::new_stateless(move |_| {
                 sender.emit(AppMsg::ShowAbout);
+            })
+        };
+
+        let preferences_action: RelmAction<PreferencesAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.emit(AppMsg::ShowPreferences);
             })
         };
 
@@ -203,10 +241,23 @@ impl SimpleComponent for App {
             })
         };
 
+        // Stateful checkmark toggle for developer mode in the hamburger menu.
+        let dev_mode_action: RelmAction<DeveloperModeAction> = {
+            let sender = sender.input_sender().clone();
+            let initial = model.settings.dev_mode;
+            RelmAction::new_stateful(&initial, move |_, state: &mut bool| {
+                let new_state = !*state;
+                *state = new_state;
+                sender.emit(AppMsg::ToggleDevMode(new_state));
+            })
+        };
+
         let mut group = RelmActionGroup::<WindowActionGroup>::new();
         group.add_action(about_action);
+        group.add_action(preferences_action);
         group.add_action(quit_action);
         group.add_action(shortcuts_action);
+        group.add_action(dev_mode_action);
         group.register_for_widget(&root);
 
         // ─── Keyboard Shortcuts ─────────────────────────────────────────
@@ -252,7 +303,9 @@ impl SimpleComponent for App {
                 self.cancel_tx = Some(cancel_tx);
 
                 // Spawn the async update worker on a background thread.
+                // cancel_rx is passed INTO the worker so it can kill the real process.
                 let input_sender = sender.input_sender().clone();
+                let dev_mode = self.settings.dev_mode;
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -260,36 +313,28 @@ impl SimpleComponent for App {
                         .expect("Failed to create tokio runtime");
 
                     rt.block_on(async move {
-                        let mut worker = UpdateWorker::new();
-                        let mut rx = worker.run().await;
+                        let mut rx = if dev_mode {
+                            tracing::info!("Developer mode active — running simulated update");
+                            run_simulated(SimulationScenario::Success, cancel_rx).await
+                        } else {
+                            UpdateWorker::new().run(cancel_rx).await
+                        };
 
-                        // Use select! to race between events and cancellation.
-                        tokio::pin!(cancel_rx);
-
-                        loop {
-                            tokio::select! {
-                                event = rx.recv() => {
-                                    match event {
-                                        Some(UpdateEvent::Output(line)) => {
-                                            input_sender.emit(AppMsg::OutputLine(line));
-                                        }
-                                        Some(UpdateEvent::Complete) => {
-                                            input_sender.emit(AppMsg::UpdateComplete);
-                                            break;
-                                        }
-                                        Some(UpdateEvent::Error(err)) => {
-                                            input_sender.emit(AppMsg::UpdateFailed(err));
-                                            break;
-                                        }
-                                        None => break,
-                                    }
+                        while let Some(event) = rx.recv().await {
+                            match event {
+                                UpdateEvent::Output(line) => {
+                                    input_sender.emit(AppMsg::OutputLine(line));
                                 }
-                                _ = &mut cancel_rx => {
-                                    // User cancelled — the worker's process will be
-                                    // dropped when this scope exits, killing it.
-                                    input_sender.emit(AppMsg::UpdateFailed(
-                                        "Update cancelled by user".to_string()
-                                    ));
+                                UpdateEvent::Complete => {
+                                    input_sender.emit(AppMsg::UpdateComplete);
+                                    break;
+                                }
+                                UpdateEvent::UpToDate => {
+                                    input_sender.emit(AppMsg::UpdateUpToDate);
+                                    break;
+                                }
+                                UpdateEvent::Error(err) => {
+                                    input_sender.emit(AppMsg::UpdateFailed(err));
                                     break;
                                 }
                             }
@@ -324,6 +369,15 @@ impl SimpleComponent for App {
                     "System Update Complete",
                     "Your system has been updated. Restart to apply changes.",
                 );
+            }
+
+            AppMsg::UpdateUpToDate => {
+                tracing::info!("System is already up to date (uupd exit 77)");
+                self.state = AppState::UpToDate;
+                self.cancel_tx = None;
+                self.update_subtitle();
+                self.status_view
+                    .emit(StatusViewInput::StateChanged(AppState::UpToDate));
             }
 
             AppMsg::UpdateFailed(err) => {
@@ -424,6 +478,30 @@ impl SimpleComponent for App {
                 }
             }
 
+            AppMsg::ShowPreferences => {
+                if let Some(root) = self.status_view.widget().root() {
+                    if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
+                        let sender = sender.input_sender().clone();
+                        show_preferences(window, self.settings.clone(), move |updated| {
+                            sender.emit(AppMsg::SettingsChanged(updated));
+                        });
+                    }
+                }
+            }
+
+            AppMsg::SettingsChanged(new_settings) => {
+                tracing::debug!("Settings updated: dev_mode={}", new_settings.dev_mode);
+                self.settings = new_settings;
+                self.dev_banner.set_revealed(self.settings.dev_mode);
+            }
+
+            AppMsg::ToggleDevMode(enabled) => {
+                tracing::info!("Developer mode toggled via menu: {}", enabled);
+                self.settings.dev_mode = enabled;
+                self.settings.save();
+                self.dev_banner.set_revealed(enabled);
+            }
+
             AppMsg::Quit => {
                 // If update in progress, treat like close request (ask first).
                 if self.state == AppState::Updating {
@@ -474,6 +552,7 @@ impl App {
             AppState::Idle => None,
             AppState::Updating => Some("Updating…"),
             AppState::Complete => Some("Update complete"),
+            AppState::UpToDate => Some("Already up to date"),
             AppState::Error(_) => Some("Update failed"),
         };
         // AdwHeaderBar doesn't have subtitle — set window title instead.
@@ -535,5 +614,7 @@ fn send_notification(id: &str, title: &str, body: &str) {
 // Action group and actions for the window-level menu.
 relm4::new_action_group!(WindowActionGroup, "win");
 relm4::new_stateless_action!(AboutAction, WindowActionGroup, "about");
+relm4::new_stateless_action!(PreferencesAction, WindowActionGroup, "preferences");
 relm4::new_stateless_action!(QuitAction, WindowActionGroup, "quit");
 relm4::new_stateless_action!(ShortcutsAction, WindowActionGroup, "show-shortcuts");
+relm4::new_stateful_action!(DeveloperModeAction, WindowActionGroup, "dev-mode", (), bool);
