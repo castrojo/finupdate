@@ -1,0 +1,305 @@
+# Bluefin Utility App Patterns
+
+> Architectural patterns extracted from **Finpilot** — the first app in the Bluefin utility suite.
+> Every future Bluefin app should start from these patterns for consistency.
+
+---
+
+## 1. Project Scaffold
+
+### Cargo.toml Template
+
+```toml
+[package]
+name = "your-app-name"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+# GTK4 bindings — always use the `gtk4` package aliased as `gtk`
+gtk = { version = "0.8", package = "gtk4" }
+
+# libadwaita — enable version feature for the minimum libadwaita you target
+adw = { version = "0.6", package = "libadwaita", features = ["v1_5"] }
+
+# Relm4 with libadwaita feature — this replaces gtk::Application with adw::Application
+relm4 = { version = "0.8", features = ["libadwaita"] }
+
+# Tokio — only include features you actually need
+tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "macros"] }
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+```
+
+### Why these choices:
+- **`gtk4` aliased as `gtk`**: matches upstream convention and all documentation
+- **`libadwaita` aliased as `adw`**: matches the C library namespace
+- **relm4 `"libadwaita"` feature**: ensures `adw::init()` is called before any widget creation
+- **Tokio**: needed for async subprocess/network I/O — GTK's own async (gio) is harder to use from Rust
+
+### Crate Structure
+
+```
+src/
+├── main.rs              # Entry point: logging + relm4 app launch
+├── app.rs               # Top-level component (owns the window)
+├── ui/
+│   ├── mod.rs           # Re-exports child components
+│   ├── status_view.rs   # State-driven content switcher
+│   └── log_view.rs      # Scrollable text output
+└── <domain>_worker.rs   # Async logic (subprocess, network, etc.)
+data/
+├── org.projectbluefin.<AppName>.desktop
+└── org.projectbluefin.<AppName>.metainfo.xml
+```
+
+### Development Container
+
+Use the `.devcontainer/` setup for reproducible builds:
+- Base: `mcr.microsoft.com/devcontainers/rust:latest`
+- Post-create: install `libgtk-4-dev` and `libadwaita-1-dev`
+
+---
+
+## 2. App Entry Point Pattern
+
+```rust
+const APP_ID: &str = "org.projectbluefin.YourApp";
+
+fn main() {
+    // 1. Structured logging (respects RUST_LOG)
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    // 2. RelmApp handles adw::init() and GLib main loop
+    let app = relm4::RelmApp::new(APP_ID);
+    app.run::<AppComponent>(());
+}
+```
+
+### Rules:
+- **APP_ID must match** the `.desktop` filename and metainfo `<id>` exactly
+- **Never call `gtk::init()` manually** — relm4 + libadwaita feature handles it
+- **Never create widgets before `app.run()`** — Adwaita CSS hasn't loaded yet
+
+---
+
+## 3. Main Window Pattern
+
+```rust
+view! {
+    adw::ApplicationWindow {
+        set_title: Some("Window Title"),
+        set_default_size: (600, 500),
+        set_width_request: 360,   // HIG minimum
+        set_height_request: 360,  // HIG minimum
+
+        adw::ToolbarView {
+            add_top_bar = &adw::HeaderBar {},
+
+            #[wrap(Some)]
+            set_content = &adw::ToastOverlay {
+                // Your content here
+            },
+        },
+    }
+}
+```
+
+### Key decisions:
+- **`AdwToolbarView`** (not raw Box + HeaderBar): handles header integration with scrolling content, unfloating on scroll, etc.
+- **`AdwToastOverlay`** wraps content: allows any component to show transient notifications without prop-drilling
+- **`AdwHeaderBar`** (not `gtk::HeaderBar`): respects the Adwaita style and integrates with AdwToolbarView
+- **When to use `AdwNavigationView`**: multi-page flows (wizards, settings with subpages). Single-view apps use ToolbarView alone.
+
+---
+
+## 4. Async Subprocess Pattern
+
+### Architecture
+
+```
+┌──────────────────┐     mpsc::channel      ┌─────────────────┐
+│  relm4 Component │ ◄──────────────────────│  Worker (tokio)  │
+│  (GTK main loop) │                         │  (std::thread)   │
+│                  │  sender.emit(AppMsg)    │                  │
+└──────────────────┘                         └─────────────────┘
+```
+
+### Why this approach:
+1. **Separate thread for tokio**: GTK owns the main thread. Tokio needs its own runtime.
+2. **mpsc channel from worker → component**: decouples I/O from UI, makes worker testable in isolation.
+3. **`sender.emit()`**: thread-safe; queues messages to the GLib main loop for processing.
+
+### Worker implementation:
+
+```rust
+pub struct Worker { /* command, args */ }
+
+pub enum WorkerEvent {
+    Output(String),
+    Complete,
+    Error(String),
+}
+
+impl Worker {
+    pub async fn run(&mut self) -> mpsc::UnboundedReceiver<WorkerEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            // Spawn process, stream lines, send events via tx
+        });
+        rx
+    }
+}
+```
+
+### Connecting to the component:
+
+```rust
+// In the component's update() method:
+let input_sender = sender.input_sender().clone();
+std::thread::spawn(move || {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let mut worker = Worker::new();
+        let mut rx = worker.run().await;
+        while let Some(event) = rx.recv().await {
+            input_sender.emit(/* convert event to AppMsg */);
+        }
+    });
+});
+```
+
+### Alternative: relm4 `CommandOutput`
+For simpler cases, relm4's `Component::CommandOutput` type + `sender.command()` works well. Use the thread + channel pattern when you need streaming (many events over time) rather than a single result.
+
+---
+
+## 5. Status/Feedback Pattern
+
+### State-driven view switching with `gtk::Stack`
+
+```rust
+view! {
+    gtk::Stack {
+        set_transition_type: gtk::StackTransitionType::Crossfade,
+        set_transition_duration: 200,
+
+        add_child = &adw::StatusPage { /* idle state */ } -> { set_name: "idle" },
+        add_child = &gtk::Box { /* active state */ } -> { set_name: "active" },
+        add_child = &adw::StatusPage { /* error state */ } -> { set_name: "error" },
+    }
+}
+```
+
+Then in `update_view()`:
+```rust
+stack.set_visible_child_name(match &self.state {
+    State::Idle => "idle",
+    State::Active => "active",
+    State::Error(_) => "error",
+});
+```
+
+### AdwStatusPage — when and how:
+- **Empty states**: "No items yet", "Nothing to show"
+- **Error states**: with `dialog-error-symbolic` icon and retry button
+- **Success states**: with `emblem-ok-symbolic`
+- Always include `icon_name`, `title`, and optionally `description`
+
+### AdwToast — transient notifications:
+```rust
+let toast = adw::Toast::new("Operation complete");
+toast.set_timeout(5); // seconds; 0 = persistent until dismissed
+self.toast_overlay.add_toast(toast);
+```
+- Use for: success confirmations, non-critical warnings
+- Do NOT use for: errors that need user action (use StatusPage instead)
+
+### Progress indication:
+- **Determinate**: `gtk::ProgressBar` with `set_fraction()` when you know percentage
+- **Indeterminate**: `gtk::ProgressBar` with `pulse()` on a timer when progress is unknown
+- **Spinner**: `adw::Spinner` for small inline loading indicators
+
+---
+
+## 6. HIG Compliance Checklist
+
+Run through this before shipping any Bluefin utility app:
+
+### Icons
+- [ ] All icons use `-symbolic` suffix (e.g., `system-software-update-symbolic`)
+- [ ] No hardcoded icon paths — only icon names from the system theme
+- [ ] Window has an appropriate icon name set
+
+### Spacing & Layout
+- [ ] No hardcoded pixel values for margins/padding — use Adwaita CSS classes
+- [ ] Text content is wrapped in `AdwClamp` (max ~800px) for readability
+- [ ] Buttons use appropriate style classes: `suggested-action`, `destructive-action`, `pill`
+- [ ] Content spacing uses multiples of 6px (Adwaita's base unit)
+
+### Accessibility
+- [ ] Every button has `set_accessible_label` if icon-only
+- [ ] Interactive elements are keyboard-navigable (natural with GTK, but verify)
+- [ ] Text views have appropriate `AccessibleRole` (e.g., `Log` for output)
+- [ ] Color is never the only way to convey information
+
+### Behavior
+- [ ] Single-instance via GApplication (automatic with correct APP_ID)
+- [ ] Window remembers size/position (AdwApplicationWindow handles this if you set an ID)
+- [ ] Destructive actions have confirmation dialogs
+- [ ] Long operations show progress and remain cancelable where possible
+- [ ] Errors are shown in-context (StatusPage), not as modal dialogs
+
+### Metadata
+- [ ] `.desktop` file has correct `DBusActivatable=true`
+- [ ] AppStream metainfo passes `appstreamcli validate`
+- [ ] App ID follows `org.projectbluefin.<AppName>` convention
+- [ ] Content rating (`oars-1.1`) is present even if empty
+
+### Dark Mode
+- [ ] App respects system color scheme (automatic with libadwaita)
+- [ ] No hardcoded colors anywhere — only Adwaita CSS variables
+- [ ] Tested in both light and dark mode
+
+---
+
+## Quick Start: New App
+
+```bash
+# 1. Clone the template structure from finpilot
+cp -r finpilot/ my-new-app/
+cd my-new-app/
+
+# 2. Rename in Cargo.toml, APP_ID, desktop/metainfo files
+sed -i 's/Finpilot/MyNewApp/g' **/*.rs data/*
+sed -i 's/finpilot/my-new-app/g' Cargo.toml
+
+# 3. Replace the worker with your domain logic
+
+# 4. Build & run
+cargo run
+```
+
+---
+
+## Appendix: Version Compatibility Matrix
+
+| Crate | Version | Maps to |
+|-------|---------|---------|
+| gtk4-rs (`gtk`) | 0.8.x | GTK 4.14+ (GNOME 46+) |
+| libadwaita-rs (`adw`) | 0.6.x | libadwaita 1.5+ (GNOME 46+) |
+| relm4 | 0.8.x | Stable macro syntax |
+| tokio | 1.x | Async runtime |
+
+When GNOME 47+ ships new widgets, bump the `features = ["v1_6"]` in your libadwaita dep.

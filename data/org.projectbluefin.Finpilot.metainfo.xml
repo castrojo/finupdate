@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Minimal AppStream metainfo for Finpilot.
+     See https://www.freedesktop.org/software/appstream/docs/ for full spec. -->
+<component type="desktop-application">
+  <id>org.projectbluefin.Finpilot</id>
+  <name>System Update</name>
+  <summary>A friendly frontend for system updates</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+
+  <description>
+    <p>
+      Finpilot provides a graphical interface for running system updates
+      via uupd on Bluefin and Universal Blue systems. It shows live progress,
+      logs, and clear status feedback.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">org.projectbluefin.Finpilot.desktop</launchable>
+
+  <url type="homepage">https://projectbluefin.io</url>
+  <url type="bugtracker">https://github.com/castrojo/finupdate/issues</url>
+
+  <developer id="org.projectbluefin">
+    <name>Project Bluefin</name>
+  </developer>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#99c1f1</color>
+    <color type="primary" scheme_preference="dark">#1a5fb4</color>
+  </branding>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.1.0" date="2026-05-26">
+      <description>
+        <p>Initial MVP release.</p>
+      </description>
+    </release>
+  </releases>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>touch</control>
+  </supports>
+</component>

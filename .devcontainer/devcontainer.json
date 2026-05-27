@@ -1,0 +1,20 @@
+{
+  "name": "Finpilot (Rust + GTK4 + libadwaita)",
+  "image": "mcr.microsoft.com/devcontainers/rust:latest",
+  "features": {},
+  "containerEnv": {
+    "CARGO_HOME": "/usr/local/cargo",
+    "RUSTUP_HOME": "/usr/local/rustup"
+  },
+  "postCreateCommand": ".devcontainer/post-create.sh",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "serayuzgur.crates",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  },
+  "remoteUser": "vscode"
+}
