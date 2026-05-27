@@ -12,6 +12,7 @@
 
 mod app;
 mod config;
+pub mod dbus_progress;
 mod registry_client;
 mod settings;
 mod ui;

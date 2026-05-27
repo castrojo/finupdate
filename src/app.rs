@@ -50,6 +50,7 @@ use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
 use relm4::prelude::*;
 
 use crate::config;
+use crate::dbus_progress::ProgressDBus;
 use crate::settings::Settings;
 use crate::ui::preferences::show_preferences;
 use crate::ui::rebase_dialog::show_rebase_dialog;
@@ -101,6 +102,8 @@ pub struct App {
     dev_banner: adw::Banner,
     /// Persistent user preferences.
     settings: Settings,
+    /// D-Bus progress publisher for the GNOME Shell panel extension.
+    progress_dbus: ProgressDBus,
 }
 
 /// Messages the App component can receive.
@@ -248,6 +251,7 @@ impl SimpleComponent for App {
             header_bar,
             dev_banner,
             settings,
+            progress_dbus: ProgressDBus::new(),
         };
 
         let widgets = view_output!();
@@ -430,6 +434,7 @@ impl SimpleComponent for App {
                 tracing::info!("Starting system update via uupd");
                 self.state = AppState::Updating;
                 self.log_lines.clear();
+                self.progress_dbus.update("updating", 0.0, "Starting update…");
 
                 // Update header subtitle to indicate activity.
                 self.update_subtitle();
@@ -489,6 +494,7 @@ impl SimpleComponent for App {
             }
 
             AppMsg::OpenCheckDialog => {
+                self.progress_dbus.update("checking", 0.0, "Checking for updates…");
                 if let Some(root) = self.status_view.widget().root() {
                     if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
                         let result_sender = sender.input_sender().clone();
@@ -516,8 +522,10 @@ impl SimpleComponent for App {
                 );
                 if result.sources_with_updates > 0 {
                     self.preflight_status = PreflightStatus::UpdateAvailable;
+                    self.progress_dbus.update("idle", 0.0, "Updates available");
                 } else {
                     self.preflight_status = PreflightStatus::UpToDate;
+                    self.progress_dbus.reset();
                 }
                 self.status_view.emit(StatusViewInput::PreflightResult(
                     self.preflight_status.clone(),
@@ -533,6 +541,18 @@ impl SimpleComponent for App {
             }
 
             AppMsg::OutputLine(line) => {
+                // Parse module progress for D-Bus (4 modules total)
+                if line.contains("module_name=") {
+                    let module_count = self.log_lines.iter()
+                        .filter(|l| l.contains("module_name="))
+                        .count() as f64;
+                    let progress = (module_count / 4.0).min(0.95);
+                    let module = line.split("module_name=").nth(1)
+                        .and_then(|s| s.split_whitespace().next())
+                        .unwrap_or("system");
+                    self.progress_dbus.set_progress(progress);
+                    self.progress_dbus.set_message(&format!("Updating {module}…"));
+                }
                 self.log_lines.push(line.clone());
                 self.status_view.emit(StatusViewInput::AppendLog(line));
             }
@@ -541,6 +561,7 @@ impl SimpleComponent for App {
                 tracing::info!("System update completed successfully");
                 self.state = AppState::Complete;
                 self.cancel_tx = None;
+                self.progress_dbus.update("complete", 1.0, "Update complete");
                 self.update_subtitle();
                 self.status_view
                     .emit(StatusViewInput::StateChanged(AppState::Complete));
@@ -563,6 +584,7 @@ impl SimpleComponent for App {
                 tracing::info!("System is already up to date (uupd exit 77)");
                 self.state = AppState::UpToDate;
                 self.cancel_tx = None;
+                self.progress_dbus.update("complete", 1.0, "Up to date");
                 self.update_subtitle();
                 self.status_view
                     .emit(StatusViewInput::StateChanged(AppState::UpToDate));
@@ -572,6 +594,7 @@ impl SimpleComponent for App {
                 tracing::error!("System update failed: {}", err);
                 self.state = AppState::Error(err.clone());
                 self.cancel_tx = None;
+                self.progress_dbus.update("error", 0.0, &err);
                 self.update_subtitle();
 
                 // Notify the user if window is backgrounded.

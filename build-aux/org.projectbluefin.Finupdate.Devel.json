@@ -14,6 +14,7 @@
         "--socket=fallback-x11",
         "--socket=wayland",
         "--talk-name=org.freedesktop.Flatpak",
+        "--own-name=org.projectbluefin.Finupdate",
         "--env=RUST_LOG=finupdate=debug",
         "--env=G_MESSAGES_DEBUG=none",
         "--env=RUST_BACKTRACE=1"

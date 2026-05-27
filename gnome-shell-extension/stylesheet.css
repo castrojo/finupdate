@@ -1,0 +1,9 @@
+/* Finupdate progress circle — top panel indicator */
+.finupdate-indicator {
+  padding: 0 4px;
+}
+
+.finupdate-indicator .progress-circle {
+  width: 18px;
+  height: 18px;
+}
