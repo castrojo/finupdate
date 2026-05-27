@@ -52,6 +52,7 @@ use relm4::prelude::*;
 use crate::config;
 use crate::settings::Settings;
 use crate::ui::preferences::show_preferences;
+use crate::ui::rebase_dialog::show_rebase_dialog;
 use crate::ui::status_view::{StatusView, StatusViewInput, StatusViewOutput};
 use crate::update_worker::{run_simulated, SimulationScenario, UpdateEvent, UpdateWorker};
 
@@ -109,6 +110,8 @@ pub enum AppMsg {
     RequestReboot,
     /// User confirmed reboot in the dialog.
     ConfirmReboot,
+    /// User requested the Rebase History dialog.
+    ShowRebaseDialog,
     /// User requested the About dialog.
     ShowAbout,
     /// User requested the Preferences dialog.
@@ -170,6 +173,9 @@ impl SimpleComponent for App {
         main_menu: {
             "_Preferences" => PreferencesAction,
             "_Developer Mode" => DeveloperModeAction,
+            section! {
+                "_Rebase to Previous Version…" => RebaseAction,
+            },
             section! {
                 "_About Finupdate" => AboutAction,
                 "_Keyboard Shortcuts" => ShortcutsAction,
@@ -252,12 +258,20 @@ impl SimpleComponent for App {
             })
         };
 
+        let rebase_action: RelmAction<RebaseAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.emit(AppMsg::ShowRebaseDialog);
+            })
+        };
+
         let mut group = RelmActionGroup::<WindowActionGroup>::new();
         group.add_action(about_action);
         group.add_action(preferences_action);
         group.add_action(quit_action);
         group.add_action(shortcuts_action);
         group.add_action(dev_mode_action);
+        group.add_action(rebase_action);
         group.register_for_widget(&root);
 
         // ─── Keyboard Shortcuts ─────────────────────────────────────────
@@ -458,6 +472,14 @@ impl SimpleComponent for App {
                 });
             }
 
+            AppMsg::ShowRebaseDialog => {
+                if let Some(root) = self.status_view.widget().root() {
+                    if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
+                        show_rebase_dialog(window);
+                    }
+                }
+            }
+
             AppMsg::ShowAbout => {
                 let about = adw::AboutDialog::builder()
                     .application_name("Finupdate")
@@ -617,4 +639,5 @@ relm4::new_stateless_action!(AboutAction, WindowActionGroup, "about");
 relm4::new_stateless_action!(PreferencesAction, WindowActionGroup, "preferences");
 relm4::new_stateless_action!(QuitAction, WindowActionGroup, "quit");
 relm4::new_stateless_action!(ShortcutsAction, WindowActionGroup, "show-shortcuts");
+relm4::new_stateless_action!(RebaseAction, WindowActionGroup, "rebase-history");
 relm4::new_stateful_action!(DeveloperModeAction, WindowActionGroup, "dev-mode", (), bool);

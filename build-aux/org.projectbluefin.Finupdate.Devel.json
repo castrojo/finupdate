@@ -9,6 +9,7 @@
     "command": "finupdate",
     "finish-args": [
         "--device=dri",
+        "--share=network",
         "--share=ipc",
         "--socket=fallback-x11",
         "--socket=wayland",

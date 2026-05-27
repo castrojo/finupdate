@@ -34,3 +34,16 @@ serde_json = "1"
 # Pangocairo — text layout in gtk::DrawingArea (segmented progress bar labels).
 # Wraps the pangocairo C library which ships with GNOME SDK 50.
 pangocairo = "0.22"
+
+# HTTP client for GHCR registry queries (rebase calendar).
+# rustls-tls: pure-Rust TLS — no system OpenSSL needed inside the Flatpak sandbox.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Date/time utilities — used to parse YYYYMMDD image tags and display build dates.
+chrono = { version = "0.4", features = ["serde"] }
+
+# futures::future::join_all — parallel manifest fetches in registry_client.
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# thiserror — ergonomic error type derivation for RegistryError.
+thiserror = "1"

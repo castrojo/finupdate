@@ -12,6 +12,7 @@
 
 mod app;
 mod config;
+mod registry_client;
 mod settings;
 mod update_worker;
 mod ui;
