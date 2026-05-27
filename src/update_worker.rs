@@ -1,9 +1,54 @@
 //! Async subprocess worker for invoking `uupd`.
 //!
-//! Pattern: Subprocess streaming with Flatpak sandbox awareness
+//! ## About uupd
+//!
+//! `uupd` (Universal Update) is the system update daemon for Universal Blue / Bluefin.
+//! It coordinates updates across 4 independent modules:
+//!
+//! | Module | What it updates | Backend |
+//! |--------|----------------|---------|
+//! | System | The OS image (bootc/rpm-ostree) | `bootc upgrade` or `rpm-ostree upgrade` |
+//! | Flatpak | User + system Flatpak apps | `flatpak update` |
+//! | Brew | Homebrew packages in /home/linuxbrew | `brew upgrade` |
+//! | Distrobox | Container-based distro environments | `distrobox upgrade` |
+//!
+//! ### Key behaviors:
+//! - **Requires root** — must be run as `sudo uupd` (or via polkit/pkexec)
+//! - **Lock file** — only one instance can run at a time
+//! - **Exit codes** — 0 = success, non-zero = at least one module failed
+//! - **Logging** — uses Go's `slog`; default `info` level shows module progress
+//! - **Progress** — emits OSC terminal progress sequences (disabled with `--json`)
+//! - **Config** — reads `/etc/uupd/config.json` for module enable/disable
+//! - **Systemd** — normally runs via `uupd.timer` daily at 04:00
+//! - **update-check** — exits 0 if update available, 77 if not (useful for pre-checking)
+//!
+//! ### Useful flags for GUI integration:
+//! - `--verbose` / `-v` — shows command output from each module (more log lines)
+//! - `--dry-run` / `-n` — simulates without making changes
+//! - `--force` / `-f` — skips update-check, forces system module to run
+//! - `--json` — structured JSON log output (parseable but noisy)
+//! - `--disable-module-<name>` — skip a specific module
+//! - `--log-level debug` — very verbose, shows all subprocess output
+//!
+//! ### Output format (default info level):
+//! ```text
+//! time=... level=INFO msg="Hardware checks passed"
+//! time=... level=INFO msg="System" module_name=System
+//! time=... level=INFO msg="Flatpak" module_name=Flatpak
+//! time=... level=INFO msg="Updates Completed Successfully"
+//! ```
+//!
+//! On failure:
+//! ```text
+//! time=... level=ERROR msg="module_fail" module=System cli="bootc upgrade"
+//! time=... level=ERROR msg="Updates finished with errors!"
+//! ```
+//!
+//! ## Pattern: Subprocess streaming with Flatpak sandbox awareness
+//!
 //! - Detect if running inside a Flatpak sandbox (via /.flatpak-info)
 //! - If sandboxed, use `flatpak-spawn --host` to run commands on the host
-//! - Spawn the process with stdout piped
+//! - Spawn the process with stdout/stderr piped
 //! - Read lines asynchronously via tokio
 //! - Send structured events back through an mpsc channel
 //! - The caller (relm4 component) receives events and updates UI state

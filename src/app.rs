@@ -1,13 +1,49 @@
 //! Top-level application component.
 //!
-//! Pattern: Main window component owns the `AdwApplicationWindow` and orchestrates
-//! child components. Uses `AdwToolbarView` as the structural backbone (header + content),
-//! with `AdwToastOverlay` wrapping the content area for transient notifications.
+//! ## relm4 Design Rationale
 //!
-//! State machine:
+//! This module demonstrates the **canonical relm4 component pattern** for Bluefin apps:
+//!
+//! 1. **Single top-level component** owns the `AdwApplicationWindow` and the state machine.
+//!    It is the sole orchestrator — child components communicate UP via `Output` messages
+//!    and receive commands DOWN via `emit()` on their controller handle.
+//!
+//! 2. **Message-driven state** — all state transitions happen through `AppMsg` variants
+//!    processed in a single `update()` method. This makes state transitions explicit,
+//!    traceable (via `tracing`), and impossible to miss. No widget callbacks mutate
+//!    state directly.
+//!
+//! 3. **Forward pattern** — child component outputs are mapped to parent inputs via
+//!    `.forward(sender, |output| match output { ... })`. This decouples children from
+//!    the parent's message type.
+//!
+//! 4. **Action groups** — menu items and keyboard shortcuts use relm4's action system
+//!    (`new_action_group!`, `new_stateless_action!`) rather than raw GAction. This keeps
+//!    type safety and connects naturally to the message bus.
+//!
+//! 5. **Separate async thread** — long-running work (subprocess) runs on a tokio runtime
+//!    in `std::thread::spawn`. Results flow back via `sender.emit()` which is thread-safe
+//!    and queues messages on the GLib main loop.
+//!
+//! ## State machine
+//!
 //!   Idle → Updating → (Complete | Error) → Idle
 //!
-//! This module demonstrates the canonical Bluefin app window structure.
+//! ## Component hierarchy
+//!
+//!   App (this)
+//!   └── StatusView (content area, owns LogView)
+//!       └── LogView (scrollable text output)
+//!
+//! ## Why SimpleComponent (not Component)?
+//!
+//! `SimpleComponent` is sufficient because:
+//! - We don't need `CommandOutput` (we use manual thread + channel instead for streaming)
+//! - We don't produce output messages (top-level component has no parent)
+//! - The simpler trait reduces boilerplate
+//!
+//! Use full `Component` with `CommandOutput` when you need a single async result
+//! (not streaming). Use `AsyncComponent` when the init itself is async.
 
 use adw::prelude::*;
 use relm4::actions::{AccelsPlus, RelmAction, RelmActionGroup};
