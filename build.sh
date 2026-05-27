@@ -23,13 +23,26 @@ if [ -d "$HOME/.local/share/flatpak/exports/share/icons/hicolor" ]; then
 fi
 # Signal the desktop environment to rescan .desktop files and icons.
 update-desktop-database "$HOME/.local/share/flatpak/exports/share/applications" 2>/dev/null || true
+
+echo "==> Pinning to dock…"
+# Ensure the new APP_ID is in the dock and remove any legacy Finpilot entry.
+CURRENT=$(gsettings get org.gnome.shell favorite-apps 2>/dev/null || echo "[]")
+UPDATED=$(echo "$CURRENT" \
+    | sed "s|'org.projectbluefin.Finpilot.Devel.desktop'|'$APP_ID'|g" \
+    | sed "s|'org.projectbluefin.Finpilot.Devel'|'$APP_ID'|g")
+# Add APP_ID if not already present
+if ! echo "$UPDATED" | grep -q "$APP_ID"; then
+    UPDATED=$(echo "$UPDATED" | sed "s|]|, '$APP_ID']|")
+fi
+gsettings set org.gnome.shell favorite-apps "$UPDATED" 2>/dev/null || true
+
 # Notify GNOME Shell to reload its icon cache (works on Wayland + X11).
 gdbus call \
     --session \
     --dest org.gnome.Shell \
     --object-path /org/gnome/Shell \
     --method org.gnome.Shell.Eval \
-    'global.reexec_self()' 2>/dev/null \
+    'Main.iconGridLayout._loadData()' 2>/dev/null \
   || xdg-desktop-menu forceupdate 2>/dev/null \
   || true
 
