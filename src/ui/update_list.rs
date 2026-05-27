@@ -1,21 +1,22 @@
 //! Update list component — shows per-module status during an update run.
 //!
 //! Displays four rows (System, Flatpak, Brew, Distrobox) as `adw::ExpanderRow`
-//! widgets. Each row shows a status indicator (spinner while running, icon when
-//! complete/failed). A **Nerd Mode** toggle button expands all rows to reveal
-//! the raw log output attributed to each module.
+//! widgets inside an `adw::PreferencesGroup`. Each row shows a status indicator
+//! (spinner while running, icon when complete/failed).
 //!
-//! ## Module detection
-//! uupd logs emit `module_name=<Name>` when a module starts. This component
-//! parses incoming log lines via `ProcessLine` and transitions module state
-//! accordingly. It also detects `level=ERROR` / `module_fail` to mark failures.
+//! The **Nerd Mode** toggle lives in the group's header suffix slot
+//! (`set_header_suffix`) — the HIG-correct placement for a group-level action.
+//! When active, rows expand to reveal the raw log attributed to each module.
 //!
-//! ## Nerd Mode
-//! When off: rows are compact, expansion is disabled (no arrow visible).
-//! When on: all rows expand to show their attributed log lines in monospace text.
+//! ## HIG notes
+//! - `adw::PreferencesGroup` + `adw::ExpanderRow` is the canonical pattern for
+//!   expandable grouped rows; the group manages its own margins and separator.
+//! - Status icons follow the system icon naming spec:
+//!   `object-select-symbolic` (complete), `dialog-warning-symbolic` (failed).
+//! - The log sub-row wraps its label in an `adw::ActionRow` so padding and
+//!   typography match the rest of the row hierarchy automatically.
 
 use adw::prelude::*;
-use gtk::prelude::*;
 use relm4::prelude::*;
 
 /// The four uupd modules, in execution order.
@@ -82,6 +83,7 @@ impl SimpleComponent for UpdateList {
             set_orientation: gtk::Orientation::Vertical,
             set_spacing: 0,
         }
+
     }
 
     fn init(
@@ -89,22 +91,12 @@ impl SimpleComponent for UpdateList {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        // ── Header row ────────────────────────────────────────────────────
-        let header = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        header.set_margin_start(12);
-        header.set_margin_end(12);
-        header.set_margin_top(10);
-        header.set_margin_bottom(4);
-
-        let title = gtk::Label::new(Some("Component Updates"));
-        title.add_css_class("heading");
-        title.set_hexpand(true);
-        title.set_halign(gtk::Align::Start);
-
+        // ── Nerd Mode button — lives in the group header suffix slot ──────
+        // This is the HIG-correct placement for a group-level toggle action.
         let nerd_btn = gtk::ToggleButton::builder()
             .label("Nerd Mode")
             .icon_name("utilities-terminal-symbolic")
-            .tooltip_text("Expand rows to show detailed log output per component")
+            .tooltip_text("Show detailed log output per component")
             .build();
         nerd_btn.add_css_class("flat");
 
@@ -113,45 +105,50 @@ impl SimpleComponent for UpdateList {
             nerd_sender.emit(UpdateListInput::SetNerdMode(btn.is_active()));
         });
 
-        header.append(&title);
-        header.append(&nerd_btn);
-
-        // ── Module rows ───────────────────────────────────────────────────
-        let list_box = gtk::ListBox::new();
-        list_box.set_selection_mode(gtk::SelectionMode::None);
-        list_box.add_css_class("boxed-list");
-        list_box.set_margin_start(12);
-        list_box.set_margin_end(12);
-        list_box.set_margin_bottom(8);
+        // ── PreferencesGroup: handles title, margins, and boxed-list ─────
+        // adw::PreferencesGroup is the canonical HIG container for grouped
+        // rows; it owns the separator style and the correct top-level margins.
+        let group = adw::PreferencesGroup::builder()
+            .title("Component Updates")
+            .build();
+        group.set_header_suffix(Some(&nerd_btn));
 
         let mut modules = Vec::with_capacity(MODULES.len());
 
         for &(key, name, description) in MODULES {
+            // adw::ExpanderRow implements AdwPreferencesRow so it can be
+            // added directly to the group — no intermediate gtk::ListBox needed.
             let row = adw::ExpanderRow::builder()
                 .title(name)
                 .subtitle(description)
-                // Hide expand arrow until Nerd Mode is enabled.
+                // Arrow hidden until Nerd Mode is enabled — keeps the list
+                // compact and avoids affordance confusion while not interactive.
                 .enable_expansion(false)
                 .build();
 
-            // Status indicator: stack switches between visual states.
+            // ── Status indicator (suffix) ─────────────────────────────────
+            // gtk::Stack with crossfade transitions between four visual states.
             let status_stack = gtk::Stack::builder()
                 .transition_type(gtk::StackTransitionType::Crossfade)
                 .transition_duration(150)
                 .valign(gtk::Align::Center)
                 .build();
 
-            let pending_icon = gtk::Image::from_icon_name("media-playback-pause-symbolic");
+            // Pending: subtle loading indicator — neutral, non-intrusive
+            let pending_icon = gtk::Image::from_icon_name("content-loading-symbolic");
             pending_icon.add_css_class("dim-label");
 
+            // Running: animated spinner
             let spinner = gtk::Spinner::new();
             spinner.set_size_request(16, 16);
 
-            let complete_icon = gtk::Image::from_icon_name("emblem-ok-symbolic");
+            // Complete: system standard "selected/done" checkmark
+            let complete_icon = gtk::Image::from_icon_name("object-select-symbolic");
             complete_icon.add_css_class("success");
 
-            let failed_icon = gtk::Image::from_icon_name("dialog-error-symbolic");
-            failed_icon.add_css_class("error");
+            // Failed: warning triangle (less alarming than error, still clear)
+            let failed_icon = gtk::Image::from_icon_name("dialog-warning-symbolic");
+            failed_icon.add_css_class("warning");
 
             status_stack.add_named(&pending_icon, Some("pending"));
             status_stack.add_named(&spinner, Some("running"));
@@ -161,22 +158,31 @@ impl SimpleComponent for UpdateList {
 
             row.add_suffix(&status_stack);
 
-            // Log content widget — shown when the row is expanded (Nerd Mode).
-            let log_label = gtk::Label::new(Some("No output yet."));
+            // ── Log sub-row (Nerd Mode) ───────────────────────────────────
+            // Wrapping in adw::ActionRow gives the correct indentation, row
+            // height, and separator handling for a child of ExpanderRow.
+            let log_row = adw::ActionRow::new();
+            log_row.set_activatable(false);
+
+            let log_label = gtk::Label::builder()
+                .use_markup(false)
+                .selectable(true)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .xalign(0.0)
+                .valign(gtk::Align::Start)
+                .margin_top(6)
+                .margin_bottom(6)
+                .build();
             log_label.add_css_class("monospace");
             log_label.add_css_class("caption");
             log_label.add_css_class("dim-label");
-            log_label.set_xalign(0.0);
-            log_label.set_wrap(true);
-            log_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-            log_label.set_selectable(true);
-            log_label.set_margin_start(12);
-            log_label.set_margin_end(12);
-            log_label.set_margin_top(6);
-            log_label.set_margin_bottom(6);
+            log_label.set_text("No output yet.");
 
-            row.add_row(&log_label);
-            list_box.append(&row);
+            log_row.set_child(Some(&log_label));
+            row.add_row(&log_row);
+
+            group.add(&row);
 
             modules.push(ModuleEntry {
                 key,
@@ -190,8 +196,7 @@ impl SimpleComponent for UpdateList {
             });
         }
 
-        root.append(&header);
-        root.append(&list_box);
+        root.append(&group);
 
         let model = UpdateList {
             modules,

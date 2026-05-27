@@ -607,7 +607,7 @@ fn send_notification(id: &str, title: &str, body: &str) {
     let app = relm4::main_application();
     let notification = gtk::gio::Notification::new(title);
     notification.set_body(Some(body));
-    notification.set_icon(&gtk::gio::ThemedIcon::new("system-software-update-symbolic"));
+    notification.set_icon(&gtk::gio::ThemedIcon::new("software-update-available-symbolic"));
     app.send_notification(Some(id), &notification);
 }
 

@@ -13,6 +13,7 @@ use relm4::prelude::*;
 use std::time::Instant;
 
 use crate::app::AppState;
+use crate::config;
 use crate::ui::log_view::{LogView, LogViewInput};
 use crate::ui::update_list::{UpdateList, UpdateListInput};
 
@@ -77,7 +78,7 @@ impl SimpleComponent for StatusView {
 
             // ─── Idle page ──────────────────────────────────────────────
             add_child = &adw::StatusPage {
-                set_icon_name: Some("system-software-update-symbolic"),
+                set_icon_name: Some(config::APP_ID),
                 set_title: "System Up to Date",
                 set_description: Some("Your system is managed by uupd.\nClick below to check for and install updates now."),
 
@@ -121,7 +122,7 @@ impl SimpleComponent for StatusView {
 
             // ─── Complete page ──────────────────────────────────────────
             add_child = &adw::StatusPage {
-                set_icon_name: Some("emblem-ok-symbolic"),
+                set_icon_name: Some("object-select-symbolic"),
                 set_title: "Update Complete",
                 set_description: Some("Your system has been updated.\nRestart to apply changes."),
 
@@ -156,7 +157,7 @@ impl SimpleComponent for StatusView {
 
             // ─── Up to date page ────────────────────────────────────────
             add_child = &adw::StatusPage {
-                set_icon_name: Some("emblem-ok-symbolic"),
+                set_icon_name: Some("object-select-symbolic"),
                 set_title: "Already Up to Date",
                 set_description: Some("Your system is current.\nNo updates are available right now."),
 
