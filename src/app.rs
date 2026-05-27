@@ -281,6 +281,13 @@ impl SimpleComponent for App {
                 toast.set_timeout(0); // Persistent until dismissed
                 toast.set_button_label(Some("Dismiss"));
                 self.toast_overlay.add_toast(toast);
+
+                // Send a desktop notification if window is not focused.
+                send_notification(
+                    "update-complete",
+                    "System Update Complete",
+                    "Your system has been updated. Restart to apply changes.",
+                );
             }
 
             AppMsg::UpdateFailed(err) => {
@@ -288,6 +295,13 @@ impl SimpleComponent for App {
                 self.state = AppState::Error(err.clone());
                 self.cancel_tx = None;
                 self.update_subtitle();
+
+                // Notify the user if window is backgrounded.
+                send_notification(
+                    "update-failed",
+                    "System Update Failed",
+                    &err,
+                );
                 self.status_view
                     .emit(StatusViewInput::StateChanged(AppState::Error(err)));
             }
@@ -470,6 +484,16 @@ fn show_shortcuts_window(window: &adw::ApplicationWindow) {
     section.add_group(&group);
     shortcuts.add_section(&section);
     shortcuts.set_visible(true);
+}
+
+/// Send a desktop notification via GApplication.
+/// Notifications appear in the system notification area if the app is backgrounded.
+fn send_notification(id: &str, title: &str, body: &str) {
+    let app = relm4::main_application();
+    let notification = gtk::gio::Notification::new(title);
+    notification.set_body(Some(body));
+    notification.set_icon(&gtk::gio::ThemedIcon::new("system-software-update-symbolic"));
+    app.send_notification(Some(id), &notification);
 }
 
 // Action group and actions for the window-level menu.

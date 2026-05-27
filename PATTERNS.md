@@ -13,18 +13,18 @@
 [package]
 name = "your-app-name"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 
 [dependencies]
 # GTK4 bindings — always use the `gtk4` package aliased as `gtk`
-gtk = { version = "0.8", package = "gtk4" }
+gtk = { version = "0.11", package = "gtk4", features = ["v4_16"] }
 
 # libadwaita — enable version feature for the minimum libadwaita you target
-adw = { version = "0.6", package = "libadwaita", features = ["v1_5"] }
+adw = { version = "0.9", package = "libadwaita", features = ["v1_7"] }
 
 # Relm4 with libadwaita feature — this replaces gtk::Application with adw::Application
-relm4 = { version = "0.8", features = ["libadwaita"] }
+relm4 = { version = "0.11", features = ["libadwaita"] }
 
 # Tokio — only include features you actually need
 tokio = { version = "1", features = ["rt-multi-thread", "process", "io-util", "sync", "macros"] }
@@ -37,6 +37,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ### Why these choices:
 - **`gtk4` aliased as `gtk`**: matches upstream convention and all documentation
 - **`libadwaita` aliased as `adw`**: matches the C library namespace
+- **`v4_16` / `v1_7` features**: gates APIs to the latest stable GNOME 47+ release
+- **Edition 2024**: latest Rust edition for modern syntax (e.g., `use` in closures)
 - **relm4 `"libadwaita"` feature**: ensures `adw::init()` is called before any widget creation
 - **Tokio**: needed for async subprocess/network I/O — GTK's own async (gio) is harder to use from Rust
 
@@ -311,10 +313,44 @@ let about = adw::AboutDialog::builder()
     .license_type(gtk::License::MitX11)
     .developers(vec!["Contributors"])
     .build();
-about.present(window);  // takes &impl IsA<gtk::Widget>
+about.present(Some(window));  // takes Option<&impl IsA<gtk::Widget>> in 0.9+
 ```
 
 **Import**: Requires `use adw::prelude::*` for the `AdwDialogExt::present()` method.
+
+### Window Close Guard:
+
+Prevent the window from closing during destructive operations:
+
+```rust
+// In init(), connect to the close-request signal:
+root.connect_close_request(move |_| {
+    if *state_ref.borrow() == AppState::Updating {
+        // Show a toast or warning, then inhibit close
+        gtk::glib::Propagation::Stop
+    } else {
+        gtk::glib::Propagation::Proceed
+    }
+});
+```
+
+### Reboot Confirmation (AdwAlertDialog):
+
+```rust
+let dialog = adw::AlertDialog::builder()
+    .heading("Restart System?")
+    .body("A restart is required to apply the update.")
+    .build();
+dialog.add_response("cancel", "Cancel");
+dialog.add_response("restart", "Restart");
+dialog.set_response_appearance("restart", adw::ResponseAppearance::Destructive);
+dialog.connect_response(None, move |_, response| {
+    if response == "restart" {
+        // Execute reboot
+    }
+});
+dialog.present(Some(&window));
+```
 
 ---
 
@@ -363,6 +399,47 @@ self.toast_overlay.add_toast(toast);
 - **Determinate**: `gtk::ProgressBar` with `set_fraction()` when you know percentage
 - **Indeterminate**: `gtk::ProgressBar` with `pulse()` on a timer when progress is unknown
 - **Spinner**: `adw::Spinner` for small inline loading indicators
+
+### Desktop Notifications (GNotification):
+```rust
+fn send_notification(id: &str, title: &str, body: &str) {
+    let app = relm4::main_application();
+    let notification = gtk::gio::Notification::new(title);
+    notification.set_body(Some(body));
+    notification.set_icon(&gtk::gio::ThemedIcon::new("system-software-update-symbolic"));
+    app.send_notification(Some(id), &notification);
+}
+```
+- Use a stable `id` so repeat notifications replace rather than stack
+- Works in both Flatpak and native — no extra permissions needed
+
+### Elapsed Timer Pattern:
+```rust
+// In model:
+update_start: Option<std::time::Instant>,
+elapsed_label: gtk::Label,
+
+// Start timer when work begins:
+self.update_start = Some(Instant::now());
+
+// Periodic tick (every 250ms via glib::timeout_add_local):
+if let Some(start) = self.update_start {
+    let secs = start.elapsed().as_secs();
+    self.elapsed_label.set_label(&format!("{}:{:02}", secs / 60, secs % 60));
+}
+```
+- Use `gtk::glib::timeout_add_local()` — it runs on the main loop so UI updates are safe
+- Stop the timer by checking state in the callback, not by removing the source
+
+### Clipboard Pattern:
+```rust
+if let Some(display) = gtk::gdk::Display::default() {
+    let clipboard = display.clipboard();
+    clipboard.set_text(&self.log_text);
+    // Confirm with toast
+    self.toast_overlay.add_toast(adw::Toast::new("Copied to clipboard"));
+}
+```
 
 ---
 
@@ -431,11 +508,21 @@ cargo run
 
 | Crate | Version | Maps to |
 |-------|---------|---------|
-| gtk4-rs (`gtk`) | 0.8.x | GTK 4.14+ (GNOME 46+) |
-| libadwaita-rs (`adw`) | 0.6.x | libadwaita 1.5+ (GNOME 46+) |
-| relm4 | 0.8.x | Stable macro syntax |
+| gtk4-rs (`gtk`) | 0.11.x | GTK 4.16+ (GNOME 47+) |
+| libadwaita-rs (`adw`) | 0.9.x | libadwaita 1.7+ (GNOME 47+) |
+| relm4 | 0.11.x | Stable macro syntax |
 | tokio | 1.x | Async runtime |
 
 **Flatpak SDK versions**: GNOME Sdk 50 maps to freedesktop-sdk 25.08. The rust-stable extension must match the SDK base version (e.g., `rust-stable//25.08` for GNOME 50).
 
-When GNOME 47+ ships new widgets, bump the `features = ["v1_6"]` in your libadwaita dep.
+When GNOME 48+ ships new widgets, bump the `features = ["v1_8"]` in your libadwaita dep.
+
+### libadwaita 0.9 breaking change:
+`AdwDialog::present()` now takes `Option<&impl IsA<Widget>>`:
+```rust
+// Old (0.6):
+about.present(&window);
+
+// New (0.9):
+about.present(Some(&window));
+```
