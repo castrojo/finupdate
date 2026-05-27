@@ -92,20 +92,33 @@ impl RegistryClient {
         }
     }
 
+    pub fn registry(&self) -> &str { &self.registry }
+    pub fn org(&self) -> &str { &self.org }
+    pub fn image(&self) -> &str { &self.image }
+
     /// Detect the current image stream from the running system.
     ///
     /// Tries `bootc status --json` first, then falls back to parsing
     /// `/run/host/etc/os-release` (Flatpak-friendly path).
     pub async fn detect() -> Option<Self> {
+        println!("[debug] RegistryClient::detect()");
         // Try bootc status --json for the most reliable answer.
         if let Some(client) = Self::detect_from_bootc().await {
             return Some(client);
         }
         // Fallback: parse os-release
-        Self::detect_from_os_release()
+        let fallback = Self::detect_from_os_release();
+        println!("[debug] RegistryClient::detect() fallback os-release = {:?}", fallback.as_ref().map(|c| c.stream.clone()));
+        fallback
     }
 
     async fn detect_from_bootc() -> Option<Self> {
+        let cmd_name = if crate::update_worker::is_flatpak() {
+            "flatpak-spawn --host bootc status --json"
+        } else {
+            "bootc status --json"
+        };
+        println!("[debug] RegistryClient::detect_from_bootc() running {}", cmd_name);
         let output = if crate::update_worker::is_flatpak() {
             tokio::process::Command::new("flatpak-spawn")
                 .args(["--host", "bootc", "status", "--json"])
@@ -120,6 +133,7 @@ impl RegistryClient {
                 .ok()?
         };
 
+        println!("[debug] RegistryClient::detect_from_bootc() exit = {:?}", output.status);
         if !output.status.success() {
             return None;
         }
@@ -136,24 +150,69 @@ impl RegistryClient {
         parse_image_ref(image_ref)
     }
 
-    fn detect_from_os_release() -> Option<Self> {
-        let paths = ["/run/host/etc/os-release", "/etc/os-release"];
-        for path in &paths {
-            if let Ok(content) = std::fs::read_to_string(path) {
-                let mut image_id = None;
-                let mut version_id = None;
-                for line in content.lines() {
-                    if let Some(v) = line.strip_prefix("IMAGE_ID=") {
-                        image_id = Some(v.trim_matches('"').to_string());
-                    } else if let Some(v) = line.strip_prefix("VERSION_ID=") {
-                        version_id = Some(v.trim_matches('"').to_string());
-                    }
+    fn read_os_release_content() -> Option<String> {
+        if crate::update_worker::is_flatpak() {
+            let output = std::process::Command::new("flatpak-spawn")
+                .args(["--host", "cat", "/etc/os-release"])
+                .output()
+                .ok()?;
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        } else {
+            std::fs::read_to_string("/etc/os-release").ok()
+        }
+    }
+
+    pub fn detect_from_os_release() -> Option<Self> {
+        if let Some(content) = Self::read_os_release_content() {
+            let mut image_ref = None;
+            let mut image_tag = None;
+            let mut image_id = None;
+            let mut version_id = None;
+            for line in content.lines() {
+                if let Some(v) = line.strip_prefix("IMAGE_REF=") {
+                    image_ref = Some(v.trim_matches('"').to_string());
+                } else if let Some(v) = line.strip_prefix("IMAGE_TAG=") {
+                    image_tag = Some(v.trim_matches('"').to_string());
+                } else if let Some(v) = line.strip_prefix("IMAGE_ID=") {
+                    image_id = Some(v.trim_matches('"').to_string());
+                } else if let Some(v) = line.strip_prefix("VERSION_ID=") {
+                    version_id = Some(v.trim_matches('"').to_string());
                 }
-                if let (Some(img), Some(ver)) = (image_id, version_id) {
-                    // Best-guess stream: "stable-daily-{version_id}"
-                    let stream = format!("stable-daily-{}", ver);
-                    return Some(Self::new("ghcr.io", "ublue-os", &img, &stream));
+            }
+
+            if let Some(ref_str) = image_ref {
+                let clean_ref = if let Some(pos) = ref_str.find("docker://") {
+                    &ref_str[pos + 9..]
+                } else {
+                    &ref_str
+                };
+                let parts: Vec<&str> = clean_ref.split('/').collect();
+                if parts.len() >= 3 {
+                    let registry = parts[0];
+                    let org = parts[1];
+                    let image = parts[2..].join("/");
+                    let tag = image_tag.unwrap_or_else(|| "latest".to_string());
+                    let stream = strip_date_suffix(&tag).unwrap_or(tag);
+                    return Some(Self::new(registry, org, &image, &stream));
                 }
+            }
+
+            if let (Some(img), Some(ver)) = (image_id, version_id) {
+                let org = if img.contains("dakota") || img.contains("bluefin") || img.contains("aurora") {
+                    "projectbluefin"
+                } else {
+                    "ublue-os"
+                };
+                let stream = if ver == "latest" {
+                    "latest".to_string()
+                } else {
+                    format!("stable-daily-{}", ver)
+                };
+                return Some(Self::new("ghcr.io", org, &img, &stream));
             }
         }
         None

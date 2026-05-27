@@ -795,6 +795,13 @@ fn run_rebase_simulated(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog
 /// Generate mock image versions for the last 30 days (dev mode).
 fn generate_mock_versions() -> Vec<ImageVersion> {
     use chrono::{Duration, Utc};
+    use crate::registry_client::RegistryClient;
+
+    let (registry, org, image) = if let Some(client) = RegistryClient::detect_from_os_release() {
+        (client.registry().to_string(), client.org().to_string(), client.image().to_string())
+    } else {
+        ("ghcr.io".to_string(), "projectbluefin".to_string(), "dakota".to_string())
+    };
 
     let today = Utc::now().date_naive();
     let mut versions = Vec::new();
@@ -804,13 +811,11 @@ fn generate_mock_versions() -> Vec<ImageVersion> {
     let mut build_num = 1u32;
     while day_offset <= 60 {
         let date = today - Duration::days(day_offset);
+        let tag = format!("latest-{}", date.format("%Y%m%d"));
         versions.push(ImageVersion {
             date,
-            full_ref: format!(
-                "ghcr.io/ublue-os/bluefin:stable-daily-43.{}",
-                date.format("%Y%m%d")
-            ),
-            version: format!("43.{}", date.format("%Y%m%d")),
+            full_ref: format!("{}/{}/{}:{}", registry, org, image, tag),
+            version: tag,
             kernel: format!("6.12.{}-200.fc42.x86_64", build_num),
             revision: format!("{:08x}", 0xdeadbe00 + build_num),
             created: date.and_hms_opt(4, 30, 0).unwrap().and_utc(),

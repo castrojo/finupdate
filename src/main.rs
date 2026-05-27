@@ -11,6 +11,7 @@
 //! - libadwaita styles are loaded before any widgets are created
 
 mod app;
+mod sbom_diff;
 mod config;
 pub mod dbus_progress;
 mod registry_client;

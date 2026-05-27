@@ -98,6 +98,10 @@ pub struct App {
     cancel_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Reference to header bar for dynamic subtitle updates.
     header_bar: adw::HeaderBar,
+    /// Back button in header bar
+    back_btn: gtk::Button,
+    /// Currently visible subpage ("main", "history", etc.)
+    current_page: String,
     /// Banner shown when developer mode is active.
     dev_banner: adw::Banner,
     /// Persistent user preferences.
@@ -149,6 +153,10 @@ pub enum AppMsg {
     Quit,
     /// Window close was requested — check if we should allow it.
     CloseRequest,
+    /// Navigate between pages
+    PageChanged(String),
+    /// Back button clicked
+    GoBack,
 }
 
 #[relm4::component(pub)]
@@ -161,16 +169,17 @@ impl SimpleComponent for App {
         #[root]
         adw::ApplicationWindow {
             set_title: Some("System Update"),
-            // HIG: minimum window size ensures content is never clipped.
             set_default_size: (750, 700),
             set_width_request: 400,
             set_height_request: 500,
 
-            // AdwToolbarView is the modern GNOME pattern for header + content layout.
-            // It handles the header bar integration with scrolling content automatically.
             adw::ToolbarView {
-                // Top bar — store reference for dynamic subtitle changes.
                 add_top_bar = &model.header_bar.clone() -> adw::HeaderBar {
+                    pack_start = &model.back_btn.clone() -> gtk::Button {
+                        connect_clicked[sender] => move |_| {
+                            sender.input(AppMsg::GoBack);
+                        }
+                    },
                     pack_end = &gtk::MenuButton {
                         set_icon_name: "open-menu-symbolic",
                         set_tooltip_text: Some("Main Menu"),
@@ -178,19 +187,16 @@ impl SimpleComponent for App {
                     },
                 },
 
-                // Developer mode banner — shown when dev_mode is active.
                 add_top_bar = &model.dev_banner.clone() -> adw::Banner {
                     set_title: "Developer Mode — updates are simulated",
                     set_revealed: model.settings.dev_mode,
                 },
 
-                // Content area wrapped in ToastOverlay for transient notifications.
                 #[wrap(Some)]
                 set_content = &model.toast_overlay.clone() -> adw::ToastOverlay {
-                    // The status view child component occupies the content area.
                     set_child: Some(model.status_view.widget()),
                 },
-            },
+            }
         }
     }
 
@@ -232,6 +238,7 @@ impl SimpleComponent for App {
                     StatusViewOutput::Reboot => AppMsg::RequestReboot,
                     StatusViewOutput::ShowRebase => AppMsg::ShowRebaseDialog,
                     StatusViewOutput::OpenCheckDialog => AppMsg::OpenCheckDialog,
+                    StatusViewOutput::PageChanged(page) => AppMsg::PageChanged(page),
                 });
 
         let toast_overlay = adw::ToastOverlay::new();
@@ -239,6 +246,13 @@ impl SimpleComponent for App {
         let dev_banner = adw::Banner::new("Developer Mode — updates are simulated");
 
         let settings = Settings::load();
+
+        inject_app_css();
+
+        let back_btn = gtk::Button::builder()
+            .icon_name("go-previous-symbolic")
+            .visible(false)
+            .build();
 
         let model = App {
             state: AppState::Idle,
@@ -249,6 +263,8 @@ impl SimpleComponent for App {
             status_view,
             cancel_tx: None,
             header_bar,
+            back_btn,
+            current_page: "main".to_string(),
             dev_banner,
             settings,
             progress_dbus: ProgressDBus::new(),
@@ -465,8 +481,10 @@ impl SimpleComponent for App {
                                 ?sim_scenario,
                                 "Developer mode active — running simulated update"
                             );
+                            println!("[debug] app: developer mode update run start, scenario={:?}", sim_scenario);
                             run_simulated(sim_scenario, cancel_rx).await
                         } else {
+                            println!("[debug] app: starting real update worker");
                             UpdateWorker::new().run(cancel_rx).await
                         };
 
@@ -726,6 +744,27 @@ impl SimpleComponent for App {
                     .emit(StatusViewInput::PreflightResult(status));
             }
 
+            AppMsg::PageChanged(page) => {
+                self.current_page = page.clone();
+                let title = match page.as_str() {
+                    "main" => "OS Image".to_string(),
+                    "history" => "Version history".to_string(),
+                    "source" => "Image source".to_string(),
+                    "changelog" => "What’s new".to_string(),
+                    _ => "OS Image".to_string(),
+                };
+                if let Some(root) = self.status_view.widget().root() {
+                    if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
+                        window.set_title(Some(&format!("System Update — {}", title)));
+                    }
+                }
+                self.back_btn.set_visible(page != "main");
+            }
+
+            AppMsg::GoBack => {
+                self.status_view.emit(StatusViewInput::ShowPage("main".to_string()));
+            }
+
             AppMsg::ToggleDevMode(enabled) => {
                 tracing::info!("Developer mode toggled via menu: {}", enabled);
                 self.settings.dev_mode = enabled;
@@ -858,3 +897,95 @@ relm4::new_stateless_action!(SimSuccessAction, WindowActionGroup, "sim-success")
 relm4::new_stateless_action!(SimFailureAction, WindowActionGroup, "sim-failure");
 relm4::new_stateless_action!(SimUpToDateAction, WindowActionGroup, "sim-uptodate");
 relm4::new_stateful_action!(DeveloperModeAction, WindowActionGroup, "dev-mode", (), bool);
+
+fn inject_app_css() {
+    let css = gtk::CssProvider::new();
+    css.load_from_string(
+        r#"
+        .sidebar-box {
+            background-color: @window_bg_color;
+            border-right: 1px solid alpha(currentColor, 0.07);
+        }
+        .navigation-sidebar {
+            background-color: transparent;
+        }
+        .sidebar-badge {
+            background-color: @accent_color;
+            min-width: 8px;
+            min-height: 8px;
+            border-radius: 4px;
+            margin-right: 6px;
+        }
+        .hero-logo-box {
+            background: linear-gradient(135deg, @accent_color, #60a5fa);
+            border-radius: 14px;
+            padding: 12px;
+            color: white;
+            box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.2);
+        }
+        .status-pill-staged {
+            background-color: alpha(@warning_color, 0.15);
+            color: @warning_color;
+            font-weight: bold;
+            border-radius: 999px;
+            padding: 4px 10px;
+        }
+        .status-pill-ready {
+            background-color: alpha(@accent_color, 0.15);
+            color: @accent_color;
+            font-weight: bold;
+            border-radius: 999px;
+            padding: 4px 10px;
+        }
+        .status-pill-ok {
+            background-color: alpha(@success_color, 0.15);
+            color: @success_color;
+            font-weight: bold;
+            border-radius: 999px;
+            padding: 4px 10px;
+        }
+        .status-pill-dot {
+            background-color: currentColor;
+            min-width: 8px;
+            min-height: 8px;
+            border-radius: 4px;
+        }
+        .update-banner-icon {
+            background-color: alpha(@accent_color, 0.15);
+            color: @accent_color;
+            border-radius: 10px;
+            padding: 10px;
+        }
+        .destructive-title label {
+            color: @error_color;
+        }
+        .deploy-indicator-current {
+            border: 2px solid @accent_color;
+            background-color: @accent_color;
+            min-width: 14px;
+            min-height: 14px;
+            border-radius: 8px;
+        }
+        .deploy-indicator-staged {
+            border: 2px solid @accent_color;
+            background-color: transparent;
+            min-width: 14px;
+            min-height: 14px;
+            border-radius: 8px;
+        }
+        .deploy-indicator-archive {
+            border: 2px solid @window_fg_color;
+            opacity: 0.5;
+            background-color: transparent;
+            min-width: 14px;
+            min-height: 14px;
+            border-radius: 8px;
+        }
+        "#,
+    );
+    gtk::style_context_add_provider_for_display(
+        &gtk::gdk::Display::default().expect("display"),
+        &css,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}

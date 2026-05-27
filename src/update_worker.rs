@@ -118,19 +118,21 @@ impl UpdateWorker {
         }
     }
 
-    /// Build the actual Command, wrapping with `flatpak-spawn --host` if sandboxed.
+    /// Build the actual Command, wrapping with `flatpak-spawn --host pkexec` if sandboxed.
     fn build_command(&self) -> Command {
         if is_flatpak() {
             // Inside Flatpak: use flatpak-spawn to escape the sandbox and
-            // run the command on the host system.
+            // run the command on the host system via pkexec for root privileges.
             let mut cmd = Command::new("flatpak-spawn");
             cmd.arg("--host");
+            cmd.arg("pkexec");
             cmd.arg(&self.command);
             cmd.args(&self.args);
             cmd
         } else {
-            // Running natively: invoke the command directly.
-            let mut cmd = Command::new(&self.command);
+            // Running natively: invoke the command directly via pkexec.
+            let mut cmd = Command::new("pkexec");
+            cmd.arg(&self.command);
             cmd.args(&self.args);
             cmd
         }
@@ -153,10 +155,11 @@ impl UpdateWorker {
         let (tx, rx) = mpsc::unbounded_channel();
 
         let command_display = if is_flatpak() {
-            format!("flatpak-spawn --host {}", self.command)
+            format!("flatpak-spawn --host pkexec {}", self.command)
         } else {
-            self.command.clone()
+            format!("pkexec {}", self.command)
         };
+        println!("[debug] UpdateWorker::run starting command: {}", command_display);
 
         let mut cmd = self.build_command();
         cmd.stdout(std::process::Stdio::piped());
