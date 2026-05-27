@@ -157,7 +157,7 @@ impl SimpleComponent for StatusView {
 
             // ─── Up to date page ────────────────────────────────────────
             add_child = &adw::StatusPage {
-                set_icon_name: Some("object-select-symbolic"),
+                set_icon_name: Some(config::APP_ID),
                 set_title: "Already Up to Date",
                 set_description: Some("Your system is current.\nNo updates are available right now."),
 
