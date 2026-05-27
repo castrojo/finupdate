@@ -14,8 +14,8 @@ mod app;
 mod config;
 mod registry_client;
 mod settings;
-mod update_worker;
 mod ui;
+mod update_worker;
 
 use app::App;
 
@@ -29,7 +29,11 @@ fn main() {
         )
         .init();
 
-    tracing::info!("Starting Finupdate ({}) v{}", config::APP_ID, config::VERSION);
+    tracing::info!(
+        "Starting Finupdate ({}) v{}",
+        config::APP_ID,
+        config::VERSION
+    );
 
     // relm4::RelmApp handles:
     // - Creating the adw::Application (because we enabled the "libadwaita" feature)

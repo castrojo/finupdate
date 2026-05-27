@@ -68,9 +68,7 @@ impl SimpleComponent for LogView {
 
         // Pre-create the text view so we can store a reference in the model
         // and use #[local_ref] in the view! macro.
-        let text_view_widget = gtk::TextView::builder()
-            .buffer(&buffer)
-            .build();
+        let text_view_widget = gtk::TextView::builder().buffer(&buffer).build();
 
         let model = LogView {
             buffer,
@@ -97,7 +95,8 @@ impl SimpleComponent for LogView {
                 // Auto-scroll to the end after inserting.
                 let end_iter = self.buffer.end_iter();
                 let end_mark = self.buffer.create_mark(None, &end_iter, false);
-                self.text_view.scroll_to_mark(&end_mark, 0.0, true, 0.0, 1.0);
+                self.text_view
+                    .scroll_to_mark(&end_mark, 0.0, true, 0.0, 1.0);
                 self.buffer.delete_mark(&end_mark);
             }
             LogViewInput::Clear => {

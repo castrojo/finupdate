@@ -162,9 +162,10 @@ impl SegmentedProgress {
                 if !alive_ref.get() {
                     return gtk::glib::ControlFlow::Break;
                 }
-                let is_active = segs_ref.borrow().iter().any(|s| {
-                    matches!(s.status, SegStatus::Active | SegStatus::Downloading)
-                });
+                let is_active = segs_ref
+                    .borrow()
+                    .iter()
+                    .any(|s| matches!(s.status, SegStatus::Active | SegStatus::Downloading));
                 if is_active {
                     phase_ref.set((phase_ref.get() + 0.040) % 1.0);
                     da.queue_draw();
@@ -267,7 +268,11 @@ fn draw_bar(
 
     // Accent color from Adwaita (adapts to user accent preference).
     let accent = adw::StyleManager::default().accent_color().to_rgba();
-    let (ar, ag, ab) = (accent.red() as f64, accent.green() as f64, accent.blue() as f64);
+    let (ar, ag, ab) = (
+        accent.red() as f64,
+        accent.green() as f64,
+        accent.blue() as f64,
+    );
 
     // Foreground text color — correct for both light and dark themes.
     let fg = widget.style_context().color();

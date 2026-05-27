@@ -9,7 +9,7 @@
 //! show_rebase_dialog()
 //!   └── spawn background thread
 //!         └── RegistryClient::detect() → fetch_versions(90)
-//!               → glib channel → UI thread
+//!               → result slot + timeout poll on UI thread
 //!                    ├── Success → show calendar + details panel
 //!                    └── Error   → show error page with retry
 //! ```
@@ -61,15 +61,17 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow) {
     };
     stack.add_named(&loading_page, Some("loading"));
 
-    // Error page  
-    let error_label = gtk::Label::new(Some("Unable to fetch version history."));
-    error_label.set_wrap(true);
-    error_label.set_max_width_chars(40);
-    let error_page = adw::StatusPage::builder()
-        .title("Could Not Load Versions")
-        .icon_name("network-error-symbolic")
+    // Error page
+    let retry_button = gtk::Button::builder()
+        .label("Retry")
+        .halign(gtk::Align::Center)
         .build();
-    error_page.set_child(Some(&error_label));
+    let error_page = adw::StatusPage::builder()
+        .icon_name("network-error-symbolic")
+        .title("Couldn't Load Versions")
+        .description("Check your internet connection and try again.")
+        .build();
+    error_page.set_child(Some(&retry_button));
     stack.add_named(&error_page, Some("error"));
 
     // Loaded page — built dynamically once data arrives
@@ -85,12 +87,79 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow) {
     dialog.set_child(Some(&toolbar_view));
     stack.set_visible_child_name("loading");
 
+    let stack_for_retry = stack.clone();
+    let loaded_box_for_retry = loaded_box.clone();
+    let dialog_for_retry = dialog.clone();
+    let parent_for_retry = parent.clone();
+    let error_page_for_retry = error_page.clone();
+    retry_button.connect_clicked(move |_| {
+        start_version_fetch(
+            stack_for_retry.clone(),
+            loaded_box_for_retry.clone(),
+            dialog_for_retry.clone(),
+            parent_for_retry.clone(),
+            error_page_for_retry.clone(),
+        );
+    });
+
     dialog.present(Some(parent));
+    start_version_fetch(
+        stack.clone(),
+        loaded_box.clone(),
+        dialog.clone(),
+        parent.clone(),
+        error_page.clone(),
+    );
+}
 
-    // ── Spawn background fetch ──────────────────────────────────────────
+fn start_version_fetch(
+    stack: gtk::Stack,
+    loaded_box: gtk::Box,
+    dialog: adw::Dialog,
+    parent: adw::ApplicationWindow,
+    error_page: adw::StatusPage,
+) {
+    stack.set_visible_child_name("loading");
+    error_page.set_description(Some("Check your internet connection and try again."));
+
     let result_slot: Arc<Mutex<Option<FetchResult>>> = Arc::new(Mutex::new(None));
-    let result_bg = result_slot.clone();
+    spawn_fetch_thread(result_slot.clone());
 
+    let start_time = std::time::Instant::now();
+    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        if let Some(result) = result_slot.lock().ok().and_then(|mut guard| guard.take()) {
+            match result {
+                FetchResult::Ok(versions) => {
+                    build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions);
+                    stack.set_visible_child_name("loaded");
+                }
+                FetchResult::DetectFailed => {
+                    error_page.set_description(Some(
+                        "Could not detect the current image. Is bootc installed and managing this system?",
+                    ));
+                    stack.set_visible_child_name("error");
+                }
+                FetchResult::Err(_) => {
+                    error_page.set_description(Some(
+                        "Check your internet connection and try again.",
+                    ));
+                    stack.set_visible_child_name("error");
+                }
+            }
+            return glib::ControlFlow::Break;
+        }
+
+        if start_time.elapsed() > std::time::Duration::from_secs(20) {
+            error_page.set_description(Some("Check your internet connection and try again."));
+            stack.set_visible_child_name("error");
+            return glib::ControlFlow::Break;
+        }
+
+        glib::ControlFlow::Continue
+    });
+}
+
+fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -105,43 +174,8 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow) {
                     Err(e) => FetchResult::Err(e.to_string()),
                 },
             };
-            *result_bg.lock().unwrap() = Some(result);
+            *result_slot.lock().unwrap() = Some(result);
         });
-    });
-
-    // ── Poll result on main thread every 100 ms ─────────────────────────
-    let stack_rc = stack.clone();
-    let loaded_box_rc = loaded_box.clone();
-    let dialog_rc = dialog.clone();
-    let parent_clone = parent.clone();
-
-    glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-        let Some(result) = result_slot.lock().ok().and_then(|mut g| g.take()) else {
-            return glib::ControlFlow::Continue;
-        };
-        match result {
-            FetchResult::Ok(versions) => {
-                build_loaded_page(
-                    &loaded_box_rc,
-                    &stack_rc,
-                    &dialog_rc,
-                    &parent_clone,
-                    versions,
-                );
-                stack_rc.set_visible_child_name("loaded");
-            }
-            FetchResult::DetectFailed => {
-                error_label.set_label(
-                    "Could not detect current image.\nIs bootc installed and the system managed by Universal Blue?",
-                );
-                stack_rc.set_visible_child_name("error");
-            }
-            FetchResult::Err(msg) => {
-                error_label.set_label(&format!("Network error:\n{}", msg));
-                stack_rc.set_visible_child_name("error");
-            }
-        }
-        glib::ControlFlow::Break
     });
 }
 
@@ -154,6 +188,10 @@ fn build_loaded_page(
     parent: &adw::ApplicationWindow,
     versions: Vec<ImageVersion>,
 ) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
     // Version lookup map
     let version_map: HashMap<NaiveDate, ImageVersion> =
         versions.iter().map(|v| (v.date, v.clone())).collect();
@@ -207,8 +245,7 @@ fn build_loaded_page(
 
     // Current displayed month — starts at current month.
     let today = Local::now().date_naive();
-    let initial_month =
-        NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+    let initial_month = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
     let displayed_month: Rc<RefCell<NaiveDate>> = Rc::new(RefCell::new(initial_month));
 
     // ── Month nav row ───────────────────────────────────────────────────
@@ -327,8 +364,7 @@ fn build_loaded_page(
             let prev = if current.month() == 1 {
                 NaiveDate::from_ymd_opt(current.year() - 1, 12, 1).unwrap_or(current)
             } else {
-                NaiveDate::from_ymd_opt(current.year(), current.month() - 1, 1)
-                    .unwrap_or(current)
+                NaiveDate::from_ymd_opt(current.year(), current.month() - 1, 1).unwrap_or(current)
             };
             *displayed_month.borrow_mut() = prev;
             redraw(&grid, prev);
@@ -344,8 +380,7 @@ fn build_loaded_page(
             let next = if current.month() == 12 {
                 NaiveDate::from_ymd_opt(current.year() + 1, 1, 1).unwrap_or(current)
             } else {
-                NaiveDate::from_ymd_opt(current.year(), current.month() + 1, 1)
-                    .unwrap_or(current)
+                NaiveDate::from_ymd_opt(current.year(), current.month() + 1, 1).unwrap_or(current)
             };
             *displayed_month.borrow_mut() = next;
             redraw(&grid, next);
@@ -422,8 +457,7 @@ fn redraw_grid(
     month_label.set_label(&displayed.format("%B %Y").to_string());
 
     // Disable next if we're on current month
-    let current_month =
-        NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+    let current_month = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
     next_btn.set_sensitive(displayed < current_month);
 
     let days_in_month = days_in_month(displayed);
@@ -452,11 +486,8 @@ fn redraw_grid(
                 btn.set_visible(true);
                 btn.set_label(&day_num.to_string());
 
-                let date = NaiveDate::from_ymd_opt(
-                    displayed.year(),
-                    displayed.month(),
-                    day_num as u32,
-                );
+                let date =
+                    NaiveDate::from_ymd_opt(displayed.year(), displayed.month(), day_num as u32);
 
                 // Clear state classes
                 for cls in ["day-available", "day-current", "day-selected", "day-today"] {
@@ -472,16 +503,24 @@ fn redraw_grid(
 
                     btn.set_sensitive(is_available && !is_future);
 
-                    if is_today { btn.add_css_class("day-today"); }
-                    if is_available { btn.add_css_class("day-available"); }
-                    if is_current { btn.add_css_class("day-current"); }
-                    if is_selected { btn.add_css_class("day-selected"); }
+                    if is_today {
+                        btn.add_css_class("day-today");
+                    }
+                    if is_available {
+                        btn.add_css_class("day-available");
+                    }
+                    if is_current {
+                        btn.add_css_class("day-current");
+                    }
+                    if is_selected {
+                        btn.add_css_class("day-selected");
+                    }
 
                     if is_available && !is_future {
                         // Wire click — disconnect any existing handler first
-                        if let Some(hid) = unsafe {
-                            btn.steal_data::<glib::SignalHandlerId>("day-handler")
-                        } {
+                        if let Some(hid) =
+                            unsafe { btn.steal_data::<glib::SignalHandlerId>("day-handler") }
+                        {
                             btn.disconnect(hid);
                         }
 
@@ -683,7 +722,10 @@ async fn run_bootc_switch(full_ref: &str) -> Result<(), String> {
 
     match status {
         Ok(s) if s.success() => Ok(()),
-        Ok(s) => Err(format!("bootc switch exited with code {}", s.code().unwrap_or(-1))),
+        Ok(s) => Err(format!(
+            "bootc switch exited with code {}",
+            s.code().unwrap_or(-1)
+        )),
         Err(e) => Err(format!("Failed to run bootc switch: {}", e)),
     }
 }

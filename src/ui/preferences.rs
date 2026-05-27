@@ -12,6 +12,8 @@
 //! the user to restart.
 
 use std::cell::RefCell;
+use std::path::Path;
+use std::process::Command;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -24,9 +26,13 @@ use crate::settings::{Settings, UpdateInterval};
 /// snapshot so the caller can update its own state.
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
-    settings: Settings,
+    mut settings: Settings,
     on_change: impl Fn(Settings) + 'static,
 ) {
+    if let Some(auto_updates) = read_uupd_timer_enabled() {
+        settings.auto_updates = auto_updates;
+    }
+
     let shared = Rc::new(RefCell::new(settings));
 
     let dialog = adw::PreferencesDialog::new();
@@ -56,6 +62,35 @@ pub fn show_preferences(
 
 // ── Updates group ─────────────────────────────────────────────────────────────
 
+fn is_flatpak() -> bool {
+    Path::new("/.flatpak-info").exists()
+}
+
+fn read_uupd_timer_enabled() -> Option<bool> {
+    let output = if is_flatpak() {
+        Command::new("flatpak-spawn")
+            .args(["--host", "systemctl", "is-enabled", "uupd.timer"])
+            .output()
+    } else {
+        Command::new("systemctl")
+            .arg("is-enabled")
+            .arg("uupd.timer")
+            .output()
+    };
+
+    match output {
+        Ok(output) => match String::from_utf8_lossy(&output.stdout).trim() {
+            "enabled" => Some(true),
+            "disabled" => Some(false),
+            _ => None,
+        },
+        Err(err) => {
+            tracing::warn!("Failed to read uupd.timer state: {}", err);
+            None
+        }
+    }
+}
+
 fn build_updates_group(page: &adw::PreferencesPage, shared: &Rc<RefCell<Settings>>) {
     let group = adw::PreferencesGroup::builder()
         .title("Automatic Updates")
@@ -75,8 +110,36 @@ fn build_updates_group(page: &adw::PreferencesPage, shared: &Rc<RefCell<Settings
     {
         let shared = shared.clone();
         auto_row.connect_active_notify(move |row| {
-            shared.borrow_mut().auto_updates = row.is_active();
+            let active = row.is_active();
+            shared.borrow_mut().auto_updates = active;
             shared.borrow().save();
+
+            std::thread::spawn(move || {
+                let (action, args) = if active {
+                    ("enable", ["enable", "--now", "uupd.timer"])
+                } else {
+                    ("disable", ["disable", "--now", "uupd.timer"])
+                };
+
+                let status = if is_flatpak() {
+                    Command::new("flatpak-spawn")
+                        .args(["--host", "pkexec", "systemctl"])
+                        .args(args)
+                        .status()
+                } else {
+                    Command::new("pkexec").arg("systemctl").args(args).status()
+                };
+
+                match status {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => {
+                        tracing::warn!("Failed to {}: {}", action, status);
+                    }
+                    Err(err) => {
+                        tracing::warn!("Failed to {}: {}", action, err);
+                    }
+                }
+            });
         });
     }
     group.add(&auto_row);
@@ -161,9 +224,7 @@ fn build_network_group(page: &adw::PreferencesPage, shared: &Rc<RefCell<Settings
         let s = shared.borrow();
         adw::SwitchRow::builder()
             .title("Pause on Metered Connections")
-            .subtitle(
-                "Suspend automatic updates on limited or cellular connections",
-            )
+            .subtitle("Suspend automatic updates on limited or cellular connections")
             .active(s.pause_on_metered)
             .build()
     };
@@ -183,7 +244,10 @@ fn build_network_group(page: &adw::PreferencesPage, shared: &Rc<RefCell<Settings
             "warning",
         )
     } else {
-        ("✓  Unmetered connection — automatic updates will run normally", "success")
+        (
+            "✓  Unmetered connection — automatic updates will run normally",
+            "success",
+        )
     };
 
     let status_box = gtk::Box::builder()

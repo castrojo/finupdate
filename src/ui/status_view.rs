@@ -12,10 +12,10 @@ use gtk::prelude::*;
 use relm4::prelude::*;
 use std::time::Instant;
 
-use crate::app::AppState;
+use crate::app::{AppState, PreflightStatus};
 use crate::config;
 use crate::ui::log_view::{LogView, LogViewInput};
-use crate::ui::segmented_progress::{same_segment, SegmentedProgress};
+use crate::ui::segmented_progress::{SegmentedProgress, same_segment};
 use crate::ui::update_list::{UpdateList, UpdateListInput};
 
 /// Input messages for the StatusView component.
@@ -29,6 +29,8 @@ pub enum StatusViewInput {
     ClearLog,
     /// Timer tick — update elapsed time display.
     TimerTick,
+    /// Result of the startup preflight update check.
+    PreflightResult(PreflightStatus),
     /// Copy log to clipboard.
     CopyLog,
 }
@@ -61,6 +63,8 @@ pub struct StatusView {
     toast_overlay: adw::ToastOverlay,
     /// Label showing last update time on idle page.
     last_update_label: gtk::Label,
+    /// Label showing startup preflight status on idle page.
+    preflight_label: gtk::Label,
     /// Image info badge shown on the idle page.
     idle_image_box: gtk::Box,
     /// Segmented progress bar shown while updating.
@@ -105,6 +109,11 @@ impl SimpleComponent for StatusView {
                         connect_clicked[sender] => move |_| {
                             sender.output(StatusViewOutput::StartUpdate).unwrap();
                         },
+                    },
+
+                    #[local_ref]
+                    preflight_label -> gtk::Label {
+                        add_css_class: "caption",
                     },
 
                     // Show last update time if known.
@@ -237,6 +246,9 @@ impl SimpleComponent for StatusView {
         elapsed_label.add_css_class("monospace");
 
         let last_update_label = gtk::Label::new(None);
+        let preflight_label = gtk::Label::new(None);
+        preflight_label.set_halign(gtk::Align::Center);
+        preflight_label.set_visible(false);
         let toast_overlay = adw::ToastOverlay::new();
 
         // Image info badge for the idle page.
@@ -312,12 +324,14 @@ impl SimpleComponent for StatusView {
             log_text: String::new(),
             toast_overlay,
             last_update_label: last_update_label.clone(),
+            preflight_label: preflight_label.clone(),
             idle_image_box: idle_image_box.clone(),
             seg_progress,
             active_module: None,
         };
 
         let idle_image_box = &model.idle_image_box;
+        let preflight_label = &model.preflight_label;
         let last_update_label = &model.last_update_label;
         let widgets = view_output!();
 
@@ -400,7 +414,8 @@ impl SimpleComponent for StatusView {
                     self.log_text.push('\n');
                 }
                 self.log_text.push_str(&line);
-                self.update_list.emit(UpdateListInput::ProcessLine(line.clone()));
+                self.update_list
+                    .emit(UpdateListInput::ProcessLine(line.clone()));
                 self.log_view.emit(LogViewInput::AppendLine(line.clone()));
 
                 // Drive segmented progress from log output.
@@ -438,6 +453,28 @@ impl SimpleComponent for StatusView {
                     let remaining_secs = secs % 60;
                     self.elapsed_label
                         .set_label(&format!("{}:{:02}", mins, remaining_secs));
+                }
+            }
+
+            StatusViewInput::PreflightResult(status) => {
+                self.preflight_label.remove_css_class("success");
+                self.preflight_label.remove_css_class("dim-label");
+
+                match status {
+                    PreflightStatus::Checking | PreflightStatus::Unknown => {
+                        self.preflight_label.set_visible(false);
+                        self.preflight_label.set_label("");
+                    }
+                    PreflightStatus::UpdateAvailable => {
+                        self.preflight_label.set_label("Update available");
+                        self.preflight_label.add_css_class("success");
+                        self.preflight_label.set_visible(true);
+                    }
+                    PreflightStatus::UpToDate => {
+                        self.preflight_label.set_label("System is up to date");
+                        self.preflight_label.add_css_class("dim-label");
+                        self.preflight_label.set_visible(true);
+                    }
                 }
             }
 

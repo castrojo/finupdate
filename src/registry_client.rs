@@ -75,6 +75,7 @@ pub struct RegistryClient {
     image: String,
     /// Tag prefix for dated builds, e.g. `"stable-daily-43"`.
     stream: String,
+    client: reqwest::Client,
 }
 
 impl RegistryClient {
@@ -87,6 +88,7 @@ impl RegistryClient {
             org: org.to_string(),
             image: image.to_string(),
             stream: stream.to_string(),
+            client: build_http_client(),
         }
     }
 
@@ -163,7 +165,7 @@ impl RegistryClient {
     /// - Round trip 2…N: manifest HEADs, up to 8 concurrent
     pub async fn fetch_versions(&self, days: u32) -> Result<Vec<ImageVersion>, RegistryError> {
         let token = self.get_token().await?;
-        let client = build_http_client()?;
+        let client = self.client.clone();
 
         // Fetch the full tag list.
         let tags_url = format!(
@@ -213,16 +215,11 @@ impl RegistryClient {
                         "https://{}/v2/{}/{}/manifests/{}",
                         registry, org, image, tag
                     );
-                    let full_ref = format!(
-                        "{}/{}/{}:{}",
-                        registry, org, image, tag
-                    );
+                    let full_ref = format!("{}/{}/{}:{}", registry, org, image, tag);
                     let client = client.clone();
                     let token = token.clone();
                     let date = *date;
-                    async move {
-                        fetch_version(&client, &url, &token, date, full_ref).await
-                    }
+                    async move { fetch_version(&client, &url, &token, date, full_ref).await }
                 })
                 .collect();
 
@@ -241,8 +238,7 @@ impl RegistryClient {
             "https://{}/token?scope=repository:{}/{}:pull&service={}",
             self.registry, self.org, self.image, self.registry
         );
-        let client = build_http_client()?;
-        let resp: TokenResponse = client.get(&url).send().await?.json().await?;
+        let resp: TokenResponse = self.client.get(&url).send().await?.json().await?;
         Ok(resp.token)
     }
 }
@@ -276,10 +272,7 @@ async fn fetch_version(
         .cloned()
         .unwrap_or_else(|| date.format("%Y%m%d").to_string());
 
-    let kernel = ann
-        .get("ostree.linux")
-        .cloned()
-        .unwrap_or_default();
+    let kernel = ann.get("ostree.linux").cloned().unwrap_or_default();
 
     let revision = ann
         .get("org.opencontainers.image.revision")
@@ -303,15 +296,16 @@ async fn fetch_version(
 }
 
 /// Build a shared reqwest client with a reasonable timeout.
-fn build_http_client() -> Result<reqwest::Client, RegistryError> {
-    Ok(reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
+fn build_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
             "/",
             env!("CARGO_PKG_VERSION")
         ))
-        .build()?)
+        .build()
+        .unwrap_or_default()
 }
 
 /// Parse a full OCI ref like `ghcr.io/ublue-os/bluefin:stable-daily-43.20260222`

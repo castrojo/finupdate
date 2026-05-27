@@ -54,7 +54,7 @@ use crate::settings::Settings;
 use crate::ui::preferences::show_preferences;
 use crate::ui::rebase_dialog::show_rebase_dialog;
 use crate::ui::status_view::{StatusView, StatusViewInput, StatusViewOutput};
-use crate::update_worker::{run_simulated, SimulationScenario, UpdateEvent, UpdateWorker};
+use crate::update_worker::{SimulationScenario, UpdateEvent, UpdateWorker, run_simulated};
 
 /// Application-level state.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -72,9 +72,20 @@ pub enum AppState {
     Error(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreflightStatus {
+    Checking,
+    UpdateAvailable,
+    UpToDate,
+    Unknown,
+}
+
 /// Top-level model.
 pub struct App {
     state: AppState,
+    preflight_status: PreflightStatus,
+    /// Selected developer-mode simulation scenario.
+    sim_scenario: SimulationScenario,
     /// Accumulated output lines from the uupd process.
     log_lines: Vec<String>,
     /// Toast overlay reference for showing transient notifications.
@@ -94,8 +105,8 @@ pub struct App {
 /// Messages the App component can receive.
 #[derive(Debug)]
 pub enum AppMsg {
-    /// User clicked "Update" — start the uupd process.
-    StartUpdate,
+    /// User clicked "Update" — optionally bypass the metered-network confirmation.
+    StartUpdate { skip_metered_check: bool },
     /// A line of output arrived from the subprocess.
     OutputLine(String),
     /// The subprocess exited successfully.
@@ -118,8 +129,12 @@ pub enum AppMsg {
     ShowPreferences,
     /// Settings were updated in the preferences dialog.
     SettingsChanged(Settings),
+    /// Result of the startup preflight update check.
+    PreflightResult(PreflightStatus),
     /// Developer mode toggle from the hamburger menu.
     ToggleDevMode(bool),
+    /// Update the selected developer-mode simulation scenario.
+    SetSimScenario(SimulationScenario),
     /// Quit the application.
     Quit,
     /// Window close was requested — check if we should allow it.
@@ -174,6 +189,11 @@ impl SimpleComponent for App {
             "_Preferences" => PreferencesAction,
             "_Developer Mode" => DeveloperModeAction,
             section! {
+                "Simulate _Success" => SimSuccessAction,
+                "Simulate _Failure" => SimFailureAction,
+                "Simulate Already _Up To Date" => SimUpToDateAction,
+            },
+            section! {
                 "_Rebase to Previous Version…" => RebaseAction,
             },
             section! {
@@ -191,13 +211,16 @@ impl SimpleComponent for App {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         // Build child component: StatusView receives state updates and emits user actions.
-        let status_view = StatusView::builder()
-            .launch(AppState::Idle)
-            .forward(sender.input_sender(), |output| match output {
-                StatusViewOutput::StartUpdate => AppMsg::StartUpdate,
-                StatusViewOutput::CancelUpdate => AppMsg::CancelUpdate,
-                StatusViewOutput::Reboot => AppMsg::RequestReboot,
-            });
+        let status_view =
+            StatusView::builder()
+                .launch(AppState::Idle)
+                .forward(sender.input_sender(), |output| match output {
+                    StatusViewOutput::StartUpdate => AppMsg::StartUpdate {
+                        skip_metered_check: false,
+                    },
+                    StatusViewOutput::CancelUpdate => AppMsg::CancelUpdate,
+                    StatusViewOutput::Reboot => AppMsg::RequestReboot,
+                });
 
         let toast_overlay = adw::ToastOverlay::new();
         let header_bar = adw::HeaderBar::new();
@@ -207,6 +230,8 @@ impl SimpleComponent for App {
 
         let model = App {
             state: AppState::Idle,
+            preflight_status: PreflightStatus::Checking,
+            sim_scenario: SimulationScenario::Success,
             log_lines: Vec::new(),
             toast_overlay: toast_overlay.clone(),
             status_view,
@@ -265,6 +290,27 @@ impl SimpleComponent for App {
             })
         };
 
+        let sim_success_action: RelmAction<SimSuccessAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.emit(AppMsg::SetSimScenario(SimulationScenario::Success));
+            })
+        };
+
+        let sim_failure_action: RelmAction<SimFailureAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.emit(AppMsg::SetSimScenario(SimulationScenario::Failure));
+            })
+        };
+
+        let sim_uptodate_action: RelmAction<SimUpToDateAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.emit(AppMsg::SetSimScenario(SimulationScenario::AlreadyUpToDate));
+            })
+        };
+
         let mut group = RelmActionGroup::<WindowActionGroup>::new();
         group.add_action(about_action);
         group.add_action(preferences_action);
@@ -272,6 +318,9 @@ impl SimpleComponent for App {
         group.add_action(shortcuts_action);
         group.add_action(dev_mode_action);
         group.add_action(rebase_action);
+        group.add_action(sim_success_action);
+        group.add_action(sim_failure_action);
+        group.add_action(sim_uptodate_action);
         group.register_for_widget(&root);
 
         // ─── Keyboard Shortcuts ─────────────────────────────────────────
@@ -288,14 +337,79 @@ impl SimpleComponent for App {
             gtk::glib::Propagation::Stop
         });
 
+        let input_sender = sender.input_sender().clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
+            rt.block_on(async move {
+                let mut cmd = if std::path::Path::new("/.flatpak-info").exists() {
+                    let mut c = tokio::process::Command::new("flatpak-spawn");
+                    c.arg("--host").arg("uupd").arg("update-check");
+                    c
+                } else {
+                    let mut c = tokio::process::Command::new("uupd");
+                    c.arg("update-check");
+                    c
+                };
+                let status = match cmd.status().await {
+                    Ok(s) => s,
+                    Err(_) => {
+                        input_sender.emit(AppMsg::PreflightResult(PreflightStatus::Unknown));
+                        return;
+                    }
+                };
+                let result = match status.code() {
+                    Some(0) => PreflightStatus::UpdateAvailable,
+                    Some(77) => PreflightStatus::UpToDate,
+                    _ => PreflightStatus::Unknown,
+                };
+                input_sender.emit(AppMsg::PreflightResult(result));
+            });
+        });
+
         ComponentParts { model, widgets }
     }
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
-            AppMsg::StartUpdate => {
+            AppMsg::StartUpdate { skip_metered_check } => {
                 // Prevent double-starts.
                 if self.state == AppState::Updating {
+                    return;
+                }
+
+                if !skip_metered_check
+                    && self.settings.pause_on_metered
+                    && gtk::gio::NetworkMonitor::default().is_network_metered()
+                {
+                    let dialog = adw::AlertDialog::new(
+                        Some("Metered Connection Detected"),
+                        Some(
+                            "You're on a limited or cellular connection. Automatic updates are paused, but you can continue manually.",
+                        ),
+                    );
+                    dialog.add_response("cancel", "_Cancel");
+                    dialog.add_response("proceed", "_Update Anyway");
+                    dialog.set_default_response(Some("cancel"));
+                    dialog.set_close_response("cancel");
+
+                    let update_sender = sender.input_sender().clone();
+                    dialog.connect_response(None, move |_, response| {
+                        if response == "proceed" {
+                            update_sender.emit(AppMsg::StartUpdate {
+                                skip_metered_check: true,
+                            });
+                        }
+                    });
+
+                    if let Some(root) = self.status_view.widget().root() {
+                        if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
+                            dialog.present(Some(window));
+                        }
+                    }
+
                     return;
                 }
 
@@ -309,8 +423,7 @@ impl SimpleComponent for App {
                 // Forward state to the child view.
                 self.status_view
                     .emit(StatusViewInput::StateChanged(AppState::Updating));
-                self.status_view
-                    .emit(StatusViewInput::ClearLog);
+                self.status_view.emit(StatusViewInput::ClearLog);
 
                 // Create a cancellation channel for this update run.
                 let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
@@ -320,6 +433,7 @@ impl SimpleComponent for App {
                 // cancel_rx is passed INTO the worker so it can kill the real process.
                 let input_sender = sender.input_sender().clone();
                 let dev_mode = self.settings.dev_mode;
+                let sim_scenario = self.sim_scenario;
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -328,8 +442,11 @@ impl SimpleComponent for App {
 
                     rt.block_on(async move {
                         let mut rx = if dev_mode {
-                            tracing::info!("Developer mode active — running simulated update");
-                            run_simulated(SimulationScenario::Success, cancel_rx).await
+                            tracing::info!(
+                                ?sim_scenario,
+                                "Developer mode active — running simulated update"
+                            );
+                            run_simulated(sim_scenario, cancel_rx).await
                         } else {
                             UpdateWorker::new().run(cancel_rx).await
                         };
@@ -359,8 +476,7 @@ impl SimpleComponent for App {
 
             AppMsg::OutputLine(line) => {
                 self.log_lines.push(line.clone());
-                self.status_view
-                    .emit(StatusViewInput::AppendLog(line));
+                self.status_view.emit(StatusViewInput::AppendLog(line));
             }
 
             AppMsg::UpdateComplete => {
@@ -401,11 +517,7 @@ impl SimpleComponent for App {
                 self.update_subtitle();
 
                 // Notify the user if window is backgrounded.
-                send_notification(
-                    "update-failed",
-                    "System Update Failed",
-                    &err,
-                );
+                send_notification("update-failed", "System Update Failed", &err);
                 self.status_view
                     .emit(StatusViewInput::StateChanged(AppState::Error(err)));
             }
@@ -517,11 +629,22 @@ impl SimpleComponent for App {
                 self.dev_banner.set_revealed(self.settings.dev_mode);
             }
 
+            AppMsg::PreflightResult(status) => {
+                self.preflight_status = status.clone();
+                self.status_view
+                    .emit(StatusViewInput::PreflightResult(status));
+            }
+
             AppMsg::ToggleDevMode(enabled) => {
                 tracing::info!("Developer mode toggled via menu: {}", enabled);
                 self.settings.dev_mode = enabled;
                 self.settings.save();
                 self.dev_banner.set_revealed(enabled);
+            }
+
+            AppMsg::SetSimScenario(scenario) => {
+                tracing::info!(?scenario, "Selected developer simulation scenario");
+                self.sim_scenario = scenario;
             }
 
             AppMsg::Quit => {
@@ -602,9 +725,7 @@ fn show_shortcuts_window(window: &adw::ApplicationWindow) {
         .visible(true)
         .build();
 
-    let group = gtk::ShortcutsGroup::builder()
-        .title("Application")
-        .build();
+    let group = gtk::ShortcutsGroup::builder().title("Application").build();
 
     let shortcut_quit = gtk::ShortcutsShortcut::builder()
         .title("Quit")
@@ -629,7 +750,9 @@ fn send_notification(id: &str, title: &str, body: &str) {
     let app = relm4::main_application();
     let notification = gtk::gio::Notification::new(title);
     notification.set_body(Some(body));
-    notification.set_icon(&gtk::gio::ThemedIcon::new("software-update-available-symbolic"));
+    notification.set_icon(&gtk::gio::ThemedIcon::new(
+        "software-update-available-symbolic",
+    ));
     app.send_notification(Some(id), &notification);
 }
 
@@ -640,4 +763,7 @@ relm4::new_stateless_action!(PreferencesAction, WindowActionGroup, "preferences"
 relm4::new_stateless_action!(QuitAction, WindowActionGroup, "quit");
 relm4::new_stateless_action!(ShortcutsAction, WindowActionGroup, "show-shortcuts");
 relm4::new_stateless_action!(RebaseAction, WindowActionGroup, "rebase-history");
+relm4::new_stateless_action!(SimSuccessAction, WindowActionGroup, "sim-success");
+relm4::new_stateless_action!(SimFailureAction, WindowActionGroup, "sim-failure");
+relm4::new_stateless_action!(SimUpToDateAction, WindowActionGroup, "sim-uptodate");
 relm4::new_stateful_action!(DeveloperModeAction, WindowActionGroup, "dev-mode", (), bool);

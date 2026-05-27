@@ -284,7 +284,7 @@ pub async fn run_simulated(
 
 /// Internal simulation: emits fake log lines for all four uupd modules.
 async fn simulate_update(tx: &mpsc::UnboundedSender<UpdateEvent>, scenario: SimulationScenario) {
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     // Helper: emit a log line and pause briefly.
     macro_rules! line {
@@ -304,50 +304,110 @@ async fn simulate_update(tx: &mpsc::UnboundedSender<UpdateEvent>, scenario: Simu
 
     let ts = "2026-05-26T04:00:00Z";
 
-    line!(format!("time={ts} level=INFO msg=\"[DEV MODE] Starting finupdate simulation\""));
-    line!(format!("time={ts} level=INFO msg=\"Hardware checks passed\""), 500);
+    line!(format!(
+        "time={ts} level=INFO msg=\"[DEV MODE] Starting finupdate simulation\""
+    ));
+    line!(
+        format!("time={ts} level=INFO msg=\"Hardware checks passed\""),
+        500
+    );
 
     // ── System module ────────────────────────────────────────────────────
-    line!(format!("time={ts} level=INFO msg=\"System\" module_name=System"));
-    line!(format!("time={ts} level=INFO msg=\"Checking for OS image updates...\""), 600);
+    line!(format!(
+        "time={ts} level=INFO msg=\"System\" module_name=System"
+    ));
+    line!(
+        format!("time={ts} level=INFO msg=\"Checking for OS image updates...\""),
+        600
+    );
 
     if matches!(scenario, SimulationScenario::AlreadyUpToDate) {
-        line!(format!("time={ts} level=INFO msg=\"Image is already up to date\""), 400);
+        line!(
+            format!("time={ts} level=INFO msg=\"Image is already up to date\""),
+            400
+        );
         let _ = tx.send(UpdateEvent::UpToDate);
         return;
     }
 
     if matches!(scenario, SimulationScenario::Failure) {
-        line!(format!("time={ts} level=ERROR msg=\"module_fail\" module=System cli=\"bootc upgrade\""), 400);
+        line!(
+            format!(
+                "time={ts} level=ERROR msg=\"module_fail\" module=System cli=\"bootc upgrade\""
+            ),
+            400
+        );
         let _ = tx.send(UpdateEvent::Error(
             "[DEV MODE] Simulated system module failure".to_string(),
         ));
         return;
     }
 
-    line!(format!("time={ts} level=INFO msg=\"bootc: Fetching image manifest...\""), 500);
-    line!(format!("time={ts} level=INFO msg=\"bootc: Pulling 3 new layers (42.1 MB)\""), 800);
-    line!(format!("time={ts} level=INFO msg=\"bootc: Staging complete — reboot to apply\""), 400);
+    line!(
+        format!("time={ts} level=INFO msg=\"bootc: Fetching image manifest...\""),
+        500
+    );
+    line!(
+        format!("time={ts} level=INFO msg=\"bootc: Pulling 3 new layers (42.1 MB)\""),
+        800
+    );
+    line!(
+        format!("time={ts} level=INFO msg=\"bootc: Staging complete — reboot to apply\""),
+        400
+    );
 
     // ── Flatpak module ───────────────────────────────────────────────────
-    line!(format!("time={ts} level=INFO msg=\"Flatpak\" module_name=Flatpak"));
-    line!(format!("time={ts} level=INFO msg=\"Checking for Flatpak updates...\""), 500);
-    line!(format!("time={ts} level=INFO msg=\"Updated: org.mozilla.firefox (130.0.1 → 131.0)\""), 400);
-    line!(format!("time={ts} level=INFO msg=\"Updated: com.spotify.Client (1.2.45 → 1.2.46)\""), 400);
-    line!(format!("time={ts} level=INFO msg=\"Flatpak: 2 apps updated\""), 300);
+    line!(format!(
+        "time={ts} level=INFO msg=\"Flatpak\" module_name=Flatpak"
+    ));
+    line!(
+        format!("time={ts} level=INFO msg=\"Checking for Flatpak updates...\""),
+        500
+    );
+    line!(
+        format!("time={ts} level=INFO msg=\"Updated: org.mozilla.firefox (130.0.1 → 131.0)\""),
+        400
+    );
+    line!(
+        format!("time={ts} level=INFO msg=\"Updated: com.spotify.Client (1.2.45 → 1.2.46)\""),
+        400
+    );
+    line!(
+        format!("time={ts} level=INFO msg=\"Flatpak: 2 apps updated\""),
+        300
+    );
 
     // ── Brew module ──────────────────────────────────────────────────────
-    line!(format!("time={ts} level=INFO msg=\"Brew\" module_name=Brew"));
-    line!(format!("time={ts} level=INFO msg=\"Upgrading Homebrew packages...\""), 500);
-    line!(format!("time={ts} level=INFO msg=\"Already up-to-date: neovim, fzf, ripgrep\""), 300);
+    line!(format!(
+        "time={ts} level=INFO msg=\"Brew\" module_name=Brew"
+    ));
+    line!(
+        format!("time={ts} level=INFO msg=\"Upgrading Homebrew packages...\""),
+        500
+    );
+    line!(
+        format!("time={ts} level=INFO msg=\"Already up-to-date: neovim, fzf, ripgrep\""),
+        300
+    );
 
     // ── Distrobox module ─────────────────────────────────────────────────
-    line!(format!("time={ts} level=INFO msg=\"Distrobox\" module_name=Distrobox"));
-    line!(format!("time={ts} level=INFO msg=\"Upgrading Distrobox containers...\""), 500);
-    line!(format!("time={ts} level=INFO msg=\"ubuntu-22: updated 5 packages\""), 400);
+    line!(format!(
+        "time={ts} level=INFO msg=\"Distrobox\" module_name=Distrobox"
+    ));
+    line!(
+        format!("time={ts} level=INFO msg=\"Upgrading Distrobox containers...\""),
+        500
+    );
+    line!(
+        format!("time={ts} level=INFO msg=\"ubuntu-22: updated 5 packages\""),
+        400
+    );
 
     sleep(Duration::from_millis(300)).await;
-    line!(format!("time={ts} level=INFO msg=\"Updates Completed Successfully\""), 200);
+    line!(
+        format!("time={ts} level=INFO msg=\"Updates Completed Successfully\""),
+        200
+    );
 
     let _ = tx.send(UpdateEvent::Complete);
 }
