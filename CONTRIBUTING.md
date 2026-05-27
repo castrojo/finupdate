@@ -4,47 +4,60 @@ Thank you for your interest in contributing to Finupdate and the Bluefin utility
 
 ## Development Setup
 
-### Prerequisites
+Finupdate is designed for Bluefin and other immutable Fedora-based desktops. The recommended workflow uses **toolbox** for fast Rust iteration and **flatpak-builder** (via Flatpak) for full integration testing. This matches how GNOME apps are developed upstream.
 
-You need **one** of these environments:
+### 1. Create a toolbox (one-time)
 
-1. **Devcontainer** (recommended for contributors without GTK on host):
-   - VS Code + Dev Containers extension
-   - Podman or Docker
-   - The repo includes a devcontainer config with all GTK/Rust deps
+```bash
+toolbox create finupdate
+toolbox enter finupdate
+```
 
-2. **Native** (Fedora/Bluefin):
-   ```bash
-   sudo dnf install gtk4-devel libadwaita-devel meson cargo rust
-   ```
+Inside the toolbox, install build dependencies:
 
-3. **Flatpak only** (build + test without any native Rust):
-   ```bash
-   flatpak install flathub org.gnome.Sdk//50 org.gnome.Platform//50
-   flatpak install flathub org.freedesktop.Sdk.Extension.rust-stable//25.08
-   flatpak install flathub org.flatpak.Builder
-   ```
+```bash
+sudo dnf install -y \
+  cargo rust \
+  gtk4-devel libadwaita-devel \
+  meson ninja-build \
+  pkg-config
+```
+
+### 2. Install Flatpak build tools (on host, one-time)
+
+```bash
+flatpak install flathub org.flatpak.Builder
+flatpak install flathub org.gnome.Sdk//50 org.gnome.Platform//50
+```
 
 ### Quick Build & Test Cycle
 
 ```bash
-# Fast iteration (cargo):
-cargo build && ./target/debug/finupdate
+# Fast cargo iteration — run inside toolbox:
+toolbox run --container finupdate cargo build
+toolbox run --container finupdate cargo check
 
-# Full integration test (Flatpak):
+# Full Flatpak build + install — run on host:
 flatpak run org.flatpak.Builder --user --install --force-clean _flatpak \
   build-aux/org.projectbluefin.Finupdate.Devel.json
+
+# Run the Flatpak:
 flatpak run org.projectbluefin.Finupdate.Devel
 ```
 
-### Important: Flatpak + Container Conflict
-
-If you use both a devcontainer AND Flatpak builds, the container's `target/` directory has different permissions. **Clean it before Flatpak builds:**
+Or use the `just` recipes (see [justfile](justfile)):
 
 ```bash
-podman exec -w /workspaces/finupdate <container-id> rm -rf target
-rm -rf _flatpak .flatpak-builder
+just build    # cargo check inside toolbox
+just flatpak  # full Flatpak build + install
+just run      # run the installed Flatpak
 ```
+
+### Notes
+
+- Keep `cargo build` and `flatpak-builder` output directories separate: toolbox builds go to `./target/`, Flatpak builds go to `./_flatpak/`. They don't conflict.
+- `flatpak-builder` always builds inside the SDK sandbox — the toolbox is only for fast iteration.
+- If you switch between the two, no cleanup is needed.
 
 ## Architecture Overview
 
@@ -132,8 +145,8 @@ Include the Co-authored-by trailer for AI-assisted commits.
 Run through the HIG compliance checklist in [PATTERNS.md](PATTERNS.md#6-hig-compliance-checklist).
 
 Quick sanity checks:
-- [ ] `cargo build` compiles cleanly with no warnings
-- [ ] `cargo clippy` passes (if available)
+- [ ] `toolbox run --container finupdate cargo build` compiles cleanly with no warnings
+- [ ] `toolbox run --container finupdate cargo clippy` passes
 - [ ] App launches and the new feature works visually
 - [ ] Dark mode looks correct
 - [ ] Keyboard navigation works
@@ -143,6 +156,7 @@ Quick sanity checks:
 
 | File | Purpose |
 |------|---------|
+| `justfile` | `just` recipes for common dev tasks |
 | `Cargo.toml` | Rust dependencies and metadata |
 | `meson.build` | Top-level Meson build (deps, subdirs) |
 | `meson_options.txt` | Build profile option (development/release) |
@@ -154,6 +168,9 @@ Quick sanity checks:
 | `src/ui/mod.rs` | UI module declarations |
 | `src/ui/status_view.rs` | State-driven content area (Stack) |
 | `src/ui/log_view.rs` | Scrollable log output |
+| `src/ui/update_list.rs` | Per-module update cards with Nerd Mode |
+| `src/ui/preferences.rs` | Preferences dialog |
+| `src/settings.rs` | Settings persistence (XDG JSON) |
 | `src/meson.build` | Cargo build integration |
 | `data/meson.build` | Install desktop/metainfo/icons |
 | `data/*.desktop.in` | Desktop entry template |
