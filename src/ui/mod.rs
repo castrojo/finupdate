@@ -5,5 +5,6 @@
 
 pub mod log_view;
 pub mod preferences;
+pub mod segmented_progress;
 pub mod status_view;
 pub mod update_list;

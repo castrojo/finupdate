@@ -15,6 +15,7 @@ use std::time::Instant;
 use crate::app::AppState;
 use crate::config;
 use crate::ui::log_view::{LogView, LogViewInput};
+use crate::ui::segmented_progress::{same_segment, SegmentedProgress};
 use crate::ui::update_list::{UpdateList, UpdateListInput};
 
 /// Input messages for the StatusView component.
@@ -62,6 +63,10 @@ pub struct StatusView {
     last_update_label: gtk::Label,
     /// Image info badge shown on the idle page.
     idle_image_box: gtk::Box,
+    /// Segmented progress bar shown while updating.
+    seg_progress: SegmentedProgress,
+    /// The module key that is currently active (drives segment coloring).
+    active_module: Option<&'static str>,
 }
 
 #[relm4::component(pub)]
@@ -238,9 +243,7 @@ impl SimpleComponent for StatusView {
         let idle_image_box = build_image_badge(read_image_info().as_deref());
 
         // Build the "updating" page content imperatively.
-        let progress_bar = gtk::ProgressBar::new();
-        progress_bar.set_show_text(false);
-        progress_bar.add_css_class("osd");
+        let seg_progress = SegmentedProgress::new();
 
         // Image badge for the updating page header.
         let updating_image_box = build_image_badge(read_image_info().as_deref());
@@ -283,7 +286,7 @@ impl SimpleComponent for StatusView {
         bottom_bar.append(&cancel_btn);
 
         let updating_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        updating_content.append(&progress_bar);
+        updating_content.append(&seg_progress.widget());
         updating_content.append(&updating_image_box);
         updating_content.append(update_list.widget());
         updating_content.append(&log_clamp);
@@ -310,6 +313,8 @@ impl SimpleComponent for StatusView {
             toast_overlay,
             last_update_label: last_update_label.clone(),
             idle_image_box: idle_image_box.clone(),
+            seg_progress,
+            active_module: None,
         };
 
         let idle_image_box = &model.idle_image_box;
@@ -319,12 +324,11 @@ impl SimpleComponent for StatusView {
         // Set initial visible page.
         root.set_visible_child_name("idle");
 
-        // Pulse progress bar + update elapsed timer every 250ms.
+        // Update elapsed timer every 250ms while the "updating" page is visible.
         let stack_ref = root.clone();
         let timer_sender = sender.input_sender().clone();
         gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
             if stack_ref.visible_child_name().as_deref() == Some("updating") {
-                progress_bar.pulse();
                 timer_sender.emit(StatusViewInput::TimerTick);
             }
             gtk::glib::ControlFlow::Continue
@@ -350,14 +354,22 @@ impl SimpleComponent for StatusView {
                         self.update_start = Some(Instant::now());
                         self.elapsed_label.set_label("0:00");
                         self.update_list.emit(UpdateListInput::Reset);
+                        self.seg_progress.reset();
+                        self.active_module = None;
                     }
                     AppState::Complete => {
                         self.update_start = None;
                         self.update_list.emit(UpdateListInput::MarkAllComplete);
+                        self.seg_progress.mark_all_complete();
+                        self.active_module = None;
                     }
                     AppState::Error(_) => {
                         self.update_start = None;
                         self.update_list.emit(UpdateListInput::MarkCurrentFailed);
+                        if let Some(key) = self.active_module {
+                            self.seg_progress.set_module_failed(key);
+                        }
+                        self.active_module = None;
                     }
                     AppState::UpToDate => {
                         self.update_start = None;
@@ -389,7 +401,28 @@ impl SimpleComponent for StatusView {
                 }
                 self.log_text.push_str(&line);
                 self.update_list.emit(UpdateListInput::ProcessLine(line.clone()));
-                self.log_view.emit(LogViewInput::AppendLine(line));
+                self.log_view.emit(LogViewInput::AppendLine(line.clone()));
+
+                // Drive segmented progress from log output.
+                if let Some(new_key) = extract_module_key(&line) {
+                    let is_same_seg = self
+                        .active_module
+                        .map(|prev| same_segment(prev, new_key))
+                        .unwrap_or(false);
+                    if !is_same_seg {
+                        // Complete the previous segment only when switching to a
+                        // different visual segment (brew→distrobox stays in Dev Tools).
+                        if let Some(prev) = self.active_module {
+                            self.seg_progress.set_module_complete(prev);
+                        }
+                        self.seg_progress.set_module_active(new_key);
+                    }
+                    self.active_module = Some(new_key);
+                } else if line.contains("level=ERROR") || line.contains("level=error") {
+                    if let Some(key) = self.active_module {
+                        self.seg_progress.set_module_failed(key);
+                    }
+                }
             }
 
             StatusViewInput::ClearLog => {
@@ -422,6 +455,25 @@ impl SimpleComponent for StatusView {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Extract a static module key from a uupd log line.
+///
+/// uupd emits `module_name=System` (capital first letter) in structured log
+/// lines when it begins processing a module. Map those to the lowercase keys
+/// used by [`SegmentedProgress`].
+fn extract_module_key(line: &str) -> Option<&'static str> {
+    if line.contains("module_name=System") {
+        Some("system")
+    } else if line.contains("module_name=Flatpak") {
+        Some("flatpak")
+    } else if line.contains("module_name=Brew") {
+        Some("brew")
+    } else if line.contains("module_name=Distrobox") {
+        Some("distrobox")
+    } else {
+        None
+    }
+}
 
 /// Build a pill-style image info badge widget.
 /// Returns a hidden, zero-height box if no text is available.
