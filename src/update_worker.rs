@@ -1,6 +1,8 @@
 //! Async subprocess worker for invoking `uupd`.
 //!
-//! Pattern: Subprocess streaming
+//! Pattern: Subprocess streaming with Flatpak sandbox awareness
+//! - Detect if running inside a Flatpak sandbox (via /.flatpak-info)
+//! - If sandboxed, use `flatpak-spawn --host` to run commands on the host
 //! - Spawn the process with stdout piped
 //! - Read lines asynchronously via tokio
 //! - Send structured events back through an mpsc channel
@@ -24,7 +26,14 @@ pub enum UpdateEvent {
     Error(String),
 }
 
+/// Detect if we're running inside a Flatpak sandbox.
+/// The canonical check is the existence of `/.flatpak-info`.
+pub fn is_flatpak() -> bool {
+    std::path::Path::new("/.flatpak-info").exists()
+}
+
 /// Manages spawning and streaming output from the `uupd` process.
+/// Handles Flatpak sandbox transparency automatically.
 pub struct UpdateWorker {
     /// The command to invoke. Defaults to "uupd" but can be overridden for testing.
     command: String,
@@ -50,6 +59,24 @@ impl UpdateWorker {
         }
     }
 
+    /// Build the actual Command, wrapping with `flatpak-spawn --host` if sandboxed.
+    fn build_command(&self) -> Command {
+        if is_flatpak() {
+            // Inside Flatpak: use flatpak-spawn to escape the sandbox and
+            // run the command on the host system.
+            let mut cmd = Command::new("flatpak-spawn");
+            cmd.arg("--host");
+            cmd.arg(&self.command);
+            cmd.args(&self.args);
+            cmd
+        } else {
+            // Running natively: invoke the command directly.
+            let mut cmd = Command::new(&self.command);
+            cmd.args(&self.args);
+            cmd
+        }
+    }
+
     /// Spawn the subprocess and return a receiver for streaming events.
     ///
     /// The caller should poll `rx.recv()` in a loop until it gets
@@ -62,23 +89,25 @@ impl UpdateWorker {
     pub async fn run(&mut self) -> mpsc::UnboundedReceiver<UpdateEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
 
-        let command = self.command.clone();
-        let args = self.args.clone();
+        let command_display = if is_flatpak() {
+            format!("flatpak-spawn --host {}", self.command)
+        } else {
+            self.command.clone()
+        };
+
+        let mut cmd = self.build_command();
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
 
         tokio::spawn(async move {
-            // Spawn the child process with stdout and stderr piped.
-            let child = Command::new(&command)
-                .args(&args)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
+            let child = cmd.spawn();
 
             let mut child = match child {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(UpdateEvent::Error(format!(
                         "Failed to start '{}': {}",
-                        command, e
+                        command_display, e
                     )));
                     return;
                 }
@@ -127,13 +156,13 @@ impl UpdateWorker {
                 Ok(status) => {
                     let code = status.code().unwrap_or(-1);
                     let _ = tx.send(UpdateEvent::Error(format!(
-                        "uupd exited with code {}",
+                        "Update process exited with code {}",
                         code
                     )));
                 }
                 Err(e) => {
                     let _ = tx.send(UpdateEvent::Error(format!(
-                        "Error waiting for uupd: {}",
+                        "Error waiting for update process: {}",
                         e
                     )));
                 }

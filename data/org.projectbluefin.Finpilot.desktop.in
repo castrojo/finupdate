@@ -2,11 +2,9 @@
 Name=System Update
 Comment=Check for and install system updates
 Exec=finpilot
-Icon=org.projectbluefin.Finpilot
+Icon=@ICON@
 Terminal=false
 Type=Application
 Categories=System;PackageManager;
 Keywords=update;upgrade;system;uupd;
 StartupNotify=true
-# DBusActivatable ensures single-instance via GApplication
-DBusActivatable=true
