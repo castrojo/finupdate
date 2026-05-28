@@ -14,10 +14,12 @@ mod app;
 mod sbom_diff;
 mod config;
 pub mod dbus_progress;
+mod orchestrator;
 mod registry_client;
 mod settings;
 mod ui;
 mod update_worker;
+mod uupd_compat;
 
 use app::App;
 

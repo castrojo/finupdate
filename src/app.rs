@@ -123,6 +123,10 @@ pub enum AppMsg {
     InstallFromCheck,
     /// A line of output arrived from the subprocess.
     OutputLine(String),
+    /// A module has started running.
+    ModuleStarted(crate::orchestrator::Module),
+    /// A module has finished.
+    ModuleFinished(crate::orchestrator::Module, crate::orchestrator::ModuleStatus),
     /// The subprocess exited successfully.
     UpdateComplete,
     /// The subprocess reported that the system is already up to date (exit 77).
@@ -377,13 +381,15 @@ impl SimpleComponent for App {
                     .build()
                     .expect("Failed to create tokio runtime");
                 rt.block_on(async move {
+                    // Use `bootc upgrade --check` to detect pending updates.
+                    // Exit 0 = update available, 77 = up to date, other = unknown.
                     let mut cmd = if std::path::Path::new("/.flatpak-info").exists() {
                         let mut c = tokio::process::Command::new("flatpak-spawn");
-                        c.arg("--host").arg("uupd").arg("update-check");
+                        c.args(["--host", "bootc", "upgrade", "--check"]);
                         c
                     } else {
-                        let mut c = tokio::process::Command::new("uupd");
-                        c.arg("update-check");
+                        let mut c = tokio::process::Command::new("bootc");
+                        c.arg("upgrade").arg("--check");
                         c
                     };
                     let status = match cmd.status().await {
@@ -493,6 +499,12 @@ impl SimpleComponent for App {
                                 UpdateEvent::Output(line) => {
                                     input_sender.emit(AppMsg::OutputLine(line));
                                 }
+                                UpdateEvent::ModuleStarted(module) => {
+                                    input_sender.emit(AppMsg::ModuleStarted(module));
+                                }
+                                UpdateEvent::ModuleFinished(module, status) => {
+                                    input_sender.emit(AppMsg::ModuleFinished(module, status));
+                                }
                                 UpdateEvent::Complete => {
                                     input_sender.emit(AppMsg::UpdateComplete);
                                     break;
@@ -559,20 +571,28 @@ impl SimpleComponent for App {
             }
 
             AppMsg::OutputLine(line) => {
-                // Parse module progress for D-Bus (4 modules total)
-                if line.contains("module_name=") {
-                    let module_count = self.log_lines.iter()
-                        .filter(|l| l.contains("module_name="))
-                        .count() as f64;
-                    let progress = (module_count / 4.0).min(0.95);
-                    let module = line.split("module_name=").nth(1)
-                        .and_then(|s| s.split_whitespace().next())
-                        .unwrap_or("system");
-                    self.progress_dbus.set_progress(progress);
-                    self.progress_dbus.set_message(&format!("Updating {module}…"));
-                }
                 self.log_lines.push(line.clone());
                 self.status_view.emit(StatusViewInput::AppendLog(line));
+            }
+
+            AppMsg::ModuleStarted(module) => {
+                let key = module.key();
+                tracing::debug!("Module started: {}", key);
+                let module_count = match module {
+                    crate::orchestrator::Module::System => 0,
+                    crate::orchestrator::Module::Flatpak => 1,
+                    crate::orchestrator::Module::Brew => 2,
+                    crate::orchestrator::Module::Distrobox => 3,
+                };
+                let progress = (module_count as f64 / 4.0).min(0.95);
+                self.progress_dbus.set_progress(progress);
+                self.progress_dbus.set_message(&format!("Updating {}…", key));
+                self.status_view.emit(StatusViewInput::ModuleStarted(module));
+            }
+
+            AppMsg::ModuleFinished(module, status) => {
+                tracing::debug!("Module finished: {} {:?}", module.key(), status);
+                self.status_view.emit(StatusViewInput::ModuleFinished(module, status));
             }
 
             AppMsg::UpdateComplete => {

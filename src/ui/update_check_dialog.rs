@@ -468,6 +468,39 @@ pub fn show_update_check_dialog(
                         let _ = line_tx.send(CheckEvent::Error(err));
                         break;
                     }
+                    UpdateEvent::ModuleStarted(module) => {
+                        let key = module.key().to_string();
+                        // Complete previous module if switching.
+                        if let Some(ref prev) = current_module {
+                            if prev != &key {
+                                let _ = line_tx.send(CheckEvent::ModuleComplete(prev.clone()));
+                            }
+                        }
+                        current_module = Some(key.clone());
+                        let _ = line_tx.send(CheckEvent::ModuleStart(key));
+                    }
+                    UpdateEvent::ModuleFinished(module, status) => {
+                        use crate::orchestrator::ModuleStatus;
+                        let key = module.key().to_string();
+                        match status {
+                            ModuleStatus::Success => {
+                                // System module success means a staged update.
+                                if module == crate::orchestrator::Module::System {
+                                    system_found = true;
+                                }
+                                let _ = line_tx.send(CheckEvent::ModuleComplete(key));
+                            }
+                            ModuleStatus::UpToDate
+                            | ModuleStatus::Skipped => {
+                                let _ = line_tx.send(CheckEvent::ModuleComplete(key));
+                            }
+                            ModuleStatus::Failed(code) => {
+                                let _ = line_tx.send(CheckEvent::Error(format!(
+                                    "{key} module failed (exit {code})"
+                                )));
+                            }
+                        }
+                    }
                 }
             }
         });

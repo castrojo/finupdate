@@ -12,13 +12,12 @@
 //! the user to restart.
 
 use std::cell::RefCell;
-use std::path::Path;
-use std::process::Command;
 use std::rc::Rc;
 
 use adw::prelude::*;
 
 use crate::settings::{Settings, UpdateInterval};
+use crate::uupd_compat::{self, UupdConfig};
 
 /// Build and present the preferences dialog attached to `parent`.
 ///
@@ -29,8 +28,11 @@ pub fn show_preferences(
     mut settings: Settings,
     on_change: impl Fn(Settings) + 'static,
 ) {
-    if let Some(auto_updates) = read_uupd_timer_enabled() {
-        settings.auto_updates = auto_updates;
+    // Only read the timer state if uupd is actually installed.
+    if uupd_compat::is_uupd_installed() {
+        if let Some(auto_updates) = uupd_compat::is_uupd_timer_active() {
+            settings.auto_updates = auto_updates;
+        }
     }
 
     let shared = Rc::new(RefCell::new(settings));
@@ -45,7 +47,7 @@ pub fn show_preferences(
         .icon_name("preferences-system-symbolic")
         .build();
 
-    build_updates_group(&page, &shared);
+    build_updates_group(&page, &shared, &dialog);
     build_network_group(&page, &shared);
     build_developer_group(&page, &shared);
 
@@ -62,48 +64,24 @@ pub fn show_preferences(
 
 // ── Updates group ─────────────────────────────────────────────────────────────
 
-fn is_flatpak() -> bool {
-    Path::new("/.flatpak-info").exists()
-}
-
-fn read_uupd_timer_enabled() -> Option<bool> {
-    let output = if is_flatpak() {
-        Command::new("flatpak-spawn")
-            .args(["--host", "systemctl", "is-enabled", "uupd.timer"])
-            .output()
-    } else {
-        Command::new("systemctl")
-            .arg("is-enabled")
-            .arg("uupd.timer")
-            .output()
-    };
-
-    match output {
-        Ok(output) => match String::from_utf8_lossy(&output.stdout).trim() {
-            "enabled" => Some(true),
-            "disabled" => Some(false),
-            _ => None,
-        },
-        Err(err) => {
-            tracing::warn!("Failed to read uupd.timer state: {}", err);
-            None
-        }
-    }
-}
-
-fn build_updates_group(page: &adw::PreferencesPage, shared: &Rc<RefCell<Settings>>) {
+fn build_updates_group(
+    page: &adw::PreferencesPage,
+    shared: &Rc<RefCell<Settings>>,
+    dialog: &adw::PreferencesDialog,
+) {
     let group = adw::PreferencesGroup::builder()
         .title("Automatic Updates")
         .description("Configure how and when finupdate checks for updates")
         .build();
 
-    // Auto-update toggle
+    // Auto-update toggle — only shown when uupd is installed on the host.
     let auto_row = {
         let s = shared.borrow();
         adw::SwitchRow::builder()
-            .title("Enable Automatic Updates")
+            .title("Automatic Background Updates")
             .subtitle("Allow uupd to run on its daily systemd timer")
             .active(s.auto_updates)
+            .visible(uupd_compat::is_uupd_installed())
             .build()
     };
 
@@ -115,34 +93,39 @@ fn build_updates_group(page: &adw::PreferencesPage, shared: &Rc<RefCell<Settings
             shared.borrow().save();
 
             std::thread::spawn(move || {
-                let (action, args) = if active {
-                    ("enable", ["enable", "--now", "uupd.timer"])
-                } else {
-                    ("disable", ["disable", "--now", "uupd.timer"])
-                };
-
-                let status = if is_flatpak() {
-                    Command::new("flatpak-spawn")
-                        .args(["--host", "pkexec", "systemctl"])
-                        .args(args)
-                        .status()
-                } else {
-                    Command::new("pkexec").arg("systemctl").args(args).status()
-                };
-
-                match status {
-                    Ok(status) if status.success() => {}
-                    Ok(status) => {
-                        tracing::warn!("Failed to {}: {}", action, status);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                rt.block_on(async move {
+                    if let Err(e) = uupd_compat::set_uupd_timer(active).await {
+                        tracing::warn!("Failed to toggle uupd.timer: {}", e);
                     }
-                    Err(err) => {
-                        tracing::warn!("Failed to {}: {}", action, err);
-                    }
-                }
+                });
             });
         });
     }
     group.add(&auto_row);
+
+    // "Configure automatic updates" — pushes a subpage that edits /etc/uupd/config.json.
+    // Only shown when uupd is installed (the config file only matters then).
+    let configure_row = adw::ActionRow::builder()
+        .title("Configure Automatic Updates")
+        .subtitle("Hardware checks and per-module toggles in /etc/uupd/config.json")
+        .activatable(true)
+        .visible(uupd_compat::is_uupd_installed())
+        .build();
+    let chevron = gtk::Image::from_icon_name("go-next-symbolic");
+    chevron.set_valign(gtk::Align::Center);
+    configure_row.add_suffix(&chevron);
+    {
+        let dialog = dialog.clone();
+        configure_row.connect_activated(move |_| {
+            let subpage = build_uupd_config_subpage();
+            dialog.push_subpage(&subpage);
+        });
+    }
+    group.add(&configure_row);
 
     // Update interval combo
     let interval_row = {
@@ -312,4 +295,243 @@ fn build_developer_group(page: &adw::PreferencesPage, shared: &Rc<RefCell<Settin
     group.add(&dev_row);
 
     page.add(&group);
+}
+
+// ── uupd config subpage ───────────────────────────────────────────────────────
+//
+// Edits /etc/uupd/config.json — hardware-check thresholds (battery / CPU / RAM /
+// network) and per-module enable toggles. Writes happen through a single pkexec
+// invocation when the user hits "Apply".
+
+fn build_uupd_config_subpage() -> adw::NavigationPage {
+    let config = Rc::new(RefCell::new(uupd_compat::read_config()));
+
+    let page = adw::PreferencesPage::new();
+
+    // ── Hardware checks ─────────────────────────────────────────────────
+    let hw_group = adw::PreferencesGroup::builder()
+        .title("Hardware Checks")
+        .description(
+            "Skip automatic updates when the system is busy or on battery. \
+             Manual updates always run regardless.",
+        )
+        .build();
+
+    let enable_hw_row = adw::SwitchRow::builder()
+        .title("Enable Hardware Checks")
+        .subtitle("Honor the thresholds below before running automatic updates")
+        .active(config.borrow().checks.hardware.enable)
+        .build();
+    {
+        let config = config.clone();
+        enable_hw_row.connect_active_notify(move |row| {
+            config.borrow_mut().checks.hardware.enable = row.is_active();
+        });
+    }
+    hw_group.add(&enable_hw_row);
+
+    let bat_row = make_spin_row(
+        "Minimum Battery",
+        "Skip updates if battery is below this percent",
+        0.0,
+        100.0,
+        config.borrow().checks.hardware.bat_min_percent as f64,
+        "%",
+    );
+    {
+        let config = config.clone();
+        bat_row.1.connect_value_changed(move |s| {
+            config.borrow_mut().checks.hardware.bat_min_percent = s.value() as u32;
+        });
+    }
+    hw_group.add(&bat_row.0);
+
+    let cpu_row = make_spin_row(
+        "Maximum CPU Load",
+        "Skip updates if CPU usage is above this percent",
+        0.0,
+        100.0,
+        config.borrow().checks.hardware.cpu_max_percent as f64,
+        "%",
+    );
+    {
+        let config = config.clone();
+        cpu_row.1.connect_value_changed(move |s| {
+            config.borrow_mut().checks.hardware.cpu_max_percent = s.value() as u32;
+        });
+    }
+    hw_group.add(&cpu_row.0);
+
+    let mem_row = make_spin_row(
+        "Maximum Memory Use",
+        "Skip updates if RAM usage is above this percent",
+        0.0,
+        100.0,
+        config.borrow().checks.hardware.mem_max_percent as f64,
+        "%",
+    );
+    {
+        let config = config.clone();
+        mem_row.1.connect_value_changed(move |s| {
+            config.borrow_mut().checks.hardware.mem_max_percent = s.value() as u32;
+        });
+    }
+    hw_group.add(&mem_row.0);
+
+    let net_row = make_spin_row(
+        "Maximum Network Activity",
+        "Skip updates if traffic is above this many bytes/second",
+        0.0,
+        100_000_000.0,
+        config.borrow().checks.hardware.net_max_bytes as f64,
+        "B/s",
+    );
+    {
+        let config = config.clone();
+        net_row.1.connect_value_changed(move |s| {
+            config.borrow_mut().checks.hardware.net_max_bytes = s.value() as u64;
+        });
+    }
+    hw_group.add(&net_row.0);
+
+    page.add(&hw_group);
+
+    // ── Modules ─────────────────────────────────────────────────────────
+    let mod_group = adw::PreferencesGroup::builder()
+        .title("Modules")
+        .description("Enable or disable specific update modules")
+        .build();
+
+    let system_row = module_switch_row(
+        "System",
+        "OS image updates via bootc / rpm-ostree",
+        !config.borrow().modules.system.disable,
+    );
+    {
+        let config = config.clone();
+        system_row.connect_active_notify(move |row| {
+            config.borrow_mut().modules.system.disable = !row.is_active();
+        });
+    }
+    mod_group.add(&system_row);
+
+    let flatpak_row = module_switch_row("Flatpak", "Sandboxed applications", !config.borrow().modules.flatpak.disable);
+    {
+        let config = config.clone();
+        flatpak_row.connect_active_notify(move |row| {
+            config.borrow_mut().modules.flatpak.disable = !row.is_active();
+        });
+    }
+    mod_group.add(&flatpak_row);
+
+    let brew_row = module_switch_row("Brew", "Homebrew packages", !config.borrow().modules.brew.disable);
+    {
+        let config = config.clone();
+        brew_row.connect_active_notify(move |row| {
+            config.borrow_mut().modules.brew.disable = !row.is_active();
+        });
+    }
+    mod_group.add(&brew_row);
+
+    let distrobox_row = module_switch_row(
+        "Distrobox",
+        "Containers managed by distrobox",
+        !config.borrow().modules.distrobox.disable,
+    );
+    {
+        let config = config.clone();
+        distrobox_row.connect_active_notify(move |row| {
+            config.borrow_mut().modules.distrobox.disable = !row.is_active();
+        });
+    }
+    mod_group.add(&distrobox_row);
+
+    page.add(&mod_group);
+
+    // ── Save row ────────────────────────────────────────────────────────
+    let save_group = adw::PreferencesGroup::new();
+    let save_button = gtk::Button::builder()
+        .label("Apply Changes")
+        .halign(gtk::Align::End)
+        .css_classes(["suggested-action", "pill"])
+        .build();
+    let save_row = adw::ActionRow::builder()
+        .title("Save to /etc/uupd/config.json")
+        .subtitle("Requires administrator authentication")
+        .build();
+    save_row.add_suffix(&save_button);
+    save_group.add(&save_row);
+    page.add(&save_group);
+
+    let nav_page = adw::NavigationPage::builder()
+        .title("Automatic Updates")
+        .child(&page)
+        .build();
+
+    {
+        let config = config.clone();
+        save_button.connect_clicked(move |btn| {
+            let snapshot: UupdConfig = config.borrow().clone();
+            btn.set_sensitive(false);
+            btn.set_label("Saving…");
+            // GTK widgets are !Send, so we can't move `btn` into a std::thread.
+            // Use glib's local async executor — it runs on the GTK main thread
+            // and can await futures without blocking the UI.
+            let btn = btn.clone();
+            gtk::glib::spawn_future_local(async move {
+                let result = uupd_compat::write_config(&snapshot).await;
+                btn.set_sensitive(true);
+                match result {
+                    Ok(()) => btn.set_label("Saved ✓"),
+                    Err(e) => {
+                        tracing::warn!("uupd config save failed: {e}");
+                        btn.set_label("Save failed");
+                    }
+                }
+            });
+        });
+    }
+
+    nav_page
+}
+
+/// Helper: build an AdwActionRow with a SpinButton suffix and a unit label.
+fn make_spin_row(
+    title: &str,
+    subtitle: &str,
+    min: f64,
+    max: f64,
+    value: f64,
+    suffix: &str,
+) -> (adw::ActionRow, gtk::SpinButton) {
+    let row = adw::ActionRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .build();
+    let adj = gtk::Adjustment::builder()
+        .lower(min)
+        .upper(max)
+        .step_increment(1.0)
+        .value(value)
+        .build();
+    let spin = gtk::SpinButton::builder()
+        .adjustment(&adj)
+        .valign(gtk::Align::Center)
+        .build();
+    let unit_label = gtk::Label::builder()
+        .label(suffix)
+        .valign(gtk::Align::Center)
+        .css_classes(["dim-label"])
+        .build();
+    row.add_suffix(&spin);
+    row.add_suffix(&unit_label);
+    (row, spin)
+}
+
+fn module_switch_row(title: &str, subtitle: &str, enabled: bool) -> adw::SwitchRow {
+    adw::SwitchRow::builder()
+        .title(title)
+        .subtitle(subtitle)
+        .active(enabled)
+        .build()
 }

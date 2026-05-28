@@ -47,3 +47,16 @@ futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # thiserror — ergonomic error type derivation for RegistryError.
 thiserror = "1"
+
+# anyhow — simple error propagation for async helpers.
+anyhow = "1"
+
+# OCI registry client — pure-Rust, used for SBOM referrer discovery and pull.
+# rustls-tls: no system OpenSSL needed inside the Flatpak sandbox.
+oci-client = { version = "0.15", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+# test-util enables `#[tokio::test(start_paused = true)]` so tests that drive
+# simulated event sequences with internal sleeps run in virtual time, not wall clock.
+tokio = { version = "1", features = ["test-util", "macros", "rt"] }
+tempfile = "3"

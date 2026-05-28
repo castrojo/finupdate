@@ -113,3 +113,79 @@ impl Settings {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── UpdateInterval ───────────────────────────────────────────────────
+
+    #[test]
+    fn update_interval_index_round_trip() {
+        for v in [
+            UpdateInterval::Hourly,
+            UpdateInterval::Daily,
+            UpdateInterval::Weekly,
+            UpdateInterval::Custom,
+        ] {
+            assert_eq!(UpdateInterval::from_index(v.to_index()), v);
+        }
+    }
+
+    #[test]
+    fn update_interval_unknown_index_falls_back_to_custom() {
+        assert_eq!(UpdateInterval::from_index(99), UpdateInterval::Custom);
+    }
+
+    #[test]
+    fn update_interval_serializes_lowercase() {
+        let json = serde_json::to_string(&UpdateInterval::Daily).unwrap();
+        assert_eq!(json, r#""daily""#);
+    }
+
+    #[test]
+    fn update_interval_deserializes_lowercase() {
+        let v: UpdateInterval = serde_json::from_str(r#""weekly""#).unwrap();
+        assert_eq!(v, UpdateInterval::Weekly);
+    }
+
+    // ── Settings ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn settings_round_trip_through_json() {
+        let original = Settings {
+            auto_updates: false,
+            update_interval: UpdateInterval::Weekly,
+            pause_on_metered: false,
+            custom_interval_hours: 12,
+            dev_mode: false,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.auto_updates, original.auto_updates);
+        assert_eq!(back.update_interval, original.update_interval);
+        assert_eq!(back.pause_on_metered, original.pause_on_metered);
+        assert_eq!(back.custom_interval_hours, original.custom_interval_hours);
+        assert_eq!(back.dev_mode, original.dev_mode);
+    }
+
+    #[test]
+    fn settings_missing_fields_get_defaults() {
+        // Partial JSON should fill in via serde(default).
+        let partial = r#"{"auto_updates": false}"#;
+        let s: Settings = serde_json::from_str(partial).unwrap();
+        assert!(!s.auto_updates);
+        // Other fields fall back to Default::default()'s values.
+        assert_eq!(s.update_interval, UpdateInterval::Daily);
+        assert_eq!(s.custom_interval_hours, 6);
+        assert!(s.pause_on_metered);
+    }
+
+    #[test]
+    fn settings_unknown_fields_are_ignored() {
+        // Forward-compat: tomorrow's settings.json shouldn't break today's binary.
+        let extended = r#"{"auto_updates": true, "future_field": 42}"#;
+        let s: Settings = serde_json::from_str(extended).unwrap();
+        assert!(s.auto_updates);
+    }
+}

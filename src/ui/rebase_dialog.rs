@@ -41,6 +41,31 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     let header = adw::HeaderBar::new();
     toolbar_view.add_top_bar(&header);
 
+    // ── Variant selector (Dakota vs Dakota-Nvidia) ────────────────────────
+    let variant_state = Rc::new(RefCell::new("dakota".to_string()));
+    let variant_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    variant_box.set_margin_start(16);
+    variant_box.set_margin_end(16);
+    variant_box.set_margin_top(8);
+    variant_box.set_margin_bottom(8);
+
+    let variant_label = gtk::Label::new(Some("Variant:"));
+    variant_box.append(&variant_label);
+
+    let dakota_btn = gtk::ToggleButton::builder()
+        .label("Dakota")
+        .active(true)
+        .build();
+    dakota_btn.add_css_class("pill");
+    variant_box.append(&dakota_btn);
+
+    let nvidia_btn = gtk::ToggleButton::builder()
+        .label("Dakota-Nvidia")
+        .active(false)
+        .build();
+    nvidia_btn.add_css_class("pill");
+    variant_box.append(&nvidia_btn);
+
     // ── Stack: loading / loaded / error ────────────────────────────────
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
@@ -83,7 +108,12 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     loaded_scroll.set_child(Some(&loaded_box));
     stack.add_named(&loaded_scroll, Some("loaded"));
 
-    toolbar_view.set_content(Some(&stack));
+    let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    main_box.append(&variant_box);
+    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    main_box.append(&separator);
+    main_box.append(&stack);
+    toolbar_view.set_content(Some(&main_box));
     dialog.set_child(Some(&toolbar_view));
     stack.set_visible_child_name("loading");
 
@@ -92,7 +122,9 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     let dialog_for_retry = dialog.clone();
     let parent_for_retry = parent.clone();
     let error_page_for_retry = error_page.clone();
+    let variant_state_for_retry = variant_state.clone();
     retry_button.connect_clicked(move |_| {
+        let variant = variant_state_for_retry.borrow().clone();
         start_version_fetch(
             stack_for_retry.clone(),
             loaded_box_for_retry.clone(),
@@ -100,10 +132,68 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
             parent_for_retry.clone(),
             error_page_for_retry.clone(),
             dev_mode,
+            &variant,
         );
     });
 
+    // Wire up variant selector — when Dakota is toggled on, switch to default variant
+    {
+        let nvidia_ref = nvidia_btn.clone();
+        let variant_state_ref = variant_state.clone();
+        let stack_ref = stack.clone();
+        let loaded_box_ref = loaded_box.clone();
+        let dialog_ref = dialog.clone();
+        let parent_ref = parent.clone();
+        let error_page_ref = error_page.clone();
+
+        dakota_btn.connect_toggled(move |btn| {
+            if btn.is_active() {
+                nvidia_ref.set_active(false);
+                *variant_state_ref.borrow_mut() = "default".to_string();
+                let variant = variant_state_ref.borrow().clone();
+                start_version_fetch(
+                    stack_ref.clone(),
+                    loaded_box_ref.clone(),
+                    dialog_ref.clone(),
+                    parent_ref.clone(),
+                    error_page_ref.clone(),
+                    dev_mode,
+                    &variant,
+                );
+            }
+        });
+    }
+
+    // Wire up variant selector — when Nvidia is toggled on, switch to nvidia variant
+    {
+        let dakota_ref = dakota_btn.clone();
+        let variant_state_ref = variant_state.clone();
+        let stack_ref = stack.clone();
+        let loaded_box_ref = loaded_box.clone();
+        let dialog_ref = dialog.clone();
+        let parent_ref = parent.clone();
+        let error_page_ref = error_page.clone();
+
+        nvidia_btn.connect_toggled(move |btn| {
+            if btn.is_active() {
+                dakota_ref.set_active(false);
+                *variant_state_ref.borrow_mut() = "nvidia".to_string();
+                let variant = variant_state_ref.borrow().clone();
+                start_version_fetch(
+                    stack_ref.clone(),
+                    loaded_box_ref.clone(),
+                    dialog_ref.clone(),
+                    parent_ref.clone(),
+                    error_page_ref.clone(),
+                    dev_mode,
+                    &variant,
+                );
+            }
+        });
+    }
+
     dialog.present(Some(parent));
+    let initial_variant = variant_state.borrow().clone();
     start_version_fetch(
         stack.clone(),
         loaded_box.clone(),
@@ -111,6 +201,7 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
         parent.clone(),
         error_page.clone(),
         dev_mode,
+        &initial_variant,
     );
 }
 
@@ -121,13 +212,14 @@ fn start_version_fetch(
     parent: adw::ApplicationWindow,
     error_page: adw::StatusPage,
     dev_mode: bool,
+    variant: &str,
 ) {
     stack.set_visible_child_name("loading");
     error_page.set_description(Some("Check your internet connection and try again."));
 
     if dev_mode {
         // In dev mode, use simulated data so the dialog is functional without bootc.
-        let versions = generate_mock_versions();
+        let versions = generate_mock_versions(variant);
         glib::idle_add_local_once(move || {
             build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions, dev_mode);
             stack.set_visible_child_name("loaded");
@@ -135,8 +227,9 @@ fn start_version_fetch(
         return;
     }
 
+    let variant_str = variant.to_string();
     let result_slot: Arc<Mutex<Option<FetchResult>>> = Arc::new(Mutex::new(None));
-    spawn_fetch_thread(result_slot.clone());
+    spawn_fetch_thread(result_slot.clone(), &variant_str);
 
     let start_time = std::time::Instant::now();
     glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
@@ -171,7 +264,8 @@ fn start_version_fetch(
     });
 }
 
-fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>) {
+fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>, variant: &str) {
+    let variant_str = variant.to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -182,7 +276,13 @@ fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>) {
             let result = match RegistryClient::detect().await {
                 None => FetchResult::DetectFailed,
                 Some(client) => match client.fetch_versions(90).await {
-                    Ok(versions) => FetchResult::Ok(versions),
+                    Ok(mut versions) => {
+                        // Filter versions to the selected variant if specified
+                        if !variant_str.is_empty() && variant_str != "default" {
+                            versions.retain(|v| v.version.contains(&variant_str));
+                        }
+                        FetchResult::Ok(versions)
+                    }
                     Err(e) => FetchResult::Err(e.to_string()),
                 },
             };
@@ -792,31 +892,62 @@ fn run_rebase_simulated(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog
     });
 }
 
-/// Generate mock image versions for the last 30 days (dev mode).
-fn generate_mock_versions() -> Vec<ImageVersion> {
+/// Generate mock image versions for the last 60 days (dev mode).
+///
+/// Creates realistic dated versions reflecting Universal Blue build patterns.
+fn generate_mock_versions(variant: &str) -> Vec<ImageVersion> {
     use chrono::{Duration, Utc};
     use crate::registry_client::RegistryClient;
 
-    let (registry, org, image) = if let Some(client) = RegistryClient::detect_from_os_release() {
+    let (registry, org, image_base) = if let Some(client) = RegistryClient::detect_from_os_release() {
         (client.registry().to_string(), client.org().to_string(), client.image().to_string())
     } else {
         ("ghcr.io".to_string(), "projectbluefin".to_string(), "dakota".to_string())
     };
 
+    // Allow variant-specific image names (e.g., dakota-nvidia)
+    let image = if variant.is_empty() || variant == "default" {
+        image_base.clone()
+    } else if variant == "nvidia" || variant == "dakota-nvidia" {
+        format!("{}-nvidia", image_base)
+    } else {
+        // Support any custom variant suffix
+        format!("{}-{}", image_base, variant)
+    };
+
     let today = Utc::now().date_naive();
     let mut versions = Vec::new();
 
-    // Generate a version every 2-3 days over the last 60 days.
+    // Generate a version every 2-3 days over the last 60 days, matching Universal Blue patterns.
+    // Kernel versions are realistic based on Fedora kernel releases.
+    let kernel_versions = vec![
+        "6.12.13-200.fc41.x86_64",
+        "6.13.1-100.fc42.x86_64",
+        "6.13.3-100.fc42.x86_64",
+        "6.13.4-100.fc42.x86_64",
+        "6.13.5-100.fc42.x86_64",
+        "6.13.6-200.fc42.x86_64",
+        "6.13.7-200.fc42.x86_64",
+        "6.13.8-200.fc42.x86_64",
+        "6.13.9-200.fc42.x86_64",
+        "6.13.10-200.fc42.x86_64",
+    ];
+
     let mut day_offset = 2i64;
     let mut build_num = 1u32;
     while day_offset <= 60 {
         let date = today - Duration::days(day_offset);
         let tag = format!("latest-{}", date.format("%Y%m%d"));
+        let kernel = kernel_versions
+            .get(build_num as usize % kernel_versions.len())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "6.13.10-200.fc42.x86_64".to_string());
+
         versions.push(ImageVersion {
             date,
             full_ref: format!("{}/{}/{}:{}", registry, org, image, tag),
             version: tag,
-            kernel: format!("6.12.{}-200.fc42.x86_64", build_num),
+            kernel,
             revision: format!("{:08x}", 0xdeadbe00 + build_num),
             created: date.and_hms_opt(4, 30, 0).unwrap().and_utc(),
         });

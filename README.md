@@ -1,8 +1,8 @@
 # Finupdate
 
-**A modern GTK4/libadwaita system update frontend for [uupd](https://github.com/ublue-os/uupd)**
+**A modern GTK4/libadwaita system update frontend for Bluefin and Universal Blue**
 
-Finupdate provides a graphical interface for running system updates on [Bluefin](https://projectbluefin.io) and Universal Blue systems. It's the first app in the Bluefin utility suite and serves as a reference implementation for future apps.
+Finupdate provides a graphical interface for running system updates on [Bluefin](https://projectbluefin.io) and Universal Blue systems. It orchestrates `bootc`, `flatpak`, `brew`, and `distrobox` directly — no `uupd` required. It's the first app in the Bluefin utility suite and serves as a reference implementation for future apps.
 
 ![GNOME 47+](https://img.shields.io/badge/GNOME-47%2B-blue)
 ![Rust](https://img.shields.io/badge/Rust-2024_edition-orange)
@@ -10,8 +10,8 @@ Finupdate provides a graphical interface for running system updates on [Bluefin]
 
 ## Features
 
-- **One-click system updates** — triggers `uupd` and shows live progress
-- **Live log streaming** — real-time stdout/stderr from the update process
+- **One-click system updates** — orchestrates `bootc`, `flatpak`, `brew`, and `distrobox` via a single pkexec elevation
+- **Live log streaming** — real-time stdout/stderr from each update module
 - **Elapsed timer** — shows how long the update has been running
 - **Copy log** — clipboard integration for sharing output
 - **Cancel support** — gracefully cancel a running update
@@ -38,7 +38,9 @@ The app has four states:
 ### Runtime
 - GTK 4.16+ (GNOME 47+)
 - libadwaita 1.7+
-- `uupd` installed on the host system
+- `bootc` or `rpm-ostree` on the host system
+- `flatpak`, `brew`, `distrobox` — optional; each module is skipped if the tool is absent
+- `uupd` — optional; if present, enables the "Automatic background updates" toggle in Preferences
 
 ### Build
 - Rust 1.85+ (edition 2024)
@@ -169,6 +171,6 @@ MIT — see [Cargo.toml](Cargo.toml)
 
 ## Related
 
-- [uupd](https://github.com/ublue-os/uupd) — the backend this app wraps
 - [Project Bluefin](https://projectbluefin.io) — the desktop OS this is built for
 - [GNOME HIG](https://developer.gnome.org/hig/) — the design guidelines we follow
+- [uupd](https://github.com/ublue-os/uupd) — optional host daemon; if installed, its timer can be toggled from Preferences

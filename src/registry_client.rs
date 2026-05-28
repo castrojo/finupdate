@@ -418,3 +418,107 @@ fn strip_date_suffix(tag: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── strip_date_suffix ────────────────────────────────────────────────
+
+    #[test]
+    fn strip_date_suffix_dot_form() {
+        assert_eq!(
+            strip_date_suffix("stable-daily-43.20260222"),
+            Some("stable-daily-43".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_date_suffix_dash_form() {
+        assert_eq!(
+            strip_date_suffix("stable-daily-43-20260222"),
+            Some("stable-daily-43".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_date_suffix_rejects_non_date_suffix() {
+        assert_eq!(strip_date_suffix("latest"), None);
+        assert_eq!(strip_date_suffix("stable-daily"), None);
+        assert_eq!(strip_date_suffix("stable.notadate"), None);
+    }
+
+    #[test]
+    fn strip_date_suffix_rejects_wrong_length() {
+        assert_eq!(strip_date_suffix("stream-1234567"), None); // 7 digits
+        assert_eq!(strip_date_suffix("stream-123456789"), None); // 9 digits
+    }
+
+    #[test]
+    fn strip_date_suffix_rejects_non_digit_chars() {
+        assert_eq!(strip_date_suffix("stream-2026022x"), None);
+    }
+
+    // ── parse_dated_tag ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_dated_tag_dot_separator() {
+        let d = parse_dated_tag("stable-daily-43.20260222", "stable-daily-43").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 2, 22).unwrap());
+    }
+
+    #[test]
+    fn parse_dated_tag_dash_separator() {
+        let d = parse_dated_tag("stable-daily-43-20260222", "stable-daily-43").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 2, 22).unwrap());
+    }
+
+    #[test]
+    fn parse_dated_tag_rejects_unrelated_tag() {
+        assert!(parse_dated_tag("latest", "stable-daily-43").is_none());
+        assert!(parse_dated_tag("dev-daily-20260222", "stable-daily").is_none());
+    }
+
+    #[test]
+    fn parse_dated_tag_rejects_invalid_calendar_date() {
+        // 2026-02-30 isn't a real date.
+        assert!(parse_dated_tag("stable.20260230", "stable").is_none());
+    }
+
+    // ── parse_image_ref ──────────────────────────────────────────────────
+
+    #[test]
+    fn parse_image_ref_full_ghcr_with_dot_date() {
+        let c = parse_image_ref("ghcr.io/ublue-os/bluefin:stable-daily-43.20260222").unwrap();
+        assert_eq!(c.registry(), "ghcr.io");
+        assert_eq!(c.org(), "ublue-os");
+        assert_eq!(c.image(), "bluefin");
+        assert_eq!(c.stream, "stable-daily-43");
+    }
+
+    #[test]
+    fn parse_image_ref_full_ghcr_with_dash_date() {
+        let c = parse_image_ref("ghcr.io/projectbluefin/dakota:latest-20260527").unwrap();
+        assert_eq!(c.stream, "latest");
+    }
+
+    #[test]
+    fn parse_image_ref_rejects_missing_org_or_image() {
+        assert!(parse_image_ref("ghcr.io:tag").is_none()); // no slashes
+        assert!(parse_image_ref("ghcr.io/org:tag").is_none()); // only 2 parts
+    }
+
+    #[test]
+    fn parse_image_ref_rejects_tag_without_date() {
+        assert!(parse_image_ref("ghcr.io/ublue-os/bluefin:latest").is_none());
+    }
+
+    #[test]
+    fn parse_image_ref_handles_nested_image_path() {
+        // Some registries use multi-segment image paths.
+        let c = parse_image_ref(
+            "ghcr.io/ublue-os/bluefin-dx/extras:stable-daily.20260222",
+        ).unwrap();
+        assert_eq!(c.image(), "bluefin-dx/extras");
+    }
+}

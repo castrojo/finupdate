@@ -1,0 +1,79 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://github.com/ublue-os/uupd/blob/main/config.json",
+    "title": "uupd configuration",
+    "description": "Schema for /etc/uupd/config.json — the Universal Blue Updater's hardware-check thresholds and per-module enable toggles. Tracks the format used by ublue-os/uupd. Update this file in lockstep with src/uupd_compat.rs::UupdConfig.",
+    "type": "object",
+    "additionalProperties": true,
+    "properties": {
+        "checks": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "hardware": {
+                    "type": "object",
+                    "description": "Pre-update hardware checks. Manual updates always run regardless of these thresholds.",
+                    "additionalProperties": true,
+                    "properties": {
+                        "enable": {
+                            "type": "boolean",
+                            "default": true,
+                            "description": "Master toggle for the hardware-checks subsystem."
+                        },
+                        "bat-min-percent": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "default": 20,
+                            "description": "Minimum battery charge percent. Below this, automatic updates are skipped."
+                        },
+                        "cpu-max-percent": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "default": 50,
+                            "description": "Maximum CPU load percent. Above this, automatic updates are skipped."
+                        },
+                        "mem-max-percent": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 100,
+                            "default": 90,
+                            "description": "Maximum RAM utilization percent. Above this, automatic updates are skipped."
+                        },
+                        "net-max-bytes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "default": 700000,
+                            "description": "Maximum sustained network throughput in bytes/second. Above this, automatic updates are skipped to avoid contending with active downloads."
+                        }
+                    }
+                }
+            }
+        },
+        "modules": {
+            "type": "object",
+            "description": "Per-module enable/disable controls. Each module has a single 'disable' boolean. Defaults to enabled.",
+            "additionalProperties": true,
+            "properties": {
+                "system":    { "$ref": "#/$defs/moduleToggle" },
+                "flatpak":   { "$ref": "#/$defs/moduleToggle" },
+                "brew":      { "$ref": "#/$defs/moduleToggle" },
+                "distrobox": { "$ref": "#/$defs/moduleToggle" }
+            }
+        }
+    },
+    "$defs": {
+        "moduleToggle": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "disable": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, this module is skipped entirely during runs."
+                }
+            }
+        }
+    }
+}

@@ -1,4 +1,5 @@
 toolbox := "finupdate"
+toolbox_image := "registry.fedoraproject.org/fedora-toolbox:43"
 manifest := "build-aux/org.projectbluefin.Finupdate.Devel.json"
 app_id := "org.projectbluefin.Finupdate.Devel"
 
@@ -17,6 +18,10 @@ build:
 # Run clippy lints (inside toolbox)
 lint:
     toolbox run --container {{ toolbox }} cargo clippy -- -D warnings
+
+# Run unit tests inside the toolbox
+test:
+    toolbox run --container {{ toolbox }} cargo test --all-targets
 
 # Build and install the Flatpak (full integration build)
 flatpak:
@@ -41,11 +46,46 @@ flatpak-run: flatpak dock run
 clean-flatpak:
     rm -rf _flatpak .flatpak-builder
 
-# Create the toolbox and install build deps (one-time setup)
+# Create the toolbox and install build + GUI-test deps (one-time setup).
+# Uses fedora-toolbox (which ships dnf) rather than the sealed Bluefin Dakota
+# image, which has no package manager.
 setup:
-    toolbox create {{ toolbox }} || true
+    toolbox create -y --image {{ toolbox_image }} {{ toolbox }} || true
     toolbox run --container {{ toolbox }} sudo dnf install -y \
         cargo rust \
-        gtk4-devel libadwaita-devel \
-        meson ninja-build \
-        pkg-config
+        gtk4-devel libadwaita-devel pango-devel cairo-devel openssl-devel \
+        meson ninja-build pkg-config \
+        python3-pip python3-dogtail python3-behave python3-pytest \
+        gnome-ponytail-daemon python3-uinput
+
+# Drop and recreate the toolbox from scratch
+reset-toolbox:
+    toolbox rm -f {{ toolbox }} || true
+    just setup
+
+# Run dogtail/behave GUI tests against the *currently installed* Flatpak,
+# inside the current GNOME Wayland session. Requires:
+#   - The Devel Flatpak is installed (`just flatpak` first).
+#   - You're running an active GNOME session (or `qecore-headless` — see gui-test-headless).
+#   - org.gnome.desktop.interface toolkit-accessibility is true.
+gui-test suite="smoke" tags="":
+    cd tests/{{ suite }} && behave features/ {{ if tags != "" { "--tags " + tags } else { "" } }}
+
+# Run the GUI tests inside an isolated headless Wayland session via
+# qecore-headless. This is what CI uses; safe to run on a machine with no
+# active GNOME session.
+gui-test-headless suite="smoke" tags="":
+    qecore-headless --session-type wayland --session-desktop gnome \
+        "bash -lc 'cd tests/{{ suite }} && behave features/ {{ if tags != "" { "--tags " + tags } else { "" } }}'"
+
+# Dump the current AT-SPI tree of a running finupdate to /tmp/finupdate-tree.txt
+# Useful for writing new dogtail selectors. Run `just run` first, then this.
+atspi-dump:
+    python3 -c "from dogtail.tree import root; \
+        import sys; \
+        app = root.application('finupdate'); \
+        def walk(n, d=0): \
+            print('  '*d + f'[{n.roleName}] {n.name!r}'); \
+            for c in n.children: walk(c, d+1); \
+        walk(app)" > /tmp/finupdate-tree.txt
+    @echo "AT-SPI tree dumped to /tmp/finupdate-tree.txt"

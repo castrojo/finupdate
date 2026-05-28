@@ -1,0 +1,77 @@
+#!/bin/sh
+# finupdate-runner — runs as root via a single pkexec elevation.
+# Drives the four update modules in sequence, emitting structured markers
+# that the Rust orchestrator parses into ModuleStarted/ModuleFinished events.
+#
+# Marker protocol:
+#   ===MODULE:<name>===              module starting
+#   ===MODULE:<name>:done:<rc>===    module finished with exit code
+#   ===MODULE:<name>:skipped===      module skipped (tool not present)
+#   ===DONE===                       all modules finished
+
+set -u
+
+emit() { printf '===%s===\n' "$1"; }
+
+# ── System (bootc / rpm-ostree) ───────────────────────────────────────────────
+emit MODULE:system
+if command -v bootc >/dev/null 2>&1; then
+    bootc upgrade
+    emit "MODULE:system:done:$?"
+elif command -v rpm-ostree >/dev/null 2>&1; then
+    rpm-ostree upgrade
+    emit "MODULE:system:done:$?"
+else
+    echo "system: neither bootc nor rpm-ostree found — skipping"
+    emit MODULE:system:skipped
+fi
+
+# ── Flatpak ───────────────────────────────────────────────────────────────────
+emit MODULE:flatpak
+if command -v flatpak >/dev/null 2>&1; then
+    flatpak update -y --noninteractive
+    emit "MODULE:flatpak:done:$?"
+else
+    echo "flatpak: not found — skipping"
+    emit MODULE:flatpak:skipped
+fi
+
+# ── Homebrew ──────────────────────────────────────────────────────────────────
+emit MODULE:brew
+BREW_BIN=""
+for candidate in \
+    /home/linuxbrew/.linuxbrew/bin/brew \
+    /usr/local/bin/brew \
+    /opt/homebrew/bin/brew; do
+    if [ -x "$candidate" ]; then
+        BREW_BIN="$candidate"
+        break
+    fi
+done
+
+if [ -n "$BREW_BIN" ]; then
+    # brew must run as the real user, not root — find the first human user.
+    BREW_USER=$(getent passwd | awk -F: '$3 >= 1000 && $3 < 65534 { print $1; exit }')
+    if [ -n "$BREW_USER" ]; then
+        su - "$BREW_USER" -c "$BREW_BIN upgrade --quiet"
+        emit "MODULE:brew:done:$?"
+    else
+        echo "brew: could not determine non-root user — skipping"
+        emit MODULE:brew:skipped
+    fi
+else
+    echo "brew: not found — skipping"
+    emit MODULE:brew:skipped
+fi
+
+# ── Distrobox ─────────────────────────────────────────────────────────────────
+emit MODULE:distrobox
+if command -v distrobox >/dev/null 2>&1; then
+    distrobox upgrade --all
+    emit "MODULE:distrobox:done:$?"
+else
+    echo "distrobox: not found — skipping"
+    emit MODULE:distrobox:skipped
+fi
+
+emit DONE

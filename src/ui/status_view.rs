@@ -82,6 +82,10 @@ pub enum StatusViewInput {
     GithubCommitsLoaded(Vec<(String, String, String)>),
     /// SBOM package diff loaded in background
     SbomDiffLoaded(crate::sbom_diff::SbomDiffResult),
+    /// A module has started running (from orchestrator).
+    ModuleStarted(crate::orchestrator::Module),
+    /// A module has finished (from orchestrator).
+    ModuleFinished(crate::orchestrator::Module, crate::orchestrator::ModuleStatus),
 }
 
 /// Output messages the StatusView sends to its parent.
@@ -1556,27 +1560,6 @@ impl SimpleComponent for StatusView {
                 self.update_list
                     .emit(UpdateListInput::ProcessLine(line.clone()));
                 self.log_view.emit(LogViewInput::AppendLine(line.clone()));
-
-                // Drive segmented progress from log output.
-                if let Some(new_key) = extract_module_key(&line) {
-                    let is_same_seg = self
-                        .active_module
-                        .map(|prev| same_segment(prev, new_key))
-                        .unwrap_or(false);
-                    if !is_same_seg {
-                        // Complete the previous segment only when switching to a
-                        // different visual segment (brew→distrobox stays in Dev Tools).
-                        if let Some(prev) = self.active_module {
-                            self.seg_progress.set_module_complete(prev);
-                        }
-                        self.seg_progress.set_module_active(new_key);
-                    }
-                    self.active_module = Some(new_key);
-                } else if line.contains("level=ERROR") || line.contains("level=error") {
-                    if let Some(key) = self.active_module {
-                        self.seg_progress.set_module_failed(key);
-                    }
-                }
             }
 
             StatusViewInput::ClearLog => {
@@ -1851,30 +1834,42 @@ impl SimpleComponent for StatusView {
                 self.sbom_diff = Some(diff);
                 self.rebuild_changelog_page(&sender);
             }
+
+            StatusViewInput::ModuleStarted(module) => {
+                let key = module.key();
+                let is_same_seg = self
+                    .active_module
+                    .map(|prev| same_segment(prev, key))
+                    .unwrap_or(false);
+                if !is_same_seg {
+                    if let Some(prev) = self.active_module {
+                        self.seg_progress.set_module_complete(prev);
+                    }
+                    self.seg_progress.set_module_active(key);
+                }
+                self.active_module = Some(key);
+                self.update_list.emit(UpdateListInput::ProcessLine(
+                    format!("Starting module: {}", key)
+                ));
+            }
+
+            StatusViewInput::ModuleFinished(module, status) => {
+                use crate::orchestrator::ModuleStatus;
+                let key = module.key();
+                match status {
+                    ModuleStatus::Success | ModuleStatus::UpToDate | ModuleStatus::Skipped => {
+                        self.seg_progress.set_module_complete(key);
+                    }
+                    ModuleStatus::Failed(_) => {
+                        self.seg_progress.set_module_failed(key);
+                    }
+                }
+            }
         }
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Extract a static module key from a uupd log line.
-///
-/// uupd emits `module_name=System` (capital first letter) in structured log
-/// lines when it begins processing a module. Map those to the lowercase keys
-/// used by [`SegmentedProgress`].
-fn extract_module_key(line: &str) -> Option<&'static str> {
-    if line.contains("module_name=System") {
-        Some("system")
-    } else if line.contains("module_name=Flatpak") {
-        Some("flatpak")
-    } else if line.contains("module_name=Brew") {
-        Some("brew")
-    } else if line.contains("module_name=Distrobox") {
-        Some("distrobox")
-    } else {
-        None
-    }
-}
 
 fn read_auto_updates_enabled() -> bool {
     let output = if crate::update_worker::is_flatpak() {
@@ -2718,7 +2713,7 @@ fn spawn_changelog_fetch(
             let target_ref = format!("{}:{}", registry_uri, selected_tag);
             
             println!("[debug] sbom_diff: starting background fetch booted_ref={} target_ref={}", booted_ref, target_ref);
-            if let Some(diff) = crate::sbom_diff::fetch_and_diff_sboms(booted_ref, target_ref) {
+            if let Some(diff) = crate::sbom_diff::fetch_and_diff_sboms(booted_ref, target_ref).await {
                 sender.input(StatusViewInput::SbomDiffLoaded(diff));
             }
         });
