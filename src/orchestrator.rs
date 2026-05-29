@@ -166,22 +166,45 @@ pub async fn run(
 }
 
 /// Build the command that invokes `finupdate-runner` with a single pkexec.
+///
+/// Inside a Flatpak the bundled runner lives at `/app/bin/finupdate-runner`,
+/// but that's a sandbox-internal path — `flatpak-spawn --host pkexec
+/// /app/bin/finupdate-runner` was failing with exit 127 because the host's
+/// pkexec doesn't see anything under `/app/`. Fix: stage the script body to
+/// a host-visible temp file, then invoke that path with pkexec. The temp
+/// file is named with a `finupdate-runner-` prefix so the polkit rules
+/// (`/etc/polkit-1/rules.d/49-finupdate.rules`) match it by name.
 fn build_runner_command() -> Command {
-    // The runner lives at /app/bin/finupdate-runner inside the Flatpak.
-    // Outside Flatpak (native build / dev), fall back to PATH lookup.
-    let runner = if std::path::Path::new("/app/bin/finupdate-runner").exists() {
-        "/app/bin/finupdate-runner".to_string()
-    } else {
-        "finupdate-runner".to_string()
-    };
-
     if is_flatpak() {
+        let script_body = std::fs::read_to_string("/app/bin/finupdate-runner")
+            .unwrap_or_else(|_| {
+                "#!/bin/sh\necho 'finupdate-runner script not bundled in this flatpak' >&2\necho '===DONE==='\nexit 127\n".to_string()
+            });
+
+        // The double-`-c` wrapper: outer sh writes the script body (received
+        // on stdin) to a host /tmp file under a polkit-friendly name, then
+        // pkexec's the result. Trailing `rm` keeps /tmp tidy. Pipe the script
+        // body via env var so we don't need stdin plumbing.
+        let driver = r#"
+set -e
+TMPFILE=$(mktemp /tmp/finupdate-runner-XXXXXX.sh)
+trap 'rm -f "$TMPFILE"' EXIT
+printf '%s' "$FINUPDATE_RUNNER_BODY" > "$TMPFILE"
+chmod +x "$TMPFILE"
+pkexec "$TMPFILE"
+"#;
         let mut cmd = Command::new("flatpak-spawn");
-        cmd.arg("--host").arg("pkexec").arg(runner);
+        cmd.arg("--host")
+            .arg(format!("--env=FINUPDATE_RUNNER_BODY={}", script_body))
+            .arg("sh")
+            .arg("-c")
+            .arg(driver);
         cmd
     } else {
+        // Native build / dev: PATH lookup. `cargo install --path .` or the
+        // meson install both put `finupdate-runner` on PATH.
         let mut cmd = Command::new("pkexec");
-        cmd.arg(runner);
+        cmd.arg("finupdate-runner");
         cmd
     }
 }

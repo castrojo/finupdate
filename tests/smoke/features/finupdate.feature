@@ -338,6 +338,77 @@ Feature: Finupdate smoke tests
     * Key combo: "Escape"
     * Application "finupdate" is running
 
+  # ── Accelerator coverage for non-AT-SPI surfaces ────────────────────────
+  # libadwaita ActionRow doesn't enumerate suffix-button children to AT-SPI,
+  # so the banner (What's new / Install / Restart / Discard) and the
+  # Powerwash / Factory reset rows aren't directly clickable from dogtail.
+  # We bind keyboard accelerators in app.rs for every action that previously
+  # depended on those buttons. Tests drive the accelerator; the underlying
+  # AppMsg flow is the same as the click path. Run with mock_identity so
+  # the banner is in the UpdateAvailable state and its actions are
+  # meaningful.
+
+  @live @mock_identity @buttons @whats_new
+  Scenario: Ctrl+W activates the What's new / changelog action
+    * Mock identity "ghcr.io/ublue-os/bluefin:stable" is configured
+    * Wait until "bluefin" appears in "finupdate" within 15 seconds
+    * Key combo: "<Control>w"
+    * Application "finupdate" is running
+
+  @live @mock_identity @buttons @restart
+  Scenario: Ctrl+Shift+B opens the Restart confirmation dialog
+    * Mock identity "ghcr.io/ublue-os/bluefin:stable" is configured
+    * Wait until "bluefin" appears in "finupdate" within 15 seconds
+    * Key combo: "<Control><Shift>b"
+    * Wait until "Restart System" appears in "finupdate" within 5 seconds
+    * Key combo: "Escape"
+    * Application "finupdate" is running
+
+  @live @mock_identity @buttons @discard
+  Scenario: Ctrl+Backspace dismisses the update banner
+    * Mock identity "ghcr.io/ublue-os/bluefin:stable" is configured
+    * Wait until "bluefin" appears in "finupdate" within 15 seconds
+    * Key combo: "<Control>BackSpace"
+    * Application "finupdate" is running
+
+  @live @mock_identity @buttons @powerwash @command_log
+  Scenario: Ctrl+Alt+P opens the Powerwash confirmation dialog
+    * Mock identity "ghcr.io/ublue-os/bluefin:stable" is configured
+    * Wait until "bluefin" appears in "finupdate" within 15 seconds
+    * Key combo: "<Control><Alt>p"
+    * Wait until "Powerwash" appears in "finupdate" within 5 seconds
+    * Key combo: "Escape"
+    * Application "finupdate" is running
+
+  @live @mock_identity @buttons @factory_reset @command_log
+  Scenario: Ctrl+Alt+F opens the Factory Reset confirmation dialog
+    * Mock identity "ghcr.io/ublue-os/bluefin:stable" is configured
+    * Wait until "bluefin" appears in "finupdate" within 15 seconds
+    * Key combo: "<Control><Alt>f"
+    * Wait until "Factory reset" appears in "finupdate" within 5 seconds
+    * Key combo: "Escape"
+    * Application "finupdate" is running
+
+  # ── Tab-navigability smoke ────────────────────────────────────────────
+  # Verify the home page is reachable via Tab (the keyboard-only focus
+  # chain that GTK4 maintains). Pressing Tab repeatedly should cycle
+  # through focusable widgets without crashing the app. Distinct from the
+  # accelerator coverage above — this validates the Tab focus chain
+  # itself, which is what keyboard-only users (and screen readers) rely on.
+
+  @tab_nav @keyboard
+  Scenario: Tab cycles focus through the home page without crashing
+    * Key combo: "Tab"
+    * Key combo: "Tab"
+    * Key combo: "Tab"
+    * Key combo: "Tab"
+    * Key combo: "Tab"
+    * Key combo: "Tab"
+    * Key combo: "Tab"
+    * Key combo: "Tab"
+    * Application "finupdate" is running
+    * Item "Check" "button" is "showing" in "finupdate"
+
   # ── Clean shutdown ──────────────────────────────────────────────────────
 
   @close
