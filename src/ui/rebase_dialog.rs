@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crate::registry_client::{ImageVersion, RegistryClient};
+use crate::registry_client::{Family, ImageVersion, RegistryClient};
 use crate::update_worker::is_flatpak;
 
 /// Open the rebase history dialog as a child of `parent`.
@@ -41,30 +41,48 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     let header = adw::HeaderBar::new();
     toolbar_view.add_top_bar(&header);
 
-    // ── Variant selector (Dakota vs Dakota-Nvidia) ────────────────────────
-    let variant_state = Rc::new(RefCell::new("dakota".to_string()));
-    let variant_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // ── Feature-switch variant selector ───────────────────────────────────
+    //
+    // Replaces the hardcoded Dakota/Dakota-Nvidia pair with one SwitchRow
+    // per atomic feature available in the current Family — derived live from
+    // the Family taxonomy (KNOWN_FAMILIES). The user picks Nvidia / DX / HWE
+    // etc. by name rather than choosing a raw image; the resolved target
+    // image is shown in a preview row at the bottom of the group.
+    //
+    // The legacy `variant_state: Rc<RefCell<String>>` interface is preserved
+    // for the existing `start_version_fetch` API — we feed it an empty string
+    // when the user hasn't picked features (no extra filter), so the loaded
+    // page renders the full base-image history.
+    let variant_state = Rc::new(RefCell::new(String::new()));
+    let selected_features: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let current_family: Rc<RefCell<Option<&'static Family>>> = Rc::new(RefCell::new(None));
+
+    let variant_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     variant_box.set_margin_start(16);
     variant_box.set_margin_end(16);
-    variant_box.set_margin_top(8);
-    variant_box.set_margin_bottom(8);
+    variant_box.set_margin_top(12);
+    variant_box.set_margin_bottom(12);
 
-    let variant_label = gtk::Label::new(Some("Variant:"));
-    variant_box.append(&variant_label);
+    let family_label = gtk::Label::new(Some("Loading family info…"));
+    family_label.set_halign(gtk::Align::Start);
+    family_label.add_css_class("heading");
+    variant_box.append(&family_label);
 
-    let dakota_btn = gtk::ToggleButton::builder()
-        .label("Dakota")
-        .active(true)
+    // PreferencesGroup hosts the dynamic SwitchRow list. Populated once the
+    // initial fetch completes and we know which family we're on.
+    let features_group = adw::PreferencesGroup::new();
+    variant_box.append(&features_group);
+
+    let target_image_row = adw::ActionRow::builder()
+        .title("Target image")
+        .subtitle("(select features above)")
         .build();
-    dakota_btn.add_css_class("pill");
-    variant_box.append(&dakota_btn);
-
-    let nvidia_btn = gtk::ToggleButton::builder()
-        .label("Dakota-Nvidia")
-        .active(false)
-        .build();
-    nvidia_btn.add_css_class("pill");
-    variant_box.append(&nvidia_btn);
+    let target_chip = gtk::Image::from_icon_name("emblem-default-symbolic");
+    target_chip.add_css_class("dim-label");
+    target_image_row.add_suffix(&target_chip);
+    let target_image_group = adw::PreferencesGroup::new();
+    target_image_group.add(&target_image_row);
+    variant_box.append(&target_image_group);
 
     // ── Stack: loading / loaded / error ────────────────────────────────
     let stack = gtk::Stack::builder()
@@ -136,61 +154,19 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
         );
     });
 
-    // Wire up variant selector — when Dakota is toggled on, switch to default variant
-    {
-        let nvidia_ref = nvidia_btn.clone();
-        let variant_state_ref = variant_state.clone();
-        let stack_ref = stack.clone();
-        let loaded_box_ref = loaded_box.clone();
-        let dialog_ref = dialog.clone();
-        let parent_ref = parent.clone();
-        let error_page_ref = error_page.clone();
-
-        dakota_btn.connect_toggled(move |btn| {
-            if btn.is_active() {
-                nvidia_ref.set_active(false);
-                *variant_state_ref.borrow_mut() = "default".to_string();
-                let variant = variant_state_ref.borrow().clone();
-                start_version_fetch(
-                    stack_ref.clone(),
-                    loaded_box_ref.clone(),
-                    dialog_ref.clone(),
-                    parent_ref.clone(),
-                    error_page_ref.clone(),
-                    dev_mode,
-                    &variant,
-                );
-            }
-        });
-    }
-
-    // Wire up variant selector — when Nvidia is toggled on, switch to nvidia variant
-    {
-        let dakota_ref = dakota_btn.clone();
-        let variant_state_ref = variant_state.clone();
-        let stack_ref = stack.clone();
-        let loaded_box_ref = loaded_box.clone();
-        let dialog_ref = dialog.clone();
-        let parent_ref = parent.clone();
-        let error_page_ref = error_page.clone();
-
-        nvidia_btn.connect_toggled(move |btn| {
-            if btn.is_active() {
-                dakota_ref.set_active(false);
-                *variant_state_ref.borrow_mut() = "nvidia".to_string();
-                let variant = variant_state_ref.borrow().clone();
-                start_version_fetch(
-                    stack_ref.clone(),
-                    loaded_box_ref.clone(),
-                    dialog_ref.clone(),
-                    parent_ref.clone(),
-                    error_page_ref.clone(),
-                    dev_mode,
-                    &variant,
-                );
-            }
-        });
-    }
+    // Family + feature switches are populated AFTER the initial fetch
+    // completes (we need the detected RegistryClient to know which family
+    // we're on). Switches are wired to recompute the target_image_row
+    // suffix label as the user toggles them; restarting fetch on every
+    // toggle would thrash the network — instead the user clicks Rebase to
+    // commit a switch to a different image.
+    populate_family_switches(
+        &features_group,
+        &family_label,
+        &target_image_row,
+        current_family.clone(),
+        selected_features.clone(),
+    );
 
     dialog.present(Some(parent));
     let initial_variant = variant_state.borrow().clone();
@@ -834,6 +810,137 @@ async fn run_bootc_switch(full_ref: &str) -> Result<(), String> {
             s.code().unwrap_or(-1)
         )),
         Err(e) => Err(format!("Failed to run bootc switch: {}", e)),
+    }
+}
+
+// ── Family + feature-switch UI ──────────────────────────────────────────────
+
+/// Detect the booted (or mocked) image's Family and render one SwitchRow per
+/// atomic feature. As switches toggle, recompute the target image and write
+/// it into `target_row`'s subtitle. The dialog uses this to show the user
+/// the *resolved* image they'd land on without exposing the raw image names.
+///
+/// Runs the detection on a background thread (the same pattern as
+/// [`spawn_fetch_thread`]) so the dialog stays responsive while bootc/os-release
+/// IO completes.
+fn populate_family_switches(
+    features_group: &adw::PreferencesGroup,
+    family_label: &gtk::Label,
+    target_row: &adw::ActionRow,
+    current_family: Rc<RefCell<Option<&'static Family>>>,
+    selected_features: Rc<RefCell<Vec<String>>>,
+) {
+    let slot: Arc<Mutex<Option<Option<&'static Family>>>> = Arc::new(Mutex::new(None));
+
+    {
+        let slot = slot.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let detected = rt.block_on(async move {
+                RegistryClient::detect()
+                    .await
+                    .and_then(|c| Family::best_match(c.org(), c.image(), c.stream()))
+            });
+            *slot.lock().unwrap() = Some(detected);
+        });
+    }
+
+    let features_group = features_group.clone();
+    let family_label = family_label.clone();
+    let target_row = target_row.clone();
+
+    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        let Some(detected) = slot.lock().ok().and_then(|mut g| g.take()) else {
+            return glib::ControlFlow::Continue;
+        };
+
+        let Some(family) = detected else {
+            family_label.set_label("Family not recognized");
+            target_row.set_subtitle("(this image isn't in the KNOWN_FAMILIES catalogue)");
+            return glib::ControlFlow::Break;
+        };
+
+        *current_family.borrow_mut() = Some(family);
+        family_label.set_label(&format!("Family: {}", family.name));
+
+        // Initial preview = base image. SwitchRows start unchecked.
+        target_row.set_subtitle(&format!(
+            "{} (no extras)",
+            family.base_image()
+        ));
+
+        for feat in family.available_features() {
+            let row = adw::SwitchRow::builder()
+                .title(feature_display_name(feat))
+                .subtitle(feature_subtitle(feat))
+                .build();
+
+            let feat_owned = feat.to_string();
+            let selected_features = selected_features.clone();
+            let family_ref: &'static Family = family;
+            let target_row = target_row.clone();
+            row.connect_active_notify(move |sr| {
+                let active = sr.is_active();
+                let mut feats = selected_features.borrow_mut();
+                if active {
+                    if !feats.iter().any(|f| f == &feat_owned) {
+                        feats.push(feat_owned.clone());
+                    }
+                } else {
+                    feats.retain(|f| f != &feat_owned);
+                }
+                let want: Vec<&str> = feats.iter().map(|s| s.as_str()).collect();
+                match family_ref.select_image_for_features(&want) {
+                    Some(img) => {
+                        target_row.set_subtitle(&format!("{img} (resolved)"));
+                    }
+                    None => {
+                        target_row.set_subtitle(
+                            "(combination doesn't match any published image)",
+                        );
+                    }
+                }
+            });
+
+            features_group.add(&row);
+        }
+
+        glib::ControlFlow::Break
+    });
+}
+
+/// Title shown on a feature SwitchRow. Maps the atomic suffix to a friendly
+/// name; unknown suffixes fall back to the suffix itself uppercased.
+fn feature_display_name(feat: &str) -> &'static str {
+    match feat {
+        "nvidia" => "NVIDIA drivers (proprietary)",
+        "open" => "NVIDIA open kernel modules",
+        "dx" => "Developer extras (DX)",
+        "hwe" => "Hardware-enablement kernel (HWE)",
+        "gdx" => "GNOME Developer extras (GDX)",
+        "deck" => "Steam Deck profile",
+        "asus" => "ASUS ROG tuning",
+        "surface" => "Microsoft Surface kernel",
+        "framework" => "Framework laptop tuning",
+        _ => "Variant feature",
+    }
+}
+
+fn feature_subtitle(feat: &str) -> &'static str {
+    match feat {
+        "nvidia" => "Use the closed-source NVIDIA driver",
+        "open" => "Use Mesa's NVK / NVIDIA open-source kernel driver",
+        "dx" => "Includes container tools, IDEs, and language SDKs",
+        "hwe" => "Newer kernel + drivers backported for fresh hardware",
+        "gdx" => "GNOME-focused developer toolchain",
+        "deck" => "Tuned for Steam Deck hardware (gamescope, Steam shell)",
+        "asus" => "Kernel patches for ASUS ROG Ally / Strix laptops",
+        "surface" => "Linux-surface kernel + camera fix-ups",
+        "framework" => "Power profiles + fingerprint reader support",
+        _ => "Additional ublue extras",
     }
 }
 

@@ -304,6 +304,7 @@ impl RegistryClient {
     pub fn registry(&self) -> &str { &self.registry }
     pub fn org(&self) -> &str { &self.org }
     pub fn image(&self) -> &str { &self.image }
+    pub fn stream(&self) -> &str { &self.stream }
 
     /// Detect the current image stream from the running system.
     ///
