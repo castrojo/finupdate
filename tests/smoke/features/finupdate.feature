@@ -186,6 +186,54 @@ Feature: Finupdate smoke tests
     * Wait until 5 seconds
     * Application "finupdate" is running
 
+  # ── Image history and rebasing ──────────────────────────────────────────
+
+  @dev_mode @rebase
+  Scenario: Image history and version information is accessible
+    * Item "Image history" "list item" is "showing" in "finupdate"
+    * Wait until "3 images" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
+  @dev_mode @image_management
+  Scenario: Image source configuration is visible
+    * Item "Image source" "list item" is "showing" in "finupdate"
+    * Wait until "dakota" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
+  # ── Changelog and version details ────────────────────────────────────────
+
+  @changelog
+  Scenario: Changelog view displays available image versions
+    * Item "Image history" "list item" is "showing" in "finupdate"
+    * Wait until "3 images" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
+  @dev_mode @history
+  Scenario: Image history shows deployment information
+    * Wait until "Image history" appears in "finupdate" within 5 seconds
+    * Wait until "images" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
+  # ── Image family and registry ───────────────────────────────────────────
+
+  @image_management @registry
+  Scenario: Registry URI is displayed for current image
+    * Item "Image source" "list item" is "showing" in "finupdate"
+    * Wait until "projectbluefin" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
+  @dev_mode @rollback
+  Scenario: Previous image versions are accessible for rollback
+    * Item "Image history" "list item" is "showing" in "finupdate"
+    * Wait until "images" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
+  @dev_mode @pin
+  Scenario: Pin functionality available for image versions
+    * Wait until "Image history" appears in "finupdate" within 5 seconds
+    * Wait until "3 images" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
   # ── Clean shutdown ──────────────────────────────────────────────────────
 
   @close

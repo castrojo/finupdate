@@ -177,6 +177,71 @@ def disable_dev_mode(context, app_id):
     ]))
 
 
+# ── Mock image data for testing ────────────────────────────────────────────
+
+@step('Test data for "{image_family}" image family is configured')
+def configure_test_image_family(context, image_family):
+    """Configure mock image data for testing different image families.
+
+    Supported families:
+    - bluefin: ghcr.io/ublue-os/bluefin:stable with Nvidia variant
+    - aurora: ghcr.io/ublue-os/aurora:stable
+    - bazzite: ghcr.io/ublue-os/bazzite:stable
+    - dakota: ghcr.io/projectbluefin/dakota:latest (default)
+    """
+    family_configs = {
+        "bluefin": {
+            "registry": "ghcr.io",
+            "org": "ublue-os",
+            "image": "bluefin",
+            "stream": "stable",
+            "variants": ["bluefin", "bluefin-nvidia"],
+        },
+        "aurora": {
+            "registry": "ghcr.io",
+            "org": "ublue-os",
+            "image": "aurora",
+            "stream": "stable",
+            "variants": ["aurora"],
+        },
+        "bazzite": {
+            "registry": "ghcr.io",
+            "org": "ublue-os",
+            "image": "bazzite",
+            "stream": "stable",
+            "variants": ["bazzite", "bazzite-deck"],
+        },
+        "dakota": {
+            "registry": "ghcr.io",
+            "org": "projectbluefin",
+            "image": "dakota",
+            "stream": "latest",
+            "variants": ["dakota", "dakota-nvidia"],
+        },
+    }
+
+    assert image_family in family_configs, f"Unknown image family: {image_family}"
+
+    config = family_configs[image_family]
+
+    # Close the app if running
+    if context.finupdate.instance:
+        context.execute_steps('* Close application "finupdate" via "shortcut"')
+
+    # Write mock image configuration
+    _write_settings(
+        registry_uri=f"{config['registry']}/{config['org']}/{config['image']}",
+        image_family=image_family,
+        current_variant=config["variants"][0],
+    )
+
+    # Re-launch with test configuration
+    context.execute_steps('\n'.join([
+        '* Start application "finupdate" via "command"',
+        '* Wait until window "Finupdate" appears in "finupdate"',
+    ]))
+
+
 # ── Diagnostics ───────────────────────────────────────────────────────────
 
 @step('Dump AT-SPI tree of "{app_id}" to artifact')
