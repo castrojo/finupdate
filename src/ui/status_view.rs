@@ -935,6 +935,7 @@ impl SimpleComponent for StatusView {
             .title("Image source")
             .activatable(true)
             .build();
+        source_row.set_accessible_role(gtk::AccessibleRole::Button);
         let source_sub_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let registry_row_sub = gtk::Label::new(Some(&format!("{}:{}", initial_registry_uri, initial_selected_tag)));
         registry_row_sub.add_css_class("dim-label");
@@ -953,6 +954,7 @@ impl SimpleComponent for StatusView {
             .title("Image history")
             .activatable(true)
             .build();
+        history_row.set_accessible_role(gtk::AccessibleRole::Button);
         let history_sub_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
         let images_count_label = gtk::Label::new(Some("3 versions"));
         images_count_label.add_css_class("dim-label");
@@ -977,12 +979,17 @@ impl SimpleComponent for StatusView {
         settings_card.append(&history_row);
         idle_content.append(&settings_card);
 
-        // Reset Card (Powerwash & Factory reset)
+        // Reset Card (Powerwash & Factory reset).
+        // accessible_role=Button so dogtail's `.left_click()` sees these as
+        // buttons (the default ListItem role doesn't expose an activate
+        // action). Mirrors the CcListRow pattern from gnome-control-center
+        // (accessible-role: button on every activatable Adw.ActionRow).
         let powerwash_row = adw::ActionRow::builder()
             .title("Powerwash")
             .subtitle("Reset settings and apps. Keep your files.")
             .activatable(true)
             .build();
+        powerwash_row.set_accessible_role(gtk::AccessibleRole::Button);
         let pw_chev = gtk::Image::from_icon_name("go-next-symbolic");
         pw_chev.add_css_class("dim-label");
         powerwash_row.add_suffix(&pw_chev);
@@ -996,6 +1003,7 @@ impl SimpleComponent for StatusView {
             .subtitle("Erase everything and start fresh.")
             .activatable(true)
             .build();
+        factory_row.set_accessible_role(gtk::AccessibleRole::Button);
         factory_row.add_css_class("destructive-title");
         let fact_chev = gtk::Image::from_icon_name("go-next-symbolic");
         fact_chev.add_css_class("dim-label");
@@ -2364,6 +2372,22 @@ fn get_real_deployments() -> Option<Vec<MockDeployment>> {
 /// This is destructive. It should only be reached after the caller has
 /// confirmed `!settings.dry_run && !settings.dev_mode` AND user confirmation.
 fn run_bootc_install_reset(toast_overlay: &adw::ToastOverlay, label: &'static str) {
+    // Defensive re-check: if settings.json was edited (or another tab
+    // re-saved with dry_run=true) between the dialog opening and the user
+    // clicking confirm, abort. Caller's gate is the primary line of defence,
+    // this is belt-and-suspenders against accidental destructive runs.
+    let current = Settings::load();
+    if current.dry_run || current.dev_mode {
+        tracing::warn!(
+            "{} aborted at the last moment — settings now show dry_run={} dev_mode={}",
+            label, current.dry_run, current.dev_mode
+        );
+        let abort_toast = adw::Toast::new(&format!("{label} aborted (settings now in dry-run)"));
+        abort_toast.set_timeout(4);
+        toast_overlay.add_toast(abort_toast);
+        return;
+    }
+
     let toast = adw::Toast::new(&format!("{label} starting… (running `bootc install reset`)"));
     toast.set_timeout(4);
     toast_overlay.add_toast(toast);
@@ -2873,14 +2897,38 @@ fn spawn_changelog_fetch(
                 }
             }
 
-            // 3. Fetch and diff SBOMs in the background
-            let booted_tag = read_selected_tag();
-            let booted_ref = format!("{}:{}", registry_uri, booted_tag);
-            let target_ref = format!("{}:{}", registry_uri, selected_tag);
-            
-            println!("[debug] sbom_diff: starting background fetch booted_ref={} target_ref={}", booted_ref, target_ref);
-            if let Some(diff) = crate::sbom_diff::fetch_and_diff_sboms(booted_ref, target_ref).await {
-                sender.input(StatusViewInput::SbomDiffLoaded(diff));
+            // 3. Fetch and diff SBOMs — lazily, in a detached task. SPDX
+            //    artifacts are MB-scale tarballs that parse to thousands of
+            //    package entries; running this on the same critical-path
+            //    thread as the home-page registry fetch was the freeze the
+            //    user reported. With tokio::spawn the task survives this
+            //    runtime's scope and only emits SbomDiffLoaded when the
+            //    user has already seen commits + history rendered.
+            //
+            //    Skip entirely when mock_identity is set — there's no real
+            //    booted image to diff against, so the fetch would either 404
+            //    or compare nonsense.
+            if Settings::load().mock_identity.is_none() {
+                let booted_tag = read_selected_tag();
+                let booted_ref = format!("{}:{}", registry_uri, booted_tag);
+                let target_ref = format!("{}:{}", registry_uri, selected_tag);
+                let sbom_sender = sender.clone();
+                tokio::spawn(async move {
+                    println!(
+                        "[debug] sbom_diff: deferred fetch booted_ref={} target_ref={}",
+                        booted_ref, target_ref
+                    );
+                    if let Some(diff) = crate::sbom_diff::fetch_and_diff_sboms(
+                        booted_ref,
+                        target_ref,
+                    )
+                    .await
+                    {
+                        sbom_sender.input(StatusViewInput::SbomDiffLoaded(diff));
+                    }
+                });
+            } else {
+                println!("[debug] sbom_diff: skipped (mock_identity active)");
             }
         });
     });

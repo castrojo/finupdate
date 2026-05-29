@@ -40,6 +40,13 @@ lint-fix:
 # Run all checks before committing: type-check, lint, unit tests.
 preflight: check lint test
 
+# Benchmark the GHCR round-trips the changelog fetch hits.
+# See build-aux/bench-network.sh for details.
+#
+# Usage:  just bench-network ghcr.io/ublue-os/bluefin:stable
+bench-network ref:
+    build-aux/bench-network.sh {{ ref }}
+
 # Run unit tests inside the toolbox
 test:
     toolbox run --container {{ toolbox }} cargo test --all-targets

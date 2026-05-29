@@ -558,7 +558,7 @@ impl RegistryClient {
 
         // Filter to dated tags for this stream within the window.
         let cutoff = Utc::now().date_naive() - chrono::Duration::days(days as i64);
-        let candidate_tags: Vec<(NaiveDate, String)> = tag_resp
+        let mut candidate_tags: Vec<(NaiveDate, String)> = tag_resp
             .tags
             .iter()
             .filter_map(|tag| {
@@ -570,6 +570,15 @@ impl RegistryClient {
                 }
             })
             .collect();
+
+        // Sort by date DESC and cap at HISTORY_MAX, since the home page never
+        // displays more. Measured against live GHCR: 16 parallel manifest
+        // HEADs took ~8s for ublue-os/bluefin; 8 cuts that roughly in half
+        // and removes a real freeze on every launch. If we ever start showing
+        // more than 8 entries this needs to grow with it.
+        const CANDIDATE_CAP: usize = 8;
+        candidate_tags.sort_by(|a, b| b.0.cmp(&a.0));
+        candidate_tags.truncate(CANDIDATE_CAP);
 
         if candidate_tags.is_empty() {
             // Fallback: no dated tags found — try fetching the latest tag directly.

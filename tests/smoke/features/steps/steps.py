@@ -161,16 +161,19 @@ def disable_dev_mode(context, app_id):
     The Devel build defaults to dev_mode=true for safety during development.
     This step disables it so we can test the real update flow with actual
     system checks (Flatpak, Homebrew, Distrobox, bootc).
+
+    SAFETY: dry_run is forced to True alongside dev_mode=False. Otherwise a
+    follow-up scenario that activates Restart / Powerwash / Factory reset
+    would actually reboot or reset the host machine — disable_dev_mode is
+    only ever meaningful when paired with dry_run, never on its own.
     """
     assert app_id == "finupdate", f"Unknown app_id: {app_id}"
 
-    # Close the app if running
     if context.finupdate.instance:
         context.execute_steps('* Close application "finupdate" via "shortcut"')
 
-    _write_settings(dev_mode=False)
+    _write_settings(dev_mode=False, dry_run=True)
 
-    # Re-launch with real mode in effect
     context.execute_steps('\n'.join([
         '* Start application "finupdate" via "command"',
         '* Wait until window "Finupdate" appears in "finupdate"',
