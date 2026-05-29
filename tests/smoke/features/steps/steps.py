@@ -177,65 +177,46 @@ def disable_dev_mode(context, app_id):
     ]))
 
 
-# ── Mock image data for testing ────────────────────────────────────────────
+# ── Mock identity for image-family matrix tests ──────────────────────────
 
-@step('Test data for "{image_family}" image family is configured')
-def configure_test_image_family(context, image_family):
-    """Configure mock image data for testing different image families.
+@step('Mock identity "{full_ref}" is configured')
+def configure_mock_identity(context, full_ref):
+    """Pretend the system is booted on the given image ref.
 
-    Supported families:
-    - bluefin: ghcr.io/ublue-os/bluefin:stable with Nvidia variant
-    - aurora: ghcr.io/ublue-os/aurora:stable
-    - bazzite: ghcr.io/ublue-os/bazzite:stable
-    - dakota: ghcr.io/projectbluefin/dakota:latest (default)
+    Writes settings.json with:
+      - mock_identity = parsed {registry, org, image, tag}
+      - dry_run = true   (block real bootc switch / reboot / timer toggle)
+      - dev_mode = true  (route update worker through simulator)
+
+    Then closes the app (if running) and relaunches so the new settings take
+    effect from process start. The app honours mock_identity in:
+      - RegistryClient::detect (history fetch, rebase dialog)
+      - status_view::detect_bootc_image_info (image source / history / changelog)
+    while still hitting real GHCR + GitHub APIs for downstream data.
+
+    Example: "ghcr.io/ublue-os/bluefin:stable"
     """
-    family_configs = {
-        "bluefin": {
-            "registry": "ghcr.io",
-            "org": "ublue-os",
-            "image": "bluefin",
-            "stream": "stable",
-            "variants": ["bluefin", "bluefin-nvidia"],
-        },
-        "aurora": {
-            "registry": "ghcr.io",
-            "org": "ublue-os",
-            "image": "aurora",
-            "stream": "stable",
-            "variants": ["aurora"],
-        },
-        "bazzite": {
-            "registry": "ghcr.io",
-            "org": "ublue-os",
-            "image": "bazzite",
-            "stream": "stable",
-            "variants": ["bazzite", "bazzite-deck"],
-        },
-        "dakota": {
-            "registry": "ghcr.io",
-            "org": "projectbluefin",
-            "image": "dakota",
-            "stream": "latest",
-            "variants": ["dakota", "dakota-nvidia"],
-        },
-    }
+    # Parse: registry/org/image:tag
+    if "/" not in full_ref or ":" not in full_ref:
+        raise AssertionError(f"Invalid full_ref {full_ref!r}: expected registry/org/image:tag")
+    registry, rest = full_ref.split("/", 1)
+    org, rest = rest.split("/", 1)
+    image, tag = rest.rsplit(":", 1)
 
-    assert image_family in family_configs, f"Unknown image family: {image_family}"
-
-    config = family_configs[image_family]
-
-    # Close the app if running
     if context.finupdate.instance:
         context.execute_steps('* Close application "finupdate" via "shortcut"')
 
-    # Write mock image configuration
     _write_settings(
-        registry_uri=f"{config['registry']}/{config['org']}/{config['image']}",
-        image_family=image_family,
-        current_variant=config["variants"][0],
+        dev_mode=True,
+        dry_run=True,
+        mock_identity={
+            "registry": registry,
+            "org": org,
+            "image": image,
+            "tag": tag,
+        },
     )
 
-    # Re-launch with test configuration
     context.execute_steps('\n'.join([
         '* Start application "finupdate" via "command"',
         '* Wait until window "Finupdate" appears in "finupdate"',

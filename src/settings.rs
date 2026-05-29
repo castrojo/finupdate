@@ -38,6 +38,37 @@ impl UpdateInterval {
     }
 }
 
+/// Override the detected currently-booted image identity.
+///
+/// When set, the app pretends the system is booted on this image — every
+/// downstream rendering path (image source row, history, changelog, variant
+/// list, rebase dialog) sees this identity instead of the real `bootc status`
+/// answer. Real network calls (GHCR tags, GitHub commits, SBOM diff) still
+/// hit live endpoints. Pair with `dry_run = true` to block destructive
+/// subprocess calls.
+///
+/// Used by GUI tests to exercise the app against many bootc image families
+/// without actually booting them. None in production.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MockBootcIdentity {
+    pub registry: String,
+    pub org: String,
+    pub image: String,
+    pub tag: String,
+    #[serde(default)]
+    pub digest: Option<String>,
+    /// RFC3339 timestamp. Feeds "running since" / "booted N days ago" labels.
+    #[serde(default)]
+    pub booted_at: Option<String>,
+}
+
+impl MockBootcIdentity {
+    /// Render as the canonical full image reference: `registry/org/image:tag`.
+    pub fn full_ref(&self) -> String {
+        format!("{}/{}/{}:{}", self.registry, self.org, self.image, self.tag)
+    }
+}
+
 /// All persistent user preferences for finupdate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -53,6 +84,16 @@ pub struct Settings {
     /// Run a simulated update instead of the real uupd process.
     /// Useful for UI development and demos without root or a live system.
     pub dev_mode: bool,
+    /// Override the detected currently-booted image. See [`MockBootcIdentity`].
+    #[serde(default)]
+    pub mock_identity: Option<MockBootcIdentity>,
+    /// When true, every destructive subprocess (reboot, `bootc switch`,
+    /// uupd timer toggle, uupd config write) is logged and short-circuited
+    /// to synthetic success instead of executing. Independent of `dev_mode`
+    /// so tests can drive the real-update worker path while still blocking
+    /// reboot/rebase.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 impl Default for Settings {
@@ -68,6 +109,8 @@ impl Default for Settings {
             pause_on_metered: true,
             custom_interval_hours: 6,
             dev_mode: is_dev_build,
+            mock_identity: None,
+            dry_run: false,
         }
     }
 }
@@ -159,6 +202,15 @@ mod tests {
             pause_on_metered: false,
             custom_interval_hours: 12,
             dev_mode: false,
+            mock_identity: Some(MockBootcIdentity {
+                registry: "ghcr.io".into(),
+                org: "ublue-os".into(),
+                image: "bluefin".into(),
+                tag: "stable".into(),
+                digest: None,
+                booted_at: None,
+            }),
+            dry_run: true,
         };
         let json = serde_json::to_string(&original).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -167,6 +219,30 @@ mod tests {
         assert_eq!(back.pause_on_metered, original.pause_on_metered);
         assert_eq!(back.custom_interval_hours, original.custom_interval_hours);
         assert_eq!(back.dev_mode, original.dev_mode);
+        assert_eq!(back.mock_identity, original.mock_identity);
+        assert_eq!(back.dry_run, original.dry_run);
+    }
+
+    #[test]
+    fn mock_identity_full_ref_formats_correctly() {
+        let id = MockBootcIdentity {
+            registry: "ghcr.io".into(),
+            org: "ublue-os".into(),
+            image: "bluefin-nvidia".into(),
+            tag: "stable".into(),
+            digest: None,
+            booted_at: None,
+        };
+        assert_eq!(id.full_ref(), "ghcr.io/ublue-os/bluefin-nvidia:stable");
+    }
+
+    #[test]
+    fn settings_missing_mock_identity_and_dry_run_default_to_none_false() {
+        // Old settings.json files (pre-Iteration-A) must continue loading.
+        let pre_iteration_a = r#"{"auto_updates": true, "dev_mode": false}"#;
+        let s: Settings = serde_json::from_str(pre_iteration_a).unwrap();
+        assert!(s.mock_identity.is_none());
+        assert!(!s.dry_run);
     }
 
     #[test]

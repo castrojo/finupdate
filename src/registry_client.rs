@@ -98,10 +98,30 @@ impl RegistryClient {
 
     /// Detect the current image stream from the running system.
     ///
-    /// Tries `bootc status --json` first, then falls back to parsing
-    /// `/run/host/etc/os-release` (Flatpak-friendly path).
+    /// Precedence:
+    /// 1. `Settings::mock_identity` (test override — no subprocess, no network).
+    /// 2. `bootc status --json` (most reliable on a real host).
+    /// 3. `/etc/os-release` fallback (Flatpak-friendly via flatpak-spawn).
     pub async fn detect() -> Option<Self> {
-        println!("[debug] RegistryClient::detect()");
+        Self::detect_with_settings(&crate::settings::Settings::load()).await
+    }
+
+    /// Like [`Self::detect`], but reads the mock-identity override from the
+    /// caller-supplied `Settings` instead of loading from disk. Lets tests
+    /// (and any future preferences UI) drive detection without round-tripping
+    /// through settings.json.
+    pub async fn detect_with_settings(settings: &crate::settings::Settings) -> Option<Self> {
+        println!("[debug] RegistryClient::detect_with_settings()");
+
+        if let Some(mock) = settings.mock_identity.as_ref() {
+            let stream = strip_date_suffix(&mock.tag).unwrap_or_else(|| mock.tag.clone());
+            println!(
+                "[debug] RegistryClient::detect_with_settings() mock_identity = {}/{}/{} stream={}",
+                mock.registry, mock.org, mock.image, stream
+            );
+            return Some(Self::new(&mock.registry, &mock.org, &mock.image, &stream));
+        }
+
         // Try bootc status --json for the most reliable answer.
         if let Some(client) = Self::detect_from_bootc().await {
             return Some(client);

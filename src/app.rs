@@ -492,7 +492,9 @@ impl SimpleComponent for App {
                 // Spawn the async update worker on a background thread.
                 // cancel_rx is passed INTO the worker so it can kill the real process.
                 let input_sender = sender.input_sender().clone();
-                let dev_mode = self.settings.dev_mode;
+                // `dry_run` routes the orchestrator down the same simulated path
+                // as `dev_mode`, so `pkexec finupdate-runner` is never spawned.
+                let dev_mode = self.settings.dev_mode || self.settings.dry_run;
                 let sim_scenario = self.sim_scenario;
                 std::thread::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
@@ -550,7 +552,7 @@ impl SimpleComponent for App {
                         let install_sender = sender.input_sender().clone();
                         show_update_check_dialog(
                             window,
-                            self.settings.dev_mode,
+                            self.settings.dev_mode || self.settings.dry_run,
                             self.sim_scenario,
                             move |result| {
                                 result_sender.emit(AppMsg::CheckComplete(result));
@@ -695,12 +697,18 @@ impl SimpleComponent for App {
             }
 
             AppMsg::ConfirmReboot => {
-                if self.settings.dev_mode {
+                if self.settings.dev_mode || self.settings.dry_run {
+                    let reason = if self.settings.dry_run && !self.settings.dev_mode {
+                        "dry-run"
+                    } else {
+                        "developer mode"
+                    };
                     tracing::warn!(
-                        "Reboot suppressed — developer mode is active. \
-                         Would have called `systemctl reboot`."
+                        "Reboot suppressed — {} is active. \
+                         Would have called `systemctl reboot`.",
+                        reason
                     );
-                    let toast = adw::Toast::new("Reboot suppressed (developer mode)");
+                    let toast = adw::Toast::new(&format!("Reboot suppressed ({})", reason));
                     toast.set_timeout(3);
                     self.toast_overlay.add_toast(toast);
                 } else {
@@ -735,7 +743,11 @@ impl SimpleComponent for App {
             AppMsg::ShowRebaseDialog => {
                 if let Some(root) = self.status_view.widget().root() {
                     if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
-                        show_rebase_dialog(window, self.settings.dev_mode);
+                        // Treat dry_run as equivalent to dev_mode for the rebase
+                        // dialog — both route to the simulated-rebase path that
+                        // prints `Would have called bootc switch`.
+                        let suppress_real = self.settings.dev_mode || self.settings.dry_run;
+                        show_rebase_dialog(window, suppress_real);
                     }
                 }
             }

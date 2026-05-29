@@ -231,6 +231,28 @@ Feature: Finupdate smoke tests
     * Wait until "projectbluefin" appears in "finupdate" within 5 seconds
     * Application "finupdate" is running
 
+  # ── Mock-identity matrix: render against many bootc image families ─────
+  # `Mock identity` sets settings.json.mock_identity (overrides bootc status),
+  # dry_run=true (blocks destructive subprocess calls), dev_mode=true (routes
+  # the update worker through the simulator). Real GHCR + GitHub API calls
+  # still happen — so these scenarios genuinely exercise the data-rendering
+  # paths against live upstream data. Tag @live so CI can skip offline.
+
+  @live @mock_identity @matrix
+  Scenario Outline: Image surfaces render for <family>
+    * Mock identity "<full_ref>" is configured
+    * Wait until "<image_name>" appears in "finupdate" within 15 seconds
+    * Item "Image source" "list item" is "showing" in "finupdate"
+    * Item "Image history" "list item" is "showing" in "finupdate"
+    * Wait until "images" appears in "finupdate" within 30 seconds
+    * Application "finupdate" is running
+
+    Examples:
+      | family   | full_ref                              | image_name |
+      | bluefin  | ghcr.io/ublue-os/bluefin:stable       | bluefin    |
+      | aurora   | ghcr.io/ublue-os/aurora:stable        | aurora     |
+      | dakota   | ghcr.io/projectbluefin/dakota:latest  | dakota     |
+
   @dev_mode @rollback
   Scenario: Previous image versions are accessible for rollback
     * Item "Image history" "list item" is "showing" in "finupdate"

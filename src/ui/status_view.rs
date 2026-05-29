@@ -1911,6 +1911,21 @@ fn apply_auto_updates_setting(active: bool) {
     settings.auto_updates = active;
     settings.save();
 
+    // Dry-run / dev_mode: persist the preference but don't actually toggle the
+    // host systemd timer. Logs the would-have-run command so testers can see
+    // what real mode would do.
+    if settings.dry_run || settings.dev_mode {
+        let verb = if active { "enable" } else { "disable" };
+        tracing::warn!(
+            "uupd.timer toggle suppressed (dry_run={}, dev_mode={}). \
+             Would have called `pkexec systemctl {} --now uupd.timer`.",
+            settings.dry_run,
+            settings.dev_mode,
+            verb
+        );
+        return;
+    }
+
     std::thread::spawn(move || {
         let args = if active {
             ["enable", "--now", "uupd.timer"]
@@ -1994,6 +2009,13 @@ use std::sync::Mutex;
 static BOOTC_STATUS_CACHE: Mutex<Option<Value>> = Mutex::new(None);
 
 fn get_cached_bootc_status() -> Option<Value> {
+    // Mock identity wins over real bootc status — tests don't want to spawn
+    // a privileged subprocess (and the cached result would lie about which
+    // image is "booted"). Cache stays empty when mocked.
+    if Settings::load().mock_identity.is_some() {
+        return None;
+    }
+
     {
         let cache = BOOTC_STATUS_CACHE.lock().unwrap();
         if cache.is_some() {
@@ -2031,6 +2053,22 @@ fn get_cached_bootc_status() -> Option<Value> {
 }
 
 fn detect_bootc_image_info() -> Option<(String, String, String)> {
+    // Precedence: mock_identity (test override) → FINUPDATE_IMAGE env var →
+    // bootc status --json → /etc/os-release fallback.
+
+    if let Some(mock) = Settings::load().mock_identity.as_ref() {
+        let (registry, org, image, stream) = parse_image_ref_parts(&mock.full_ref())?;
+        let title = format!("{}/{}", org, image);
+        let registry_uri = format!("{}/{}/{}", registry, org, image);
+        let selected_tag = stream
+            .rsplit('-')
+            .next()
+            .unwrap_or(&stream)
+            .to_string();
+        println!("[debug] mock_identity override: title='{}' registry_uri='{}' tag='{}'", title, registry_uri, selected_tag);
+        return Some((title, registry_uri, selected_tag));
+    }
+
     // Allow env var override for demo/debug: FINUPDATE_IMAGE=quay.io/org/image:tag
     if let Ok(override_ref) = std::env::var("FINUPDATE_IMAGE") {
         if !override_ref.is_empty() {
