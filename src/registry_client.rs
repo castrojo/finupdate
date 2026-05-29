@@ -49,6 +49,79 @@ pub enum RegistryError {
     NoCurrentImage,
 }
 
+/// One sibling variant within an image family — e.g. `bluefin-nvidia` next
+/// to `bluefin`. Yielded by [`RegistryClient::discover_variants`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariantRef {
+    /// Just the image name (no registry / org / tag), e.g. `"bluefin-nvidia"`.
+    pub image: String,
+    /// Human-readable label for chip rendering. Usually equal to `image`,
+    /// but with title-casing applied (`"Bluefin-Nvidia"`).
+    pub display_name: String,
+    /// Full OCI ref for this variant at the current stream:
+    /// `ghcr.io/ublue-os/bluefin-nvidia:stable`. Pass directly to `bootc switch`.
+    pub full_ref: String,
+}
+
+/// Known image families per registry org. Used by
+/// [`RegistryClient::discover_variants`] as the candidate set for HEAD probes
+/// — GHCR's `/v2/_catalog` endpoint isn't available for anonymous reads, so
+/// enumeration falls back to "try every well-known name and keep the hits".
+///
+/// Each tuple is `(org, &[siblings_in_one_family])`. An image can appear in
+/// at most one family entry; the entry is matched by membership of the
+/// current image name. Add new variants here as Universal Blue ships them.
+pub const KNOWN_FAMILIES: &[(&str, &[&str])] = &[
+    // Bluefin / Bluefin LTS — Fedora Workstation upstream.
+    (
+        "ublue-os",
+        &[
+            "bluefin",
+            "bluefin-nvidia",
+            "bluefin-nvidia-open",
+            "bluefin-dx",
+            "bluefin-dx-nvidia",
+            "bluefin-dx-nvidia-open",
+            "bluefin-asus",
+            "bluefin-asus-nvidia",
+            "bluefin-surface",
+            "bluefin-framework",
+        ],
+    ),
+    // Aurora — KDE Plasma sibling of Bluefin.
+    (
+        "ublue-os",
+        &[
+            "aurora",
+            "aurora-nvidia",
+            "aurora-nvidia-open",
+            "aurora-dx",
+            "aurora-dx-nvidia",
+            "aurora-dx-nvidia-open",
+        ],
+    ),
+    // Bazzite — gaming-focused KDE / Steam Deck variants.
+    (
+        "ublue-os",
+        &[
+            "bazzite",
+            "bazzite-nvidia",
+            "bazzite-nvidia-open",
+            "bazzite-deck",
+            "bazzite-deck-nvidia",
+            "bazzite-asus",
+            "bazzite-framework",
+        ],
+    ),
+    // ucore — server / container-host slim builds.
+    ("ublue-os", &["ucore", "ucore-hci", "ucore-zfs"]),
+    // Project Bluefin's own Dakota builds.
+    (
+        "projectbluefin",
+        &["dakota", "dakota-nvidia", "dakota-dx", "dakota-dx-nvidia"],
+    ),
+];
+
 // ── Internal GHCR API types ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -242,6 +315,93 @@ impl RegistryClient {
     ///
     /// - Round trip 1: tag list
     /// - Round trip 2…N: manifest HEADs, up to 12 concurrent
+    /// Discover sibling image variants in the same family by probing GHCR
+    /// with concurrent HEAD requests against each candidate.
+    ///
+    /// Returns the variants that respond with HTTP 200 for
+    /// `/v2/{org}/{image}/manifests/{stream}` — i.e. images that actually
+    /// publish a manifest under the same channel we're currently on.
+    /// Always includes the current image as the first result (so the chip
+    /// list never looks broken if the network is flaky).
+    ///
+    /// GHCR's `/v2/_catalog` is not readable anonymously, so we lean on a
+    /// static [`KNOWN_FAMILIES`] table for the candidate set.
+    pub async fn discover_variants(&self) -> Vec<VariantRef> {
+        let make_ref = |image: &str| VariantRef {
+            image: image.to_string(),
+            display_name: image
+                .split('-')
+                .map(|part| {
+                    let mut chars = part.chars();
+                    match chars.next() {
+                        Some(c) => c.to_uppercase().chain(chars).collect::<String>(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("-"),
+            full_ref: format!("{}/{}/{}:{}", self.registry, self.org, image, self.stream),
+        };
+
+        // Find the family group whose org matches AND which contains self.image.
+        let family = KNOWN_FAMILIES.iter().find(|(org, images)| {
+            *org == self.org && images.iter().any(|i| *i == self.image)
+        });
+
+        let candidates: Vec<&str> = match family {
+            Some((_, images)) => images.iter().copied().collect(),
+            None => return vec![make_ref(&self.image)], // unknown family
+        };
+
+        // Token first — anonymous HEAD probes still need the bearer.
+        let token = match self.get_token().await {
+            Ok(t) => t,
+            Err(_) => return vec![make_ref(&self.image)],
+        };
+
+        let concurrency = 12;
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+        let registry = self.registry.clone();
+        let org = self.org.clone();
+        let stream = self.stream.clone();
+        let client = self.client.clone();
+
+        let futs = candidates.into_iter().map(|img| {
+            let url = format!("https://{}/v2/{}/{}/manifests/{}", registry, org, img, stream);
+            let client = client.clone();
+            let token = token.clone();
+            let permit = semaphore.clone();
+            let img_owned = img.to_string();
+            async move {
+                let _p = permit.acquire().await.ok()?;
+                let resp = client
+                    .head(&url)
+                    .bearer_auth(&token)
+                    .header("Accept", "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json")
+                    .send()
+                    .await
+                    .ok()?;
+                if resp.status().is_success() {
+                    Some(img_owned)
+                } else {
+                    None
+                }
+            }
+        });
+
+        let hits: Vec<String> = futures::future::join_all(futs)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+
+        if hits.is_empty() {
+            vec![make_ref(&self.image)]
+        } else {
+            hits.iter().map(|i| make_ref(i)).collect()
+        }
+    }
+
     pub async fn fetch_versions(&self, days: u32) -> Result<Vec<ImageVersion>, RegistryError> {
         let token = self.get_token().await?;
         let client = self.client.clone();

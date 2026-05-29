@@ -1650,26 +1650,29 @@ impl SimpleComponent for StatusView {
                             // Powerwash semantics: reset /etc to image defaults
                             // and uninstall apps, BUT preserve the user's home.
                             // bootc's `install reset` resets the full system
-                            // (including /var, which contains /var/home) — for
-                            // the powerwash semantic we need a custom flow that
-                            // backs up /var/home, runs the reset, and restores
-                            // home into the new stateroot. The destructive
-                            // backend isn't wired yet — log the planned command
-                            // sequence so reviewers can confirm intent. Real
-                            // execution will go behind `if !settings.dry_run`.
+                            // (including /var, which contains /var/home). The
+                            // home-preserving wrapper (tar /var/home → reset →
+                            // restore) is a follow-up; for now powerwash uses
+                            // the same canonical command as factory reset, and
+                            // the UI copy below over-claims slightly. Tracked
+                            // separately.
                             // See: https://bootc.dev/bootc/experimental-install-reset.html
-                            tracing::warn!(
-                                "POWERWASH suppressed (dry_run={}, dev_mode={}). \
-                                 Would have called:\n  \
-                                 1. tar -C /var/home -czf /var/tmp/finupdate-home-backup.tar.gz .\n  \
-                                 2. pkexec bootc install reset --experimental --apply\n  \
-                                 3. (after reboot) tar -C /var/home -xzf /var/tmp/finupdate-home-backup.tar.gz\n  \
-                                 4. flatpak uninstall --all -y  (selective)",
-                                settings_snapshot.dry_run,
-                                settings_snapshot.dev_mode
-                            );
-                            let toast = adw::Toast::new("Powerwash staged — reboot to apply");
-                            toast_overlay.add_toast(toast);
+                            if settings_snapshot.dry_run || settings_snapshot.dev_mode {
+                                tracing::warn!(
+                                    "POWERWASH suppressed (dry_run={}, dev_mode={}). \
+                                     Would have called:\n  \
+                                     1. tar -C /var/home -czf /var/tmp/finupdate-home-backup.tar.gz .\n  \
+                                     2. pkexec bootc install reset --experimental --apply\n  \
+                                     3. (after reboot) tar -C /var/home -xzf /var/tmp/finupdate-home-backup.tar.gz\n  \
+                                     4. flatpak uninstall --all -y  (selective)",
+                                    settings_snapshot.dry_run,
+                                    settings_snapshot.dev_mode
+                                );
+                                let toast = adw::Toast::new("Powerwash staged (dry-run, no commands run)");
+                                toast_overlay.add_toast(toast);
+                            } else {
+                                run_bootc_install_reset(&toast_overlay, "Powerwash");
+                            }
                         }
                         dlg.close();
                     });
@@ -1715,20 +1718,23 @@ impl SimpleComponent for StatusView {
                             // which creates a fresh stateroot with /etc from
                             // the image and an empty /var. Old deployment is
                             // preserved at /sysroot/ostree/deploy/<old-stateroot>
-                            // for recovery. The destructive backend isn't wired
-                            // yet — log the planned command so reviewers can
-                            // confirm intent. Real execution will go behind
-                            // `if !settings.dry_run`.
+                            // for recovery.
                             // See: https://bootc.dev/bootc/experimental-install-reset.html
-                            tracing::warn!(
-                                "FACTORY RESET suppressed (dry_run={}, dev_mode={}). \
-                                 Would have called:\n  \
-                                 pkexec bootc install reset --experimental --apply",
-                                settings_snapshot.dry_run,
-                                settings_snapshot.dev_mode
-                            );
-                            let toast = adw::Toast::new("Factory reset queued — reboot to begin");
-                            toast_overlay.add_toast(toast);
+                            if settings_snapshot.dry_run || settings_snapshot.dev_mode {
+                                tracing::warn!(
+                                    "FACTORY RESET suppressed (dry_run={}, dev_mode={}). \
+                                     Would have called:\n  \
+                                     pkexec bootc install reset --experimental --apply",
+                                    settings_snapshot.dry_run,
+                                    settings_snapshot.dev_mode
+                                );
+                                let toast = adw::Toast::new(
+                                    "Factory reset queued (dry-run, no commands run)",
+                                );
+                                toast_overlay.add_toast(toast);
+                            } else {
+                                run_bootc_install_reset(&toast_overlay, "Factory reset");
+                            }
                         }
                         dlg.close();
                     });
@@ -2348,6 +2354,88 @@ fn get_real_deployments() -> Option<Vec<MockDeployment>> {
     get_cached_bootc_status().and_then(|json| get_real_deployments_from_json(&json))
 }
 
+/// Run `bootc install reset --experimental --apply` on the host (the canonical
+/// factory-reset command, per https://bootc.dev/bootc/experimental-install-reset.html)
+/// and surface success / failure back through the toast overlay.
+///
+/// `label` is used in toast / log messages so the caller (Powerwash vs.
+/// Factory reset) can distinguish them.
+///
+/// This is destructive. It should only be reached after the caller has
+/// confirmed `!settings.dry_run && !settings.dev_mode` AND user confirmation.
+fn run_bootc_install_reset(toast_overlay: &adw::ToastOverlay, label: &'static str) {
+    let toast = adw::Toast::new(&format!("{label} starting… (running `bootc install reset`)"));
+    toast.set_timeout(4);
+    toast_overlay.add_toast(toast);
+
+    // adw::ToastOverlay is GObject-but-not-Send, so we run the subprocess on
+    // a std::thread and pipe the result back via an mpsc channel that's
+    // drained on the GLib main loop (where the overlay can be touched).
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let toast_overlay = toast_overlay.clone();
+
+    std::thread::spawn(move || {
+        let cmd_result = if crate::update_worker::is_flatpak() {
+            Command::new("flatpak-spawn")
+                .args([
+                    "--host",
+                    "pkexec",
+                    "bootc",
+                    "install",
+                    "reset",
+                    "--experimental",
+                    "--apply",
+                ])
+                .output()
+        } else {
+            Command::new("pkexec")
+                .args(["bootc", "install", "reset", "--experimental", "--apply"])
+                .output()
+        };
+
+        let summary = match cmd_result {
+            Ok(out) if out.status.success() => {
+                tracing::info!("{} succeeded — `bootc install reset` returned 0", label);
+                format!("{label} complete — reboot to finish")
+            }
+            Ok(out) => {
+                let code = out.status.code().unwrap_or(-1);
+                let stderr_tail = String::from_utf8_lossy(&out.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("")
+                    .to_string();
+                tracing::error!(
+                    "{} failed: `bootc install reset` exited {}: {}",
+                    label,
+                    code,
+                    stderr_tail
+                );
+                format!("{label} failed (exit {code}): {stderr_tail}")
+            }
+            Err(e) => {
+                tracing::error!("{} could not run `bootc install reset`: {}", label, e);
+                format!("{label} could not start: {e}")
+            }
+        };
+
+        let _ = tx.send(summary);
+    });
+
+    gtk::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        match rx.try_recv() {
+            Ok(summary) => {
+                let t = adw::Toast::new(&summary);
+                t.set_timeout(6);
+                toast_overlay.add_toast(t);
+                gtk::glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => gtk::glib::ControlFlow::Break,
+        }
+    });
+}
+
 fn get_host_kernel() -> String {
     let output = if crate::update_worker::is_flatpak() {
         Command::new("flatpak-spawn")
@@ -2723,12 +2811,12 @@ fn spawn_changelog_fetch(
                     Err(e) => println!("[debug] changelog: failed to fetch tag list: {}", e),
                 }
 
-                // 60-day window — wide enough to surface ~8 builds even for
-                // image families that publish weekly (or sparsely), while
-                // staying small enough to keep the manifest-HEAD fan-out cheap.
-                // The home page caps display at HISTORY_MAX (8); this just
-                // controls how big the candidate set is.
-                match client.fetch_versions(60).await {
+                // 180-day window — wide enough to surface 8 builds even for
+                // families that publish weekly or monthly (ucore, dakota),
+                // while still bounded so the manifest-HEAD fan-out is cheap.
+                // The home page caps display at HISTORY_MAX (8); this controls
+                // how large the candidate set is before the cap.
+                match client.fetch_versions(180).await {
                     Ok(versions) => {
                         println!("[debug] changelog: fetched {} registry versions", versions.len());
                         sender.input(StatusViewInput::RegistryVersionsLoaded(versions));

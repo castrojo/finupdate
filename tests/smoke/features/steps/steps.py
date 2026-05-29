@@ -223,6 +223,58 @@ def configure_mock_identity(context, full_ref):
     ]))
 
 
+# ── Image history strict-count assertion ───────────────────────────────────
+
+@step('Image history shows at least {n:d} entries in "{app_id}" within {seconds:d} seconds')
+def assert_history_count(context, n, app_id, seconds):
+    """Assert the home-page "N images" label has reached at least n.
+
+    Polls the AT-SPI tree for labels matching `\\d+ images$` and checks that
+    the max observed count is >= n. The history list grows asynchronously as
+    the live GHCR fetch returns, so we time-bound the wait.
+    """
+    import re
+    app = getattr(context, app_id)
+    deadline = time.time() + seconds
+    count_re = re.compile(r"^(\d+)\s*images?$")
+    observed_max = 0
+
+    while time.time() < deadline:
+        try:
+            matches = app.instance.findChildren(
+                lambda node: node.roleName in ("label", "list item")
+                and count_re.match(node.name or "") is not None
+            )
+            for m in matches:
+                hit = count_re.match(m.name or "")
+                if hit:
+                    val = int(hit.group(1))
+                    if val > observed_max:
+                        observed_max = val
+            if observed_max >= n:
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    # Diagnostic: dump any image-history-related labels we saw.
+    seen_history_labels = []
+    try:
+        def collect(node):
+            name = node.name or ""
+            if "image" in name.lower() or "version" in name.lower() or count_re.match(name):
+                seen_history_labels.append(f"[{node.roleName}] {name!r}")
+            return False
+        app.instance.findChildren(collect)
+    except Exception:
+        pass
+    summary = "\n      ".join(seen_history_labels[:20]) if seen_history_labels else "(none)"
+    assert False, (
+        f"Image history reached only {observed_max} entries in {app_id} "
+        f"(wanted ≥ {n} within {seconds}s).\n    Labels seen:\n      {summary}"
+    )
+
+
 # ── Diagnostics ───────────────────────────────────────────────────────────
 
 @step('Dump AT-SPI tree of "{app_id}" to artifact')
