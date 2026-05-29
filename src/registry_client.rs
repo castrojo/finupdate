@@ -466,35 +466,129 @@ fn parse_image_ref(image_ref: &str) -> Option<RegistryClient> {
     Some(RegistryClient::new(registry, org, image, &stream))
 }
 
-/// Extract a `NaiveDate` from a tag like `stable-daily-43.20260222` or
-/// `stable-daily-43-20260222`, given the expected stream prefix.
+/// Extract a `NaiveDate` from a dated image tag, accepting the four conventions
+/// observed across the bootc image families we support:
+///
+/// 1. **Stream-suffixed** (Bluefin, Aurora):
+///    `stable-daily-43.20260222`, `lts-hwe-20260224`, `latest.20260527`
+///    → accepted for stream `"stable"`, `"lts"`, `"latest"` respectively (via
+///      prefix match — see the prefix rule below).
+///
+/// 2. **Sub-revisioned** (Bazzite):
+///    `testing-43.20260308.1`, `stable-43.20260301.2`
+///    → trailing `.N` (1–4 digits) is treated as a build sub-revision and
+///      stripped before the date extraction.
+///
+/// 3. **Stream-prefix match** (Bluefin, Aurora, Bazzite):
+///    A tag like `stable-daily-43.20260527` is accepted when the caller asks
+///    for stream `"stable"` — the prefix begins with `"stable-"`. This lets
+///    callers ask for the broad channel ("stable") and get back any tagged
+///    build in that family, regardless of the fully-qualified stream
+///    (e.g. `stable-daily-43`, `stable-gts-42`).
+///
+/// 4. **Bare date** (Dakota):
+///    `20260114` — 8 digits, no prefix. Accepted only when the caller asks
+///    for stream `"latest"` or `""` (the implicit / pointer-tag streams).
+///
+/// Returns the parsed calendar date, or `None` if the tag doesn't match any
+/// of these patterns or fails calendar validation (e.g. month 13).
 fn parse_dated_tag(tag: &str, stream: &str) -> Option<NaiveDate> {
-    // Try dot separator: "stream.YYYYMMDD"
-    let date_str = if let Some(rest) = tag.strip_prefix(&format!("{}.", stream)) {
-        rest
-    } else if let Some(rest) = tag.strip_prefix(&format!("{}-", stream)) {
-        rest
+    // (4) Bare YYYYMMDD with no separator — accepted only for the implicit
+    //     streams that don't qualify their dates.
+    if (stream == "latest" || stream.is_empty())
+        && tag.len() == 8
+        && tag.chars().all(|c| c.is_ascii_digit())
+    {
+        return NaiveDate::parse_from_str(tag, "%Y%m%d").ok();
+    }
+
+    // (2) Strip an optional trailing build sub-revision `.N` (1-4 digits) so
+    //     `testing-43.20260308.1` reduces to `testing-43.20260308`.
+    let base = if let Some(idx) = tag.rfind('.') {
+        let suffix = &tag[idx + 1..];
+        if (1..=4).contains(&suffix.len()) && suffix.chars().all(|c| c.is_ascii_digit()) {
+            // Only strip if doing so leaves a date-shaped tail. Otherwise
+            // we'd corrupt something like `stable.20260527` (where the `.`
+            // is the date separator, not a sub-revision).
+            let candidate = &tag[..idx];
+            if candidate.len() >= 8
+                && candidate[candidate.len() - 8..]
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+            {
+                candidate
+            } else {
+                tag
+            }
+        } else {
+            tag
+        }
     } else {
-        return None;
+        tag
     };
 
-    // Validate it looks like YYYYMMDD (8 digits)
-    if date_str.len() == 8 && date_str.chars().all(|c| c.is_ascii_digit()) {
-        NaiveDate::parse_from_str(date_str, "%Y%m%d").ok()
-    } else {
-        None
+    // (1)/(3) Find a trailing `-YYYYMMDD` or `.YYYYMMDD` on `base`, then
+    //         check the prefix matches the requested stream.
+    for sep in ['.', '-'] {
+        if let Some(idx) = base.rfind(sep) {
+            let date_str = &base[idx + 1..];
+            if date_str.len() != 8 || !date_str.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let prefix = &base[..idx];
+
+            // Stream match rule: prefix is exactly `stream`, or begins with
+            // `stream.` / `stream-` (qualified channel: stable-daily-43 etc.).
+            let stream_matches = prefix == stream
+                || prefix.starts_with(&format!("{}.", stream))
+                || prefix.starts_with(&format!("{}-", stream));
+            if !stream_matches {
+                continue;
+            }
+
+            if let Some(date) = NaiveDate::parse_from_str(date_str, "%Y%m%d").ok() {
+                return Some(date);
+            }
+        }
     }
+
+    None
 }
 
-/// Remove the trailing `.YYYYMMDD` or `-YYYYMMDD` from a tag to get the stream.
+/// Remove the trailing `.YYYYMMDD[.N]` or `-YYYYMMDD[.N]` from a tag to get the
+/// fully-qualified stream prefix.
+///
+/// Examples:
+///   `stable-daily-43.20260527`     → `Some("stable-daily-43")`
+///   `testing-43.20260308.1`        → `Some("testing-43")`   (sub-revision stripped)
+///   `lts-hwe-20260224`             → `Some("lts-hwe")`
+///   `latest`                       → `None`                  (no date)
+///   `20260114`                     → `None`                  (no stream embedded)
 fn strip_date_suffix(tag: &str) -> Option<String> {
-    // Walk backward to find an 8-digit date suffix.
-    let separators = ['.', '-'];
-    for sep in &separators {
-        if let Some(pos) = tag.rfind(*sep) {
-            let suffix = &tag[pos + 1..];
+    // Strip optional trailing sub-revision `.N` (1-4 digits) before looking
+    // for the date — matches the Bazzite convention.
+    let base = if let Some(idx) = tag.rfind('.') {
+        let suffix = &tag[idx + 1..];
+        if (1..=4).contains(&suffix.len())
+            && suffix.chars().all(|c| c.is_ascii_digit())
+            // Only strip when what's left ends in 8 digits — otherwise we'd
+            // turn `stable.20260527` into `stable.20260527` again incorrectly.
+            && idx >= 8
+            && tag[..idx].as_bytes()[idx - 8..idx].iter().all(|b| b.is_ascii_digit())
+        {
+            &tag[..idx]
+        } else {
+            tag
+        }
+    } else {
+        tag
+    };
+
+    for sep in ['.', '-'] {
+        if let Some(pos) = base.rfind(sep) {
+            let suffix = &base[pos + 1..];
             if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-                return Some(tag[..pos].to_string());
+                return Some(base[..pos].to_string());
             }
         }
     }
@@ -565,6 +659,128 @@ mod tests {
     fn parse_dated_tag_rejects_invalid_calendar_date() {
         // 2026-02-30 isn't a real date.
         assert!(parse_dated_tag("stable.20260230", "stable").is_none());
+    }
+
+    // ── parse_dated_tag: real-world per-family tag formats ─────────────────
+    // Samples below are real tags pulled from GHCR on 2026-05-29 — see the
+    // queries in the bring-up plan. Update if the upstream conventions change.
+
+    /// Bluefin: `stable-daily-43.20260222` for stream `"stable"` (prefix match).
+    #[test]
+    fn parse_dated_tag_bluefin_stable_daily_dot() {
+        let d = parse_dated_tag("stable-daily-43.20260222", "stable").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 2, 22).unwrap());
+    }
+
+    /// Bluefin: `43-43.20260222` for stream `"43"` (exact prefix match).
+    #[test]
+    fn parse_dated_tag_bluefin_version_qualified_dot() {
+        let d = parse_dated_tag("43-43.20260222", "43").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 2, 22).unwrap());
+    }
+
+    /// Bluefin LTS: `lts-hwe.20260224` for stream `"lts"` (prefix match).
+    #[test]
+    fn parse_dated_tag_bluefin_lts_hwe_dot() {
+        let d = parse_dated_tag("lts-hwe.20260224", "lts").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 2, 24).unwrap());
+    }
+
+    /// Bluefin LTS, dash variant: `lts-hwe-20260224` for stream `"lts"`.
+    #[test]
+    fn parse_dated_tag_bluefin_lts_hwe_dash() {
+        let d = parse_dated_tag("lts-hwe-20260224", "lts").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 2, 24).unwrap());
+    }
+
+    /// Bazzite: `testing-43.20260308.1` — sub-revision is stripped before
+    /// extracting the date.
+    #[test]
+    fn parse_dated_tag_bazzite_sub_revision() {
+        let d = parse_dated_tag("testing-43.20260308.1", "testing").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 3, 8).unwrap());
+    }
+
+    /// Bazzite: `testing-43.20260301` without sub-revision still works.
+    #[test]
+    fn parse_dated_tag_bazzite_no_sub_revision() {
+        let d = parse_dated_tag("testing-43.20260301", "testing").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+    }
+
+    /// Dakota: `latest.20260114` for stream `"latest"` (exact prefix).
+    #[test]
+    fn parse_dated_tag_dakota_latest_dot() {
+        let d = parse_dated_tag("latest.20260114", "latest").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 1, 14).unwrap());
+    }
+
+    /// Dakota: bare `20260114` accepted when stream is "latest" (implicit).
+    #[test]
+    fn parse_dated_tag_dakota_bare_date() {
+        let d = parse_dated_tag("20260114", "latest").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 1, 14).unwrap());
+    }
+
+    /// Bare date is also accepted when stream is empty (no qualifier).
+    #[test]
+    fn parse_dated_tag_bare_date_empty_stream() {
+        let d = parse_dated_tag("20260114", "").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 1, 14).unwrap());
+    }
+
+    /// Bare date is REJECTED when stream is anything else: a tag like
+    /// `20260114` doesn't belong in stream `"stable"` results.
+    #[test]
+    fn parse_dated_tag_bare_date_rejected_for_qualified_stream() {
+        assert!(parse_dated_tag("20260114", "stable").is_none());
+    }
+
+    /// Cross-family contamination: a `gts-*` tag must not appear in `stable`
+    /// results even if the date is valid.
+    #[test]
+    fn parse_dated_tag_rejects_other_family() {
+        assert!(parse_dated_tag("gts-daily-42.20260527", "stable").is_none());
+    }
+
+    /// Sub-revision must be 1–4 digits; `testing-43.20260308.55555` would be
+    /// a malformed tag.
+    #[test]
+    fn parse_dated_tag_rejects_long_sub_revision() {
+        assert!(parse_dated_tag("testing-43.20260308.55555", "testing").is_none());
+    }
+
+    /// `stable.20260527` — the `.20260527` is the date separator, not a
+    /// sub-revision. The sub-revision stripper must not over-fire here.
+    #[test]
+    fn parse_dated_tag_does_not_strip_date_as_sub_revision() {
+        let d = parse_dated_tag("stable.20260527", "stable").unwrap();
+        assert_eq!(d, NaiveDate::from_ymd_opt(2026, 5, 27).unwrap());
+    }
+
+    // ── strip_date_suffix: sub-revisions and bare dates ─────────────────
+
+    #[test]
+    fn strip_date_suffix_strips_sub_revision() {
+        assert_eq!(
+            strip_date_suffix("testing-43.20260308.1"),
+            Some("testing-43".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_date_suffix_bare_date_returns_none() {
+        // Bare date has no stream prefix to return.
+        assert_eq!(strip_date_suffix("20260114"), None);
+    }
+
+    #[test]
+    fn strip_date_suffix_does_not_strip_non_date_as_sub_revision() {
+        // `stable.20260527` is `stream.date`, not `stream.sub-revision`.
+        assert_eq!(
+            strip_date_suffix("stable.20260527"),
+            Some("stable".to_string())
+        );
     }
 
     // ── parse_image_ref ──────────────────────────────────────────────────

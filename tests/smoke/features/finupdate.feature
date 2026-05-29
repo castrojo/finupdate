@@ -253,6 +253,49 @@ Feature: Finupdate smoke tests
       | aurora   | ghcr.io/ublue-os/aurora:stable        | aurora     |
       | dakota   | ghcr.io/projectbluefin/dakota:latest  | dakota     |
 
+  # ── Rollback flow: open the Rebase dialog and load real version history ─
+  # Drives the rebase dialog (Ctrl+Shift+R), waits for a version-list signal
+  # ("Version" appears in the dialog header / row / loaded title). dry_run=true
+  # so even if the user clicks a Rebase button, `bootc switch` is suppressed
+  # via run_rebase_simulated. Tests are parameterised across the same families.
+
+  @live @mock_identity @rollback
+  Scenario Outline: Rebase dialog loads version history for <family>
+    * Mock identity "<full_ref>" is configured
+    * Wait until "<image_name>" appears in "finupdate" within 15 seconds
+    * Key combo: "<Control><Shift>r"
+    * Wait until "Version" appears in "finupdate" within 30 seconds
+    * Application "finupdate" is running
+    * Key combo: "Escape"
+
+    Examples:
+      | family   | full_ref                              | image_name |
+      | bluefin  | ghcr.io/ublue-os/bluefin:stable       | bluefin    |
+      | aurora   | ghcr.io/ublue-os/aurora:stable        | aurora     |
+      | dakota   | ghcr.io/projectbluefin/dakota:latest  | dakota     |
+
+  # ── Changelog flow: app stays stable while real GHCR + GitHub data loads ─
+  # We don't assert exact rendered strings (the changelog area's AT-SPI
+  # exposure is patchy under GTK4) — we assert the home-page anchors stay
+  # visible while the live fetch progresses, proving the fetch + the main
+  # window remain healthy. A future iteration can tighten this once we wire
+  # the changelog labels to expose accessible text.
+
+  @live @mock_identity @changelog
+  Scenario Outline: Changelog fetch keeps the app responsive for <family>
+    * Mock identity "<full_ref>" is configured
+    * Wait until "<image_name>" appears in "finupdate" within 15 seconds
+    * Wait until "images" appears in "finupdate" within 30 seconds
+    * Item "Image source" "list item" is "showing" in "finupdate"
+    * Item "Image history" "list item" is "showing" in "finupdate"
+    * Application "finupdate" is running
+
+    Examples:
+      | family   | full_ref                              | image_name |
+      | bluefin  | ghcr.io/ublue-os/bluefin:stable       | bluefin    |
+      | aurora   | ghcr.io/ublue-os/aurora:stable        | aurora     |
+      | dakota   | ghcr.io/projectbluefin/dakota:latest  | dakota     |
+
   @dev_mode @rollback
   Scenario: Previous image versions are accessible for rollback
     * Item "Image history" "list item" is "showing" in "finupdate"

@@ -371,6 +371,9 @@ impl SimpleComponent for App {
         app.set_accelerators_for_action::<ShortcutsAction>(&["<primary>question"]);
         app.set_accelerators_for_action::<PreferencesAction>(&["<primary>comma"]);
         app.set_accelerators_for_action::<InstallAction>(&["<primary>i"]);
+        // Ctrl+Shift+R opens the Rebase / Version History dialog. Used by the
+        // GUI test suite to drive rollback flows without menu navigation.
+        app.set_accelerators_for_action::<RebaseAction>(&["<primary><shift>r"]);
 
         // ─── Close Request Handler ──────────────────────────────────────
         // Intercept window close to warn if an update is in progress.
