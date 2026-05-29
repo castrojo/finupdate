@@ -234,6 +234,36 @@ Feature: Finupdate smoke tests
     * Wait until "3 images" appears in "finupdate" within 5 seconds
     * Application "finupdate" is running
 
+  # ── Destructive operations (dialog testing only) ─────────────────────────
+
+  @destructive @powerwash @dialog
+  Scenario: Powerwash dialog displays with proper warnings
+    * Item "Powerwash" "list item" is "showing" in "finupdate"
+    * Wait until "Powerwash" appears in "finupdate" within 5 seconds
+    * Wait until "Reset settings" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
+  @destructive @factory_reset @dialog
+  Scenario: Factory reset dialog displays with proper warnings
+    * Item "Factory reset" "list item" is "showing" in "finupdate"
+    * Wait until "Factory reset" appears in "finupdate" within 5 seconds
+    * Wait until "Erase everything" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+
+  @destructive @powerwash @dialog
+  Scenario: Powerwash dialog can be dismissed safely
+    * Item "Powerwash" "list item" is "showing" in "finupdate"
+    * Wait until "Powerwash" appears in "finupdate" within 5 seconds
+    * Key combo: "Escape"
+    * Application "finupdate" is running
+
+  @destructive @factory_reset @dialog
+  Scenario: Factory reset dialog can be dismissed safely
+    * Item "Factory reset" "list item" is "showing" in "finupdate"
+    * Wait until "Factory reset" appears in "finupdate" within 5 seconds
+    * Key combo: "Escape"
+    * Application "finupdate" is running
+
   # ── Clean shutdown ──────────────────────────────────────────────────────
 
   @close
