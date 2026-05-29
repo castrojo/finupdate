@@ -1,9 +1,9 @@
 polkit.addRule(function(action, subject) {
     if (subject.user == "james") {
-        // Allow pkexec for bootc commands without password
+        // Allow pkexec for bootc commands without password (for system updates)
         if (action.id == "org.freedesktop.policykit.exec") {
             var program = action.lookup("program");
-            if (program && program.indexOf("bootc") >= 0) {
+            if (program && (program.indexOf("bootc") >= 0 || program.indexOf("finupdate-runner") >= 0)) {
                 return polkit.Result.YES;
             }
         }
@@ -11,8 +11,12 @@ polkit.addRule(function(action, subject) {
         if (action.id == "org.freedesktop.login1.reboot") {
             return polkit.Result.YES;
         }
-        // Systemd unit management
+        // Systemd unit management (for disabling/enabling uupd timer and other system services)
         if (action.id == "org.freedesktop.systemd1.manage-units") {
+            return polkit.Result.YES;
+        }
+        // Systemd unit file management (for modifying systemd configuration)
+        if (action.id == "org.freedesktop.systemd1.manage-unit-files") {
             return polkit.Result.YES;
         }
     }

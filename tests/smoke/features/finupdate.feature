@@ -152,6 +152,40 @@ Feature: Finupdate smoke tests
     * Wait until "Powered by uupd" appears in "finupdate" within 5 seconds
     * Key combo: "Escape"
 
+  # ── Real non-destructive update checks ───────────────────────────────
+  # These test actual update checking for Flatpak, Homebrew, Distrobox
+  # without modifying the system image (bootc). Safe to run on real systems.
+
+  @real @integration @non_destructive
+  Scenario: Real check dialog queries actual update sources
+    * Item "Check" "button" is "showing" in "finupdate"
+    * Left click "Check" "button" in "finupdate"
+    * Wait until "Checking for updates" appears in "finupdate" within 30 seconds
+    * Wait until "Flatpak" appears in "finupdate" within 30 seconds
+    * Wait until "Homebrew" appears in "finupdate" within 30 seconds
+    * Wait until "Distrobox" appears in "finupdate" within 30 seconds
+    * Key combo: "Escape"
+
+  @real @integration @non_destructive
+  Scenario: Real update check completes without errors
+    * Item "Check" "button" is "showing" in "finupdate"
+    * Left click "Check" "button" in "finupdate"
+    * Wait until "Querying" appears in "finupdate" within 30 seconds
+    * Wait until "Close" "button" appears in "finupdate" within 60 seconds
+    * Application "finupdate" is running
+    * Left click "Close" "button" in "finupdate"
+
+  @real @integration @non_destructive @install
+  Scenario: Install available non-system updates (Flatpak, Homebrew, Distrobox)
+    * Item "Check" "button" is "showing" in "finupdate"
+    * Left click "Check" "button" in "finupdate"
+    * Wait until "Querying" appears in "finupdate" within 30 seconds
+    * Wait until "Close" "button" appears in "finupdate" within 60 seconds
+    * Item "Install all" "button" is "showing" in "finupdate"
+    * Left click "Install all" "button" in "finupdate"
+    * Wait until 5 seconds
+    * Application "finupdate" is running
+
   # ── Clean shutdown ──────────────────────────────────────────────────────
 
   @close
