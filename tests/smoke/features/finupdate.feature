@@ -158,6 +158,7 @@ Feature: Finupdate smoke tests
 
   @real @integration @non_destructive
   Scenario: Real check dialog queries actual update sources
+    * Application "finupdate" is in real mode (developer mode disabled)
     * Item "Check" "button" is "showing" in "finupdate"
     * Left click "Check" "button" in "finupdate"
     * Wait until "Checking for updates" appears in "finupdate" within 30 seconds
@@ -168,6 +169,7 @@ Feature: Finupdate smoke tests
 
   @real @integration @non_destructive
   Scenario: Real update check completes without errors
+    * Application "finupdate" is in real mode (developer mode disabled)
     * Item "Check" "button" is "showing" in "finupdate"
     * Left click "Check" "button" in "finupdate"
     * Wait until "Querying" appears in "finupdate" within 30 seconds
@@ -177,6 +179,7 @@ Feature: Finupdate smoke tests
 
   @real @integration @non_destructive @install
   Scenario: Install available non-system updates (Flatpak, Homebrew, Distrobox)
+    * Application "finupdate" is in real mode (developer mode disabled)
     * Item "Check" "button" is "showing" in "finupdate"
     * Left click "Check" "button" in "finupdate"
     * Wait until "Querying" appears in "finupdate" within 30 seconds

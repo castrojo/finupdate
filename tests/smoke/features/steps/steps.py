@@ -152,6 +152,31 @@ def wait_for_text(context, text, app_id, seconds):
     assert False, f"Timed out after {seconds}s waiting for {text!r} in {app_id}.\n    Visible text nodes:\n      {found_summary}"
 
 
+# ── Real mode setup ───────────────────────────────────────────────────────
+
+@step('Application "{app_id}" is in real mode (developer mode disabled)')
+def disable_dev_mode(context, app_id):
+    """Disable developer mode to test real update paths.
+
+    The Devel build defaults to dev_mode=true for safety during development.
+    This step disables it so we can test the real update flow with actual
+    system checks (Flatpak, Homebrew, Distrobox, bootc).
+    """
+    assert app_id == "finupdate", f"Unknown app_id: {app_id}"
+
+    # Close the app if running
+    if context.finupdate.instance:
+        context.execute_steps('* Close application "finupdate" via "shortcut"')
+
+    _write_settings(dev_mode=False)
+
+    # Re-launch with real mode in effect
+    context.execute_steps('\n'.join([
+        '* Start application "finupdate" via "command"',
+        '* Wait until window "Finupdate" appears in "finupdate"',
+    ]))
+
+
 # ── Diagnostics ───────────────────────────────────────────────────────────
 
 @step('Dump AT-SPI tree of "{app_id}" to artifact')

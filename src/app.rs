@@ -403,17 +403,25 @@ impl SimpleComponent for App {
                         c.args(["bootc", "upgrade", "--check"]);
                         c
                     };
-                    let status = match cmd.status().await {
-                        Ok(s) => s,
-                        Err(_) => {
-                            input_sender.emit(AppMsg::PreflightResult(PreflightStatus::Unknown));
-                            return;
+                    // Add a 15-second timeout to prevent hanging on slow/unavailable systems.
+                    let timeout = std::time::Duration::from_secs(15);
+                    let status = tokio::select! {
+                        result = cmd.status() => {
+                            match result {
+                                Ok(s) => Some(s),
+                                Err(_) => None,
+                            }
                         }
+                        _ = tokio::time::sleep(timeout) => None,
                     };
-                    let result = match status.code() {
-                        Some(0) => PreflightStatus::UpdateAvailable,
-                        Some(77) => PreflightStatus::UpToDate,
-                        _ => PreflightStatus::Unknown,
+
+                    let result = match status {
+                        Some(s) => match s.code() {
+                            Some(0) => PreflightStatus::UpdateAvailable,
+                            Some(77) => PreflightStatus::UpToDate,
+                            _ => PreflightStatus::Unknown,
+                        },
+                        None => PreflightStatus::Unknown,
                     };
                     input_sender.emit(AppMsg::PreflightResult(result));
                 });
