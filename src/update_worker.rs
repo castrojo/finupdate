@@ -131,11 +131,13 @@ async fn simulate_update(tx: &mpsc::UnboundedSender<UpdateEvent>, scenario: Simu
         }};
     }
 
-    line!("[DEV MODE] Starting finupdate simulation");
+    line!("[DEV MODE] Starting finupdate simulation (DRY RUN)");
+    line!("[DEV MODE] No actual commands will be executed - this is a preview");
     sleep(Duration::from_millis(400)).await;
 
     // ── System module ────────────────────────────────────────────────────
     module_start!(Module::System);
+    line!("$ pkexec bootc upgrade --check", 300);
     line!("Checking for OS image updates...", 600);
 
     if matches!(scenario, SimulationScenario::AlreadyUpToDate) {
@@ -146,12 +148,14 @@ async fn simulate_update(tx: &mpsc::UnboundedSender<UpdateEvent>, scenario: Simu
     }
 
     if matches!(scenario, SimulationScenario::Failure) {
-        line!("bootc upgrade failed", 400);
+        line!("[DRY RUN] Would execute: $ pkexec bootc upgrade", 300);
+        line!("bootc upgrade failed (simulated)", 400);
         module_done!(Module::System, ModuleStatus::Failed(1));
         let _ = tx.send(UpdateEvent::Error("[DEV MODE] Simulated system module failure".to_string()));
         return;
     }
 
+    line!("[DRY RUN] Would execute: $ pkexec bootc upgrade", 300);
     line!("bootc: Fetching image manifest...", 500);
     line!("bootc: Pulling 3 new layers (42.1 MB)", 800);
     line!("bootc: Staging complete — reboot to apply", 400);
@@ -159,7 +163,9 @@ async fn simulate_update(tx: &mpsc::UnboundedSender<UpdateEvent>, scenario: Simu
 
     // ── Flatpak module ───────────────────────────────────────────────────
     module_start!(Module::Flatpak);
+    line!("$ flatpak remote-info --updates flathub", 300);
     line!("Checking for Flatpak updates...", 500);
+    line!("[DRY RUN] Would execute: $ flatpak update -y", 300);
     line!("Updated: org.mozilla.firefox (130.0.1 → 131.0)", 400);
     line!("Updated: com.spotify.Client (1.2.45 → 1.2.46)", 400);
     line!("Flatpak: 2 apps updated", 300);
@@ -167,13 +173,17 @@ async fn simulate_update(tx: &mpsc::UnboundedSender<UpdateEvent>, scenario: Simu
 
     // ── Brew module ──────────────────────────────────────────────────────
     module_start!(Module::Brew);
+    line!("$ brew upgrade --dry-run", 300);
     line!("Upgrading Homebrew packages...", 500);
+    line!("[DRY RUN] Would execute: $ brew upgrade", 300);
     line!("Already up-to-date: neovim, fzf, ripgrep", 300);
     module_done!(Module::Brew, ModuleStatus::Success);
 
     // ── Distrobox module ─────────────────────────────────────────────────
     module_start!(Module::Distrobox);
+    line!("$ distrobox list --json", 300);
     line!("Upgrading Distrobox containers...", 500);
+    line!("[DRY RUN] Would execute: $ distrobox upgrade all", 300);
     line!("ubuntu-22: updated 5 packages", 400);
     module_done!(Module::Distrobox, ModuleStatus::Success);
 
