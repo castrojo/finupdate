@@ -859,7 +859,9 @@ impl SimpleComponent for StatusView {
         banner_icon_box.append(&banner_icon);
         banner_title_row.add_prefix(&banner_icon_box);
 
-        let banner_action_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        // Each button is added as a direct suffix (not nested inside a Box) so
+        // it shows up as an individual accessible child of the ActionRow in the
+        // AT-SPI tree. Box-wrapping silently drops children from a11y enumeration.
         let banner_whats_new_btn = gtk::Button::with_label("What's new");
         banner_whats_new_btn.add_css_class("flat");
         banner_whats_new_btn.add_css_class("accent");
@@ -893,11 +895,10 @@ impl SimpleComponent for StatusView {
             discard_sender.emit(StatusViewInput::DismissBanner);
         });
 
-        banner_action_box.append(&banner_whats_new_btn);
-        banner_action_box.append(&banner_install_btn);
-        banner_action_box.append(&banner_restart_btn);
-        banner_action_box.append(&banner_discard_btn);
-        banner_title_row.add_suffix(&banner_action_box);
+        banner_title_row.add_suffix(&banner_whats_new_btn);
+        banner_title_row.add_suffix(&banner_install_btn);
+        banner_title_row.add_suffix(&banner_restart_btn);
+        banner_title_row.add_suffix(&banner_discard_btn);
         update_banner_group.add(&banner_title_row);
         update_banner_group.set_visible(false);
         idle_content.append(&update_banner_group);
@@ -1643,8 +1644,30 @@ impl SimpleComponent for StatusView {
                     dialog.set_response_appearance("powerwash", adw::ResponseAppearance::Suggested);
                     
                     let toast_overlay = self.toast_overlay.clone();
+                    let settings_snapshot = Settings::load();
                     dialog.connect_response(None, move |dlg, response| {
                         if response == "powerwash" {
+                            // Powerwash semantics: reset /etc to image defaults
+                            // and uninstall apps, BUT preserve the user's home.
+                            // bootc's `install reset` resets the full system
+                            // (including /var, which contains /var/home) — for
+                            // the powerwash semantic we need a custom flow that
+                            // backs up /var/home, runs the reset, and restores
+                            // home into the new stateroot. The destructive
+                            // backend isn't wired yet — log the planned command
+                            // sequence so reviewers can confirm intent. Real
+                            // execution will go behind `if !settings.dry_run`.
+                            // See: https://bootc.dev/bootc/experimental-install-reset.html
+                            tracing::warn!(
+                                "POWERWASH suppressed (dry_run={}, dev_mode={}). \
+                                 Would have called:\n  \
+                                 1. tar -C /var/home -czf /var/tmp/finupdate-home-backup.tar.gz .\n  \
+                                 2. pkexec bootc install reset --experimental --apply\n  \
+                                 3. (after reboot) tar -C /var/home -xzf /var/tmp/finupdate-home-backup.tar.gz\n  \
+                                 4. flatpak uninstall --all -y  (selective)",
+                                settings_snapshot.dry_run,
+                                settings_snapshot.dev_mode
+                            );
                             let toast = adw::Toast::new("Powerwash staged — reboot to apply");
                             toast_overlay.add_toast(toast);
                         }
@@ -1685,8 +1708,25 @@ impl SimpleComponent for StatusView {
                     });
 
                     let toast_overlay = self.toast_overlay.clone();
+                    let settings_snapshot = Settings::load();
                     dialog.connect_response(None, move |dlg, response| {
                         if response == "reset" {
+                            // Factory reset = bootc's canonical `install reset`,
+                            // which creates a fresh stateroot with /etc from
+                            // the image and an empty /var. Old deployment is
+                            // preserved at /sysroot/ostree/deploy/<old-stateroot>
+                            // for recovery. The destructive backend isn't wired
+                            // yet — log the planned command so reviewers can
+                            // confirm intent. Real execution will go behind
+                            // `if !settings.dry_run`.
+                            // See: https://bootc.dev/bootc/experimental-install-reset.html
+                            tracing::warn!(
+                                "FACTORY RESET suppressed (dry_run={}, dev_mode={}). \
+                                 Would have called:\n  \
+                                 pkexec bootc install reset --experimental --apply",
+                                settings_snapshot.dry_run,
+                                settings_snapshot.dev_mode
+                            );
                             let toast = adw::Toast::new("Factory reset queued — reboot to begin");
                             toast_overlay.add_toast(toast);
                         }
@@ -1786,14 +1826,24 @@ impl SimpleComponent for StatusView {
                 }
                 self.rebuild_changelog_page(&sender);
 
-                // Merge remote registry versions into the history list
+                // Merge remote registry versions into the history list.
+                // Cap the visible history at HISTORY_MAX entries — the 8 most
+                // recent builds — so the page doesn't grow unbounded as the
+                // upstream registry accumulates daily tags.
+                const HISTORY_MAX: usize = 8;
+
                 let local_tags: std::collections::HashSet<&str> = self
                     .deployments
                     .iter()
                     .map(|d| d.tag.as_str())
                     .collect();
                 let mut merged = self.deployments.clone();
-                for v in &self.registry_versions {
+                // Walk versions newest-first (they're sorted ascending by date)
+                // so the cap drops oldest, not newest.
+                for v in self.registry_versions.iter().rev() {
+                    if merged.len() >= HISTORY_MAX {
+                        break;
+                    }
                     if !local_tags.contains(v.version.as_str()) {
                         let date_str = v.date.format("%b %-d, %Y").to_string();
                         merged.push(MockDeployment {
@@ -2673,7 +2723,12 @@ fn spawn_changelog_fetch(
                     Err(e) => println!("[debug] changelog: failed to fetch tag list: {}", e),
                 }
 
-                match client.fetch_versions(14).await {
+                // 60-day window — wide enough to surface ~8 builds even for
+                // image families that publish weekly (or sparsely), while
+                // staying small enough to keep the manifest-HEAD fan-out cheap.
+                // The home page caps display at HISTORY_MAX (8); this just
+                // controls how big the candidate set is.
+                match client.fetch_versions(60).await {
                     Ok(versions) => {
                         println!("[debug] changelog: fetched {} registry versions", versions.len());
                         sender.input(StatusViewInput::RegistryVersionsLoaded(versions));

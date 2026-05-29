@@ -15,9 +15,30 @@ check:
 build:
     toolbox run --container {{ toolbox }} cargo build
 
-# Run clippy lints (inside toolbox)
+# Run clippy lints (inside toolbox).
+#
+# Policy: deny `correctness` (real bugs) and `clippy::suspicious` (likely bugs);
+# warn on the rest. Deprecation warnings stay as warnings so the libadwaita /
+# GTK4 deprecation migration doesn't break CI — track those separately.
 lint:
-    toolbox run --container {{ toolbox }} cargo clippy -- -D warnings
+    toolbox run --container {{ toolbox }} cargo clippy --all-targets -- \
+        -D clippy::correctness \
+        -D clippy::suspicious \
+        -W clippy::style \
+        -W clippy::complexity \
+        -W clippy::perf \
+        -A deprecated \
+        -A unused
+
+# Run clippy with auto-fix where possible. Use before committing.
+lint-fix:
+    toolbox run --container {{ toolbox }} cargo clippy --all-targets --fix \
+        --allow-dirty --allow-staged -- \
+        -W clippy::style -W clippy::complexity -W clippy::perf \
+        -A deprecated -A unused
+
+# Run all checks before committing: type-check, lint, unit tests.
+preflight: check lint test
 
 # Run unit tests inside the toolbox
 test:

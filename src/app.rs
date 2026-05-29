@@ -161,6 +161,18 @@ pub enum AppMsg {
     PageChanged(String),
     /// Back button clicked
     GoBack,
+    /// Show "What's new" / changelog for the latest available version.
+    /// Wired to Ctrl+W so the action is reachable from the GUI test suite —
+    /// the corresponding banner button is not exposed in the AT-SPI tree
+    /// because libadwaita ActionRow doesn't enumerate suffix children.
+    ShowWhatsNew,
+    /// Dismiss the staged-reboot banner. Wired to Ctrl+Backspace for the
+    /// same reason as ShowWhatsNew.
+    DismissBanner,
+    /// Open the powerwash confirmation dialog. Wired to Ctrl+Alt+P.
+    TriggerPowerwash,
+    /// Open the factory-reset confirmation dialog. Wired to Ctrl+Alt+F.
+    TriggerFactoryReset,
 }
 
 #[relm4::component(pub)]
@@ -363,6 +375,38 @@ impl SimpleComponent for App {
         };
         group.add_action(install_action);
 
+        // Banner & destructive action accelerators — see action declarations
+        // at the bottom of the file for context.
+        let whats_new_action: RelmAction<WhatsNewAction> = {
+            let s = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| s.emit(AppMsg::ShowWhatsNew))
+        };
+        group.add_action(whats_new_action);
+
+        let restart_action: RelmAction<RestartAction> = {
+            let s = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| s.emit(AppMsg::RequestReboot))
+        };
+        group.add_action(restart_action);
+
+        let dismiss_action: RelmAction<DismissBannerAction> = {
+            let s = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| s.emit(AppMsg::DismissBanner))
+        };
+        group.add_action(dismiss_action);
+
+        let powerwash_action: RelmAction<PowerwashAction> = {
+            let s = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| s.emit(AppMsg::TriggerPowerwash))
+        };
+        group.add_action(powerwash_action);
+
+        let factory_reset_action: RelmAction<FactoryResetAction> = {
+            let s = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| s.emit(AppMsg::TriggerFactoryReset))
+        };
+        group.add_action(factory_reset_action);
+
         group.register_for_widget(&root);
 
         // ─── Keyboard Shortcuts ─────────────────────────────────────────
@@ -374,6 +418,15 @@ impl SimpleComponent for App {
         // Ctrl+Shift+R opens the Rebase / Version History dialog. Used by the
         // GUI test suite to drive rollback flows without menu navigation.
         app.set_accelerators_for_action::<RebaseAction>(&["<primary><shift>r"]);
+        // Banner buttons — see action declarations for why these need
+        // accelerators (libadwaita ActionRow suffix children aren't enumerable
+        // via AT-SPI, so the GUI test suite can't click them directly).
+        app.set_accelerators_for_action::<WhatsNewAction>(&["<primary>w"]);
+        app.set_accelerators_for_action::<RestartAction>(&["<primary><shift>b"]);
+        app.set_accelerators_for_action::<DismissBannerAction>(&["<primary>BackSpace"]);
+        // Destructive actions — guarded behind dry_run / dev_mode toasts.
+        app.set_accelerators_for_action::<PowerwashAction>(&["<primary><alt>p"]);
+        app.set_accelerators_for_action::<FactoryResetAction>(&["<primary><alt>f"]);
 
         // ─── Close Request Handler ──────────────────────────────────────
         // Intercept window close to warn if an update is in progress.
@@ -383,6 +436,17 @@ impl SimpleComponent for App {
             // Inhibit default close — we handle it in update().
             gtk::glib::Propagation::Stop
         });
+
+        // When mock_identity is set, skip the real preflight subprocess entirely
+        // and pretend an update is available so the banner-buttons surface (Install,
+        // What's new, Discard) are reachable in tests. The downstream banner state
+        // machine already gates real actions behind dry_run / dev_mode.
+        if model.settings.mock_identity.is_some() {
+            let input_sender = sender.input_sender().clone();
+            gtk::glib::idle_add_local_once(move || {
+                input_sender.emit(AppMsg::PreflightResult(PreflightStatus::UpdateAvailable));
+            });
+        } else {
 
         // Defer preflight check until the GLib main loop is running to avoid
         // racing with component initialization (the thread could finish before
@@ -430,6 +494,8 @@ impl SimpleComponent for App {
                 });
             });
         });
+
+        } // end if/else for mock_identity preflight short-circuit
 
         ComponentParts { model, widgets }
     }
@@ -819,6 +885,29 @@ impl SimpleComponent for App {
                 self.status_view.emit(StatusViewInput::ShowPage("main".to_string()));
             }
 
+            AppMsg::ShowWhatsNew => {
+                // Forward to status_view as a SelectChangelogVersion with the
+                // currently-displayed selected tag. status_view re-renders the
+                // changelog page and switches the stack to it.
+                self.status_view.emit(StatusViewInput::SelectChangelogVersion(
+                    String::new(),
+                ));
+            }
+
+            AppMsg::DismissBanner => {
+                self.status_view.emit(StatusViewInput::DismissBanner);
+            }
+
+            AppMsg::TriggerPowerwash => {
+                self.status_view
+                    .emit(StatusViewInput::TogglePin("powerwash".to_string()));
+            }
+
+            AppMsg::TriggerFactoryReset => {
+                self.status_view
+                    .emit(StatusViewInput::TogglePin("factory".to_string()));
+            }
+
             AppMsg::ToggleDevMode(enabled) => {
                 tracing::info!("Developer mode toggled via menu: {}", enabled);
                 self.settings.dev_mode = enabled;
@@ -951,6 +1040,14 @@ relm4::new_stateless_action!(SimSuccessAction, WindowActionGroup, "sim-success")
 relm4::new_stateless_action!(SimFailureAction, WindowActionGroup, "sim-failure");
 relm4::new_stateless_action!(SimUpToDateAction, WindowActionGroup, "sim-uptodate");
 relm4::new_stateless_action!(InstallAction, WindowActionGroup, "install");
+// Banner button & dangerous-action accelerators — see AppMsg variant docs for
+// why these exist (libadwaita ActionRow doesn't expose suffix buttons in the
+// AT-SPI tree, so the GUI test suite can't click them directly).
+relm4::new_stateless_action!(WhatsNewAction, WindowActionGroup, "whats-new");
+relm4::new_stateless_action!(RestartAction, WindowActionGroup, "restart");
+relm4::new_stateless_action!(DismissBannerAction, WindowActionGroup, "dismiss-banner");
+relm4::new_stateless_action!(PowerwashAction, WindowActionGroup, "powerwash");
+relm4::new_stateless_action!(FactoryResetAction, WindowActionGroup, "factory-reset");
 relm4::new_stateful_action!(DeveloperModeAction, WindowActionGroup, "dev-mode", (), bool);
 
 fn inject_app_css() {
