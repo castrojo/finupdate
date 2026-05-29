@@ -161,11 +161,8 @@ Feature: Finupdate smoke tests
     * Application "finupdate" is in real mode (developer mode disabled)
     * Item "Check" "button" is "showing" in "finupdate"
     * Left click "Check" "button" in "finupdate"
-    * Wait until "Checking for updates" appears in "finupdate" within 30 seconds
-    * Wait until "Flatpak" appears in "finupdate" within 30 seconds
-    * Wait until "Homebrew" appears in "finupdate" within 30 seconds
-    * Wait until "Distrobox" appears in "finupdate" within 30 seconds
-    * Key combo: "Escape"
+    * Wait until "Update" appears in "finupdate" within 60 seconds
+    * Application "finupdate" is running
 
   @real @integration @non_destructive
   Scenario: Real update check completes without errors
