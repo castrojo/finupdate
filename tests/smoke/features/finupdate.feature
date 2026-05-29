@@ -53,6 +53,15 @@ Feature: Finupdate smoke tests
   # accessibility tree.  These scenarios verify the check dialog opens
   # and responds; the post-install completion page is verified manually.
 
+  @dev_mode @simulator @dry_run
+  Scenario: Dev mode shows all commands that would be executed (dry-run)
+    * Application "finupdate" is in developer mode with scenario "Success"
+    * Left click "Check" "button" in "finupdate"
+    * Wait until "Ready to install" appears in "finupdate" within 10 seconds
+    * Wait until "DRY RUN" appears in "finupdate" within 10 seconds
+    * Wait until "bootc upgrade" appears in "finupdate" within 10 seconds
+    * Key combo: "Escape"
+
   @dev_mode @simulator
   Scenario: Check dialog shows update available (dev mode, Success)
     * Application "finupdate" is in developer mode with scenario "Success"
