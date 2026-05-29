@@ -78,6 +78,8 @@ pub enum StatusViewInput {
     SelectChangelogVersion(String),
     /// Registry versions loaded in background
     RegistryVersionsLoaded(Vec<crate::registry_client::ImageVersion>),
+    /// Available tags loaded from registry for the tag selector
+    AvailableTagsLoaded(Vec<String>),
     /// Github commits loaded in background
     GithubCommitsLoaded(Vec<(String, String, String)>),
     /// SBOM package diff loaded in background
@@ -190,9 +192,12 @@ pub struct StatusView {
 
 impl StatusView {
     fn hero_title(&self) -> String {
-        self.image_info
-            .clone()
-            .unwrap_or_else(|| "Fedora bootc".to_string())
+        self.image_info.clone().unwrap_or_else(|| {
+            detect_bootc_image_info()
+                .map(|(title, _, _)| title)
+                .or_else(|| read_image_info())
+                .unwrap_or_else(|| "System Image".to_string())
+        })
     }
 
     fn idle_subtitle(&self) -> String {
@@ -208,8 +213,24 @@ impl StatusView {
     fn refresh_idle_description(&self) {
         self.hero_row.set_title(&self.hero_title());
         
-        let tag = if self.reboot_pending { "43" } else { &self.selected_tag };
-        self.hero_row.set_subtitle(&format!("Version {}  ·  {}", tag, self.idle_subtitle()));
+        let tag = if self.reboot_pending {
+            // Try to derive version from the staged deployment
+            self.deployments
+                .iter()
+                .find(|d| d.state == "staged")
+                .map(|d| d.tag.as_str())
+                .unwrap_or(&self.selected_tag)
+        } else {
+            &self.selected_tag
+        };
+        let tag_display = if tag.chars().all(|c| c.is_ascii_digit()) {
+            format!("Version {}  ·  ", tag)
+        } else if tag == "latest" {
+            String::new()
+        } else {
+            format!("{}  ·  ", tag)
+        };
+        self.hero_row.set_subtitle(&format!("{}{}", tag_display, self.idle_subtitle()));
 
         for class in ["status-pill-ready", "status-pill-ok", "status-pill-staged", "dim-label"] {
             self.status_pill.remove_css_class(class);
@@ -232,16 +253,16 @@ impl StatusView {
             self.update_banner_group.set_visible(true);
             self.banner_title_row.set_title("Reboot to finish updating");
             self.banner_title_row
-                .set_subtitle("Next boot uses version 43.");
+                .set_subtitle("A new image is staged and will be used on next boot.");
             self.banner_install_btn.set_visible(false);
             self.banner_whats_new_btn.set_visible(false);
             self.banner_restart_btn.set_visible(true);
             self.banner_discard_btn.set_visible(true);
         } else if matches!(self.preflight_status, PreflightStatus::UpdateAvailable) {
             self.update_banner_group.set_visible(true);
-            self.banner_title_row.set_title("Version 43 available");
+            self.banner_title_row.set_title("Update available");
             self.banner_title_row
-                .set_subtitle("Includes a kernel update. 412 MB.");
+                .set_subtitle("A new system image is ready to install.");
             self.banner_install_btn.set_visible(true);
             self.banner_whats_new_btn.set_visible(true);
             self.banner_restart_btn.set_visible(false);
@@ -279,20 +300,18 @@ impl StatusView {
                 version_selector.append(&btn);
             }
         } else {
-            // Fallback: display mock versions as dated tags
-            let mock_versions = [("43", "05-27"), ("42", "05-24"), ("41", "04-15")];
-            for (mv_key, mv_label) in &mock_versions {
-                let btn = gtk::Button::with_label(mv_label);
-                let btn_sender = sender.input_sender().clone();
-                let mv_str = mv_key.to_string();
-                btn.connect_clicked(move |_| {
-                    btn_sender.emit(StatusViewInput::SelectChangelogVersion(mv_str.clone()));
-                });
-                if *mv_key == self.changelog_version {
-                    btn.add_css_class("suggested-action");
-                }
-                version_selector.append(&btn);
-            }
+            // No versions loaded yet — show a prominent spinner
+            let spinner = gtk::Spinner::new();
+            spinner.set_spinning(true);
+            spinner.set_size_request(24, 24);
+            let load_label = gtk::Label::new(Some("Loading versions…"));
+            load_label.add_css_class("dim-label");
+            load_label.add_css_class("caption");
+            let load_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            load_box.set_halign(gtk::Align::Center);
+            load_box.append(&spinner);
+            load_box.append(&load_label);
+            self.changelog_box.append(&load_box);
         }
         self.changelog_box.append(&version_selector);
 
@@ -322,7 +341,7 @@ impl StatusView {
             let booted_tag = read_selected_tag();
             v.version != booted_tag && !self.reboot_pending && matches!(self.preflight_status, PreflightStatus::UpdateAvailable)
         } else {
-            version == "43" && !self.reboot_pending && matches!(self.preflight_status, PreflightStatus::UpdateAvailable)
+            false
         };
 
         if is_update {
@@ -335,7 +354,7 @@ impl StatusView {
                 let booted_tag = read_selected_tag();
                 v.version == booted_tag
             } else {
-                version == "42" && !self.reboot_pending
+                false
             };
             if is_booted {
                 let booted_pill = gtk::Label::new(Some("✓ Booted"));
@@ -349,22 +368,12 @@ impl StatusView {
         let stable_str = if let Some(v) = real_version {
             v.version.clone()
         } else {
-            match version {
-                "43" => "stable-20260527".to_string(),
-                "42" => "stable-20260524".to_string(),
-                "41" => "stable-20260415".to_string(),
-                _ => "".to_string(),
-            }
+            version.to_string()
         };
         let date_str = if let Some(v) = real_version {
             v.created.format("%B %-d, %Y").to_string()
         } else {
-            match version {
-                "43" => "May 27, 2026".to_string(),
-                "42" => "May 24, 2026".to_string(),
-                "41" => "Apr 15, 2026".to_string(),
-                _ => "".to_string(),
-            }
+            "".to_string()
         };
         let meta_label = gtk::Label::builder()
             .label(&format!("{}  ·  {}", stable_str, date_str))
@@ -382,12 +391,7 @@ impl StatusView {
                 format!("Image build. Kernel {} · git commit {}.", v.kernel, if v.revision.len() >= 7 { &v.revision[0..7] } else { &v.revision })
             }
         } else {
-            match version {
-                "43" => "Fedora 43 base bump · new kernel · GNOME 50.1".to_string(),
-                "42" => "Currently booted. Kernel 6.13.7 · stable point release.".to_string(),
-                "41" => "Final Fedora 41 maintenance build.".to_string(),
-                _ => "".to_string(),
-            }
+            "".to_string()
         };
         let summary_label = gtk::Label::builder()
             .label(&summary_str)
@@ -436,42 +440,9 @@ impl StatusView {
         let stack_items: Vec<(&str, String, bool)> = if let Some(v) = real_version {
             vec![
                 ("Kernel", v.kernel.clone(), false),
-                ("bootc", "1.4.2".to_string(), false),
-                ("systemd", "259.5".to_string(), false),
-                ("flatpak", "1.17.7".to_string(), false),
             ]
         } else {
-            match version {
-                "43" => vec![
-                    ("Kernel", "6.14.1-300.fc43".to_string(), true),
-                    ("GNOME", "50.1".to_string(), true),
-                    ("Mesa", "26.0.7".to_string(), false),
-                    ("Podman", "5.8.2".to_string(), true),
-                    ("Nvidia", "595.71.05-1".to_string(), false),
-                    ("bootc", "1.4.2".to_string(), false),
-                    ("systemd", "259.5".to_string(), false),
-                    ("pipewire", "1.6.5".to_string(), true),
-                    ("flatpak", "1.17.7".to_string(), false),
-                ],
-                "42" => vec![
-                    ("Kernel", "6.13.7-300.fc42".to_string(), false),
-                    ("GNOME", "49.4".to_string(), false),
-                    ("Mesa", "26.0.6".to_string(), false),
-                    ("Podman", "5.8.0".to_string(), false),
-                    ("Nvidia", "595.71.05-1".to_string(), false),
-                    ("bootc", "1.4.2".to_string(), false),
-                    ("systemd", "259.5".to_string(), false),
-                    ("pipewire", "1.6.5".to_string(), false),
-                    ("flatpak", "1.17.7".to_string(), false),
-                ],
-                "41" => vec![
-                    ("Kernel", "6.12.9-100.fc41".to_string(), false),
-                    ("GNOME", "48.2".to_string(), false),
-                    ("Mesa", "25.3.4".to_string(), false),
-                    ("Podman", "5.6.0".to_string(), false),
-                ],
-                _ => vec![],
-            }
+            vec![]
         };
 
         for (name, ver, bumped) in stack_items {
@@ -531,45 +502,6 @@ impl StatusView {
             }
             for pkg in &diff.removed {
                 removals_list.push(pkg.clone());
-            }
-        } else {
-            // Fallback: mock upgrades and removals
-            let mock_upgrades = match version {
-                "43" => vec![
-                    ("Docker", "29.5.1-1", "29.5.2-1"),
-                    ("Mesa", "26.0.6-4", "26.0.7-4"),
-                    ("amd-gpu-firmware", "20260410-1", "20260519-1"),
-                    ("bind", "9.18.48-1", "9.18.49-1"),
-                    ("pipewire", "1.6.5-1", "1.6.5-2"),
-                    ("tailscale", "1.98.2-1", "1.98.3-1"),
-                    ("vim", "9.2.390-1", "9.2.506-2"),
-                ],
-                "42" => vec![
-                    ("kernel", "6.13.6", "6.13.7-300"),
-                    ("firefox", "142.0", "143.0"),
-                    ("gnome-shell", "49.3", "49.4"),
-                ],
-                "41" => vec![
-                    ("kernel", "6.12.4", "6.12.9-100"),
-                    ("gnome-shell", "48.1", "48.2"),
-                ],
-                _ => vec![],
-            };
-            for (pkg, from, to) in mock_upgrades {
-                upgrades_list.push((pkg.to_string(), from.to_string(), to.to_string()));
-            }
-
-            let mock_removals = match version {
-                "43" => vec![
-                    "framework-laptop-kmod-common",
-                    "libde265",
-                    "uvg266",
-                    "vvdec",
-                ],
-                _ => vec![],
-            };
-            for pkg in mock_removals {
-                removals_list.push(pkg.to_string());
             }
         }
 
@@ -644,22 +576,7 @@ impl StatusView {
             self.changelog_box.append(&list_removals);
         }
 
-        let commits_list: Vec<(String, String, String)> = if !self.github_commits.is_empty() {
-            self.github_commits.clone()
-        } else {
-            match version {
-                "43" => vec![
-                    ("60e72be".to_string(), "fix: ensure xdg-desktop-portal starts after gnome-keyring-daemon (#4539)".to_string(), "Yang Ye".to_string()),
-                    ("b6a0f5c".to_string(), "feat(changelogs): Use SBOMs for standardized package data extraction (#4635)".to_string(), "Dylan M. Taylor".to_string()),
-                    ("7036e3e".to_string(), "Adds ROCm Info utility (#4661)".to_string(), "Italo".to_string()),
-                    ("7eef3d2".to_string(), "feat(extension): Add gradia capture extension (#4651)".to_string(), "Coda".to_string()),
-                ],
-                "42" => vec![
-                    ("12ab34c".to_string(), "chore: weekly Fedora 42 base refresh".to_string(), "fedora-bootc bot".to_string()),
-                ],
-                _ => vec![],
-            }
-        };
+        let commits_list: Vec<(String, String, String)> = self.github_commits.clone();
 
         if !commits_list.is_empty() {
             let commits_title = gtk::Label::builder()
@@ -676,6 +593,10 @@ impl StatusView {
                 .build();
             list_commits.add_css_class("card");
 
+            // Build GitHub URL from registry URI org/repo
+            let github_url = parse_org_repo(&self.registry_uri)
+                .map(|(org, repo)| format!("https://github.com/{}/{}", org, repo));
+
             for (sha, msg, author) in commits_list {
                 let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
                 row_box.set_margin_start(16);
@@ -683,7 +604,8 @@ impl StatusView {
                 row_box.set_margin_top(8);
                 row_box.set_margin_bottom(8);
 
-                let sha_lbl = gtk::Label::new(Some(&sha));
+                let sha_short = if sha.len() >= 7 { &sha[0..7] } else { &sha };
+                let sha_lbl = gtk::Label::new(Some(sha_short));
                 sha_lbl.add_css_class("monospace");
                 sha_lbl.add_css_class("caption");
                 sha_lbl.add_css_class("dim-label");
@@ -710,6 +632,20 @@ impl StatusView {
                 msg_box.append(&auth_lbl);
 
                 row_box.append(&msg_box);
+
+                // Make the whole row clickable to open GitHub commit
+                if let Some(ref base_url) = github_url {
+                    let commit_url = format!("{}/commit/{}", base_url, sha);
+                    let gesture = gtk::GestureClick::new();
+                    let url = commit_url.clone();
+                    gesture.connect_pressed(move |_, _, _, _| {
+                        let _ = std::process::Command::new("xdg-open")
+                            .arg(&url)
+                            .spawn();
+                    });
+                    row_box.add_controller(gesture);
+                    row_box.set_cursor_from_name(Some("pointer"));
+                }
                 
                 list_commits.append(&row_box);
             }
@@ -850,10 +786,21 @@ impl SimpleComponent for StatusView {
 
         // ── Idle page (built imperatively) ──────────────────────────────
         let initial_image_info = read_image_info();
-        let initial_registry_uri = read_registry_uri().unwrap_or_else(|| "quay.io/fedora/fedora-bootc".to_string());
+        let initial_registry_uri = read_registry_uri().unwrap_or_else(|| String::new());
         let initial_selected_tag = read_selected_tag();
         let initial_last_update = get_last_update_time();
         let auto_updates_enabled = read_auto_updates_enabled();
+        let initial_subtitle = {
+            let tag_str = if initial_selected_tag == "latest" {
+                String::new()
+            } else if !initial_selected_tag.is_empty() {
+                format!("{}  ·  ", initial_selected_tag)
+            } else {
+                String::new()
+            };
+            let update_text = initial_last_update.as_deref().unwrap_or("");
+            format!("{}{}", tag_str, update_text)
+        };
 
         let idle_page = gtk::ScrolledWindow::new();
         idle_page.set_hscrollbar_policy(gtk::PolicyType::Never);
@@ -874,8 +821,8 @@ impl SimpleComponent for StatusView {
 
         let hero_group = adw::PreferencesGroup::new();
         let hero_row = adw::ActionRow::builder()
-            .title(initial_image_info.as_deref().unwrap_or("Fedora bootc"))
-            .subtitle("Version 42  ·  Booted 3 days ago")
+            .title(initial_image_info.as_deref().unwrap_or("System Image"))
+            .subtitle(&initial_subtitle)
             .build();
         hero_row.set_activatable(false);
         
@@ -916,9 +863,11 @@ impl SimpleComponent for StatusView {
         let banner_whats_new_btn = gtk::Button::with_label("What's new");
         banner_whats_new_btn.add_css_class("flat");
         banner_whats_new_btn.add_css_class("accent");
+        let initial_selected_tag_2 = initial_selected_tag.clone();
         let whats_new_sender = sender.input_sender().clone();
         banner_whats_new_btn.connect_clicked(move |_| {
-            whats_new_sender.emit(StatusViewInput::SelectChangelogVersion("43".to_string()));
+            let ver = initial_selected_tag_2.clone();
+            whats_new_sender.emit(StatusViewInput::SelectChangelogVersion(ver));
         });
 
         let banner_install_btn = gtk::Button::with_label("Install");
@@ -1150,13 +1099,14 @@ impl SimpleComponent for StatusView {
         let tags = if let Some(config) = read_bootc_image_info_config() {
             config.tags
         } else {
-            vec![
-                "latest".to_string(),
-                "42".to_string(),
-                "41".to_string(),
-                "testing".to_string(),
-                "rawhide".to_string(),
-            ]
+            // Derive sensible defaults from the detected tag rather than showing
+            // hardcoded version tags that don't apply to all OCI images.
+            let cur = initial_selected_tag.clone();
+            if !cur.is_empty() && cur != "latest" {
+                vec!["latest".to_string(), cur]
+            } else {
+                vec!["latest".to_string()]
+            }
         };
 
         for t in &tags {
@@ -1176,6 +1126,8 @@ impl SimpleComponent for StatusView {
             }
         });
         tag_combo.set_valign(gtk::Align::Center);
+        // Disable until the background fetch fills in real tags.
+        tag_combo.set_sensitive(tags.len() > 1);
         tag_row.add_suffix(&tag_combo);
         source_list.append(&tag_row);
 
@@ -1304,7 +1256,7 @@ impl SimpleComponent for StatusView {
         let changelog_install_bar = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         changelog_install_bar.set_margin_top(12);
         changelog_install_bar.set_margin_bottom(12);
-        let ch_install_label = gtk::Label::new(Some("Version 43 available · Includes a kernel update."));
+        let ch_install_label = gtk::Label::new(Some("A newer version is available."));
         ch_install_label.add_css_class("caption");
         ch_install_label.add_css_class("dim-label");
         let ch_install_btn = gtk::Button::with_label("Install");
@@ -1387,6 +1339,7 @@ impl SimpleComponent for StatusView {
 
         spawn_changelog_fetch(initial_registry_uri.clone(), initial_selected_tag.clone(), sender.clone());
 
+        let initial_selected_tag_3 = initial_selected_tag.clone();
         let model = StatusView {
             state: init,
             log_view,
@@ -1418,7 +1371,7 @@ impl SimpleComponent for StatusView {
             selected_tag: initial_selected_tag.clone(),
             deployments: get_sample_deployments(false),
             expanded_deployment_id: None,
-            changelog_version: "43".to_string(),
+            changelog_version: initial_selected_tag_3.clone(),
             registry_versions: Vec::new(),
             github_commits: Vec::new(),
             sbom_diff: None,
@@ -1643,11 +1596,8 @@ impl SimpleComponent for StatusView {
             StatusViewInput::SelectTag(tag) => {
                 self.selected_tag = tag.clone();
                 let desc = match tag.as_str() {
-                    "latest" => "Always the newest stable release",
-                    "42" => "Pinned to Fedora 42",
-                    "41" => "Pinned to Fedora 41 (older)",
-                    "testing" => "Pre-release builds — may be unstable",
-                    "rawhide" => "Bleeding edge — not for daily use",
+                    "latest" => "Always the newest stable build",
+                    _ if tag.chars().all(|c| c.is_ascii_digit()) => "Pinned to this version",
                     _ => "Custom tag",
                 };
                 self.tag_row.set_subtitle(desc);
@@ -1818,11 +1768,75 @@ impl SimpleComponent for StatusView {
             }
 
             StatusViewInput::RegistryVersionsLoaded(versions) => {
-                self.registry_versions = versions;
+                // Merge incoming versions, deduplicating by version string.
+                // Collect owned keys first to avoid the simultaneous borrow.
+                let existing: std::collections::HashSet<String> = self
+                    .registry_versions
+                    .iter()
+                    .map(|v| v.version.clone())
+                    .collect();
+                for v in versions {
+                    if !existing.contains(&v.version) {
+                        self.registry_versions.push(v);
+                    }
+                }
+                self.registry_versions.sort_by_key(|v| v.date);
                 if let Some(latest) = self.registry_versions.last() {
                     self.changelog_version = latest.version.clone();
                 }
                 self.rebuild_changelog_page(&sender);
+
+                // Merge remote registry versions into the history list
+                let local_tags: std::collections::HashSet<&str> = self
+                    .deployments
+                    .iter()
+                    .map(|d| d.tag.as_str())
+                    .collect();
+                let mut merged = self.deployments.clone();
+                for v in &self.registry_versions {
+                    if !local_tags.contains(v.version.as_str()) {
+                        let date_str = v.date.format("%b %-d, %Y").to_string();
+                        merged.push(MockDeployment {
+                            id: format!("remote-{}", v.version),
+                            state: "remote".to_string(),
+                            title: self.image_info.clone().unwrap_or_else(|| "System Image".to_string()),
+                            image: self.registry_uri.clone(),
+                            tag: v.version.clone(),
+                            digest: v.revision.clone(),
+                            deployed: format!("Available · {}", date_str),
+                            deployed_full: format!("Built: {} · {}", date_str, v.created.format("%H:%M UTC")),
+                            size: "—".to_string(),
+                            kernel: v.kernel.clone(),
+                            package_count: 0,
+                            signer: "Remote registry".to_string(),
+                            pinned: false,
+                        });
+                    }
+                }
+                self.deployments = merged;
+                rebuild_history_list(
+                    &self.history_list_box,
+                    &self.deployments,
+                    self.expanded_deployment_id.as_deref(),
+                    &sender,
+                );
+                self.images_count_label.set_label(&format!("{} images", self.deployments.len()));
+            }
+
+            StatusViewInput::AvailableTagsLoaded(tags) => {
+                self.tag_combo.remove_all();
+                for t in &tags {
+                    self.tag_combo.append(Some(t), &format!(":{}", t));
+                }
+                let active = tags
+                    .iter()
+                    .find(|t| *t == &self.selected_tag)
+                    .or_else(|| tags.first())
+                    .map(|t| t.as_str());
+                if let Some(id) = active {
+                    self.tag_combo.set_active_id(Some(id));
+                }
+                self.tag_combo.set_sensitive(tags.len() > 1);
             }
 
             StatusViewInput::GithubCommitsLoaded(commits) => {
@@ -2017,6 +2031,17 @@ fn get_cached_bootc_status() -> Option<Value> {
 }
 
 fn detect_bootc_image_info() -> Option<(String, String, String)> {
+    // Allow env var override for demo/debug: FINUPDATE_IMAGE=quay.io/org/image:tag
+    if let Ok(override_ref) = std::env::var("FINUPDATE_IMAGE") {
+        if !override_ref.is_empty() {
+            let (registry, org, image, tag) = parse_image_ref_parts(&override_ref)?;
+            let title = format!("{}/{}", org, image);
+            let registry_uri = format!("{}/{}/{}", registry, org, image);
+            println!("[debug] FINUPDATE_IMAGE override: title='{}' registry_uri='{}' tag='{}'", title, registry_uri, tag);
+            return Some((title, registry_uri, tag));
+        }
+    }
+
     let json = get_cached_bootc_status()?;
     let image_ref = json
         .pointer("/status/booted/image/image/image")
@@ -2135,40 +2160,43 @@ fn get_last_update_time() -> Option<String> {
     None
 }
 
+fn parse_image_ref_fields(img_ref: &str) -> (String, String, String) {
+    if img_ref.is_empty() {
+        return ("Unknown".to_string(), "latest".to_string(), "unknown".to_string());
+    }
+    let (without_tag, tag) = img_ref.rsplit_once(':').unwrap_or((img_ref, "latest"));
+    let parts: Vec<&str> = without_tag.split('/').collect();
+    let name = parts.last().map(|s| s.to_string()).unwrap_or_else(|| without_tag.to_string());
+    let org = if parts.len() >= 2 { parts[parts.len() - 2].to_string() } else { "unknown".to_string() };
+    (name, tag.to_string(), org)
+}
+
 fn get_real_deployments_from_json(json: &Value) -> Option<Vec<MockDeployment>> {
     let mut ds = Vec::new();
     let status = json.get("status")?;
+    let booted_kernel = get_host_kernel();
 
     // 1. Staged deployment
     if let Some(staged) = status.get("staged").and_then(|v| if v.is_null() { None } else { Some(v) }) {
         let img_ref = staged.pointer("/image/image/image").or_else(|| staged.pointer("/image/image")).and_then(|v| v.as_str()).unwrap_or("");
         let digest = staged.pointer("/image/imageDigest").and_then(|v| v.as_str()).unwrap_or("");
         let timestamp = staged.pointer("/image/timestamp").and_then(|v| v.as_str()).unwrap_or("");
-        
-        let (org_img, tag) = if img_ref.is_empty() {
-            ("Fedora bootc".to_string(), "latest".to_string())
-        } else {
-            let parts: Vec<&str> = img_ref.split(':').collect();
-            let name = parts[0].split('/').last().unwrap_or(parts[0]).to_string();
-            let tag = parts.get(1).map(|t| t.to_string()).unwrap_or_else(|| "latest".to_string());
-            (name, tag)
-        };
-
+        let (name, tag, org) = parse_image_ref_fields(img_ref);
         let date_str = if timestamp.len() >= 10 { &timestamp[0..10] } else { "recently" };
 
         ds.push(MockDeployment {
             id: "d-staged".to_string(),
             state: "staged".to_string(),
-            title: org_img,
+            title: name,
             image: img_ref.to_string(),
             tag,
             digest: digest.to_string(),
             deployed: "Staged · pending reboot".to_string(),
             deployed_full: format!("Built: {}", date_str),
-            size: "2.2 GB".to_string(),
-            kernel: "6.14.1-300.fc43.x86_64".to_string(),
-            package_count: 1361,
-            signer: "fedora-43 (sigstore)".to_string(),
+            size: "—".to_string(),
+            kernel: "—".to_string(),
+            package_count: 0,
+            signer: format!("{} (sigstore)", org),
             pinned: false,
         });
     }
@@ -2179,31 +2207,22 @@ fn get_real_deployments_from_json(json: &Value) -> Option<Vec<MockDeployment>> {
         let digest = booted.pointer("/image/imageDigest").and_then(|v| v.as_str()).unwrap_or("");
         let timestamp = booted.pointer("/image/timestamp").and_then(|v| v.as_str()).unwrap_or("");
         let pinned = booted.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        let (org_img, tag) = if img_ref.is_empty() {
-            ("Fedora bootc".to_string(), "latest".to_string())
-        } else {
-            let parts: Vec<&str> = img_ref.split(':').collect();
-            let name = parts[0].split('/').last().unwrap_or(parts[0]).to_string();
-            let tag = parts.get(1).map(|t| t.to_string()).unwrap_or_else(|| "latest".to_string());
-            (name, tag)
-        };
-
+        let (name, tag, org) = parse_image_ref_fields(img_ref);
         let date_str = if timestamp.len() >= 10 { &timestamp[0..10] } else { "recently" };
 
         ds.push(MockDeployment {
             id: "d-current".to_string(),
             state: "current".to_string(),
-            title: org_img,
+            title: name,
             image: img_ref.to_string(),
             tag,
             digest: digest.to_string(),
             deployed: "Currently booted".to_string(),
             deployed_full: format!("Built: {}", date_str),
-            size: "2.1 GB".to_string(),
-            kernel: "6.13.7-300.fc42.x86_64".to_string(),
-            package_count: 1342,
-            signer: "fedora-42 (sigstore)".to_string(),
+            size: "—".to_string(),
+            kernel: booted_kernel,
+            package_count: 0,
+            signer: format!("{} (sigstore)", org),
             pinned,
         });
     }
@@ -2214,31 +2233,22 @@ fn get_real_deployments_from_json(json: &Value) -> Option<Vec<MockDeployment>> {
         let digest = rollback.pointer("/image/imageDigest").and_then(|v| v.as_str()).unwrap_or("");
         let timestamp = rollback.pointer("/image/timestamp").and_then(|v| v.as_str()).unwrap_or("");
         let pinned = rollback.get("pinned").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        let (org_img, tag) = if img_ref.is_empty() {
-            ("Fedora bootc".to_string(), "latest".to_string())
-        } else {
-            let parts: Vec<&str> = img_ref.split(':').collect();
-            let name = parts[0].split('/').last().unwrap_or(parts[0]).to_string();
-            let tag = parts.get(1).map(|t| t.to_string()).unwrap_or_else(|| "latest".to_string());
-            (name, tag)
-        };
-
+        let (name, tag, org) = parse_image_ref_fields(img_ref);
         let date_str = if timestamp.len() >= 10 { &timestamp[0..10] } else { "recently" };
 
         ds.push(MockDeployment {
             id: "d-rollback".to_string(),
             state: "previous".to_string(),
-            title: org_img,
+            title: name,
             image: img_ref.to_string(),
             tag,
             digest: digest.to_string(),
             deployed: "Rollback target".to_string(),
             deployed_full: format!("Built: {}", date_str),
-            size: "2.0 GB".to_string(),
-            kernel: "6.13.4-200.fc42.x86_64".to_string(),
-            package_count: 1338,
-            signer: "fedora-42 (sigstore)".to_string(),
+            size: "—".to_string(),
+            kernel: "—".to_string(),
+            package_count: 0,
+            signer: format!("{} (sigstore)", org),
             pinned,
         });
     }
@@ -2247,96 +2257,33 @@ fn get_real_deployments_from_json(json: &Value) -> Option<Vec<MockDeployment>> {
 }
 
 fn get_real_deployments() -> Option<Vec<MockDeployment>> {
-    let output_result = if crate::update_worker::is_flatpak() {
-        Command::new("flatpak-spawn")
-            .args(["--host", "bootc", "status", "--json"])
-            .output()
-    } else {
-        Command::new("bootc")
-            .args(["status", "--json"])
-            .output()
-    };
-
-    let output = output_result.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let json: Value = serde_json::from_slice(&output.stdout).ok()?;
-    get_real_deployments_from_json(&json)
+    get_cached_bootc_status().and_then(|json| get_real_deployments_from_json(&json))
 }
 
-fn get_sample_deployments(reboot_pending: bool) -> Vec<MockDeployment> {
+fn get_host_kernel() -> String {
+    let output = if crate::update_worker::is_flatpak() {
+        Command::new("flatpak-spawn")
+            .args(["--host", "uname", "-r"])
+            .output()
+    } else {
+        Command::new("uname").arg("-r").output()
+    };
+    output
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn get_sample_deployments(_reboot_pending: bool) -> Vec<MockDeployment> {
+    // Always try real data first; return empty if unavailable rather than
+    // hardcoding Fedora-specific mock data that doesn't apply to other images.
     if let Some(ds) = get_real_deployments() {
         return ds;
     }
-
-    let title = read_image_info().unwrap_or_else(|| "Fedora bootc".to_string());
-    let image = read_registry_uri().unwrap_or_else(|| "quay.io/fedora/fedora-bootc".to_string());
-    let mut ds = Vec::new();
-    if reboot_pending {
-        ds.push(MockDeployment {
-            id: "d-staged".to_string(),
-            state: "staged".to_string(),
-            title: title.clone(),
-            image: image.clone(),
-            tag: "43".to_string(),
-            digest: "sha256:f4e8c1a6b9d2f5a8c1e4b7d0a3c6f9b2e5a8d1c4f7b0a3e6d9c2f5b8a1e4d7c0".to_string(),
-            deployed: "Staged · pending reboot".to_string(),
-            deployed_full: "Staged · pending reboot".to_string(),
-            size: "2.2 GB".to_string(),
-            kernel: "6.14.1-300.fc43.x86_64".to_string(),
-            package_count: 1361,
-            signer: "fedora-43 (sigstore)".to_string(),
-            pinned: false,
-        });
-    }
-    ds.push(MockDeployment {
-        id: "d-current".to_string(),
-        state: "current".to_string(),
-        title: title.clone(),
-        image: image.clone(),
-        tag: "42".to_string(),
-        digest: "sha256:a8c92f1e0b7c3d4f9a2b1e6c8d0f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2".to_string(),
-        deployed: "3 days ago".to_string(),
-        deployed_full: "May 24, 2026 · 14:22 UTC".to_string(),
-        size: "2.1 GB".to_string(),
-        kernel: "6.13.7-300.fc42.x86_64".to_string(),
-        package_count: 1342,
-        signer: "fedora-42 (sigstore)".to_string(),
-        pinned: false,
-    });
-    ds.push(MockDeployment {
-        id: "d-prev".to_string(),
-        state: "previous".to_string(),
-        title: title.clone(),
-        image: image.clone(),
-        tag: "42".to_string(),
-        digest: "sha256:b3e1188fd91a7eaa0c6c8c4f1d8e9a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0".to_string(),
-        deployed: "11 days ago".to_string(),
-        deployed_full: "May 16, 2026 · 09:08 UTC".to_string(),
-        size: "2.0 GB".to_string(),
-        kernel: "6.13.4-200.fc42.x86_64".to_string(),
-        package_count: 1338,
-        signer: "fedora-42 (sigstore)".to_string(),
-        pinned: true,
-    });
-    ds.push(MockDeployment {
-        id: "d-arch".to_string(),
-        state: "archived".to_string(),
-        title: title.clone(),
-        image: image.clone(),
-        tag: "41".to_string(),
-        digest: "sha256:c0d22a4e6b8d1f3a5c7e9b0d2f4a6c8e0b1d3f5a7c9e1b3d5f7a9c1e3b5d7f9a0".to_string(),
-        deployed: "6 weeks ago".to_string(),
-        deployed_full: "Apr 15, 2026 · 18:51 UTC".to_string(),
-        size: "1.9 GB".to_string(),
-        kernel: "6.12.9-100.fc41.x86_64".to_string(),
-        package_count: 1297,
-        signer: "fedora-41 (sigstore)".to_string(),
-        pinned: false,
-    });
-    ds
+    Vec::new()
 }
 
 fn rebuild_history_list(
@@ -2362,6 +2309,7 @@ fn rebuild_history_list(
         let indicator_class = match d.state.as_str() {
             "current" => "deploy-indicator-current",
             "staged" => "deploy-indicator-staged",
+            "remote" => "deploy-indicator-staged",  // available to pull
             _ => "deploy-indicator-archive",
         };
         indicator.add_css_class(indicator_class);
@@ -2388,6 +2336,11 @@ fn rebuild_history_list(
             pill.add_css_class("status-pill-ready");
             pill.add_css_class("caption");
             title_box.append(&pill);
+        } else if d.state == "remote" {
+            let pill = gtk::Label::new(Some("Remote"));
+            pill.add_css_class("status-pill-ready");
+            pill.add_css_class("caption");
+            title_box.append(&pill);
         }
         if d.pinned {
             let pill = gtk::Label::new(Some("Pinned"));
@@ -2397,8 +2350,9 @@ fn rebuild_history_list(
         }
         text_box.append(&title_box);
         
+        let digest_short = if d.digest.len() >= 12 { &d.digest[0..12] } else { &d.digest };
         let submeta_label = gtk::Label::builder()
-            .label(&format!("{}:{}  ·  {}…  ·  {}", d.image, d.tag, &d.digest[0..12], d.deployed))
+            .label(&format!("{}:{}  ·  {}…  ·  {}", d.image, d.tag, digest_short, d.deployed))
             .halign(gtk::Align::Start)
             .build();
         submeta_label.add_css_class("caption");
@@ -2421,9 +2375,22 @@ fn rebuild_history_list(
         pin_btn.connect_clicked(move |_| {
             pin_sender.emit(StatusViewInput::TogglePin(pin_id.clone()));
         });
-        actions_box.append(&pin_btn);
+        if d.state != "remote" {
+            actions_box.append(&pin_btn);
+        }
         
-        if d.state != "current" && d.state != "staged" {
+        if d.state == "remote" {
+            let pull_btn = gtk::Button::builder()
+                .icon_name("document-save-symbolic")
+                .tooltip_text("Pull this image from registry")
+                .build();
+            pull_btn.add_css_class("flat");
+            let pull_d = d.clone();
+            pull_btn.connect_clicked(move |_| {
+                println!("[debug] Pull requested for {}:{}", pull_d.image, pull_d.tag);
+            });
+            actions_box.append(&pull_btn);
+        } else if d.state != "current" && d.state != "staged" {
             let rb_btn = gtk::Button::builder()
                 .icon_name("edit-undo-symbolic")
                 .tooltip_text("Roll back to this image")
@@ -2542,7 +2509,19 @@ fn rebuild_history_list(
         
         let bottom_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         
-        if d.state != "current" && d.state != "staged" {
+        if d.state == "remote" {
+            let pull_btn = gtk::Button::builder()
+                .label("Pull this image")
+                .icon_name("document-save-symbolic")
+                .build();
+            pull_btn.add_css_class("suggested-action");
+            pull_btn.add_css_class("pill");
+            let pull_d = d.clone();
+            pull_btn.connect_clicked(move |_| {
+                println!("[debug] Pull requested for {}:{}", pull_d.image, pull_d.tag);
+            });
+            bottom_actions.append(&pull_btn);
+        } else if d.state != "current" && d.state != "staged" {
             let rb_btn = gtk::Button::builder()
                 .label("Roll back to this")
                 .icon_name("edit-undo-symbolic")
@@ -2557,7 +2536,7 @@ fn rebuild_history_list(
             bottom_actions.append(&rb_btn);
         }
         
-        if d.state != "current" {
+        if d.state != "current" && d.state != "remote" {
             let def_btn = gtk::Button::builder()
                 .label("Set as default boot")
                 .build();
@@ -2624,6 +2603,7 @@ fn spawn_changelog_fetch(
 
         rt.block_on(async move {
             println!("[debug] changelog: starting fetch for registry_uri={}", registry_uri);
+
             // 1. Fetch registry versions
             let parts: Vec<&str> = registry_uri.split('/').collect();
             if parts.len() >= 3 {
@@ -2644,7 +2624,18 @@ fn spawn_changelog_fetch(
                 }
 
                 let client = crate::registry_client::RegistryClient::new(registry, org, &image, &stream);
-                match client.fetch_versions(30).await {
+
+                // Fetch the full tag list to populate the tag selector dropdown.
+                match client.fetch_available_tags().await {
+                    Ok(available) if !available.is_empty() => {
+                        println!("[debug] changelog: fetched {} available tags", available.len());
+                        let _ = sender.input(StatusViewInput::AvailableTagsLoaded(available));
+                    }
+                    Ok(_) => {}
+                    Err(e) => println!("[debug] changelog: failed to fetch tag list: {}", e),
+                }
+
+                match client.fetch_versions(14).await {
                     Ok(versions) => {
                         println!("[debug] changelog: fetched {} registry versions", versions.len());
                         sender.input(StatusViewInput::RegistryVersionsLoaded(versions));
@@ -2655,7 +2646,7 @@ fn spawn_changelog_fetch(
                 }
             }
 
-            // 2. Fetch GitHub commits
+            // 2. Fetch GitHub commits (with dates for fallback version building)
             if let Some((org, repo)) = parse_org_repo(&registry_uri) {
                 let url = format!("https://api.github.com/repos/{}/{}/commits", org, repo);
                 println!("[debug] changelog: fetching github commits from {}", url);
@@ -2680,23 +2671,17 @@ fn spawn_changelog_fetch(
                         #[derive(serde::Deserialize)]
                         struct AuthorDetails {
                             name: String,
+                            #[allow(dead_code)]
                             date: String,
                         }
 
                         if let Ok(commits_json) = resp.json::<Vec<GithubCommit>>().await {
                             let commits: Vec<(String, String, String)> = commits_json
                                 .into_iter()
-                                .map(|c| {
-                                    let sha = if c.sha.len() >= 7 {
-                                        c.sha[0..7].to_string()
-                                    } else {
-                                        c.sha
-                                    };
-                                    (sha, c.commit.message, c.commit.author.name)
-                                })
+                                .map(|c| (c.sha, c.commit.message, c.commit.author.name))
                                 .collect();
                             println!("[debug] changelog: fetched {} github commits", commits.len());
-                            sender.input(StatusViewInput::GithubCommitsLoaded(commits));
+                            let _ = sender.input(StatusViewInput::GithubCommitsLoaded(commits));
                         } else {
                             println!("[debug] changelog: failed to parse github commits JSON");
                         }

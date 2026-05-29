@@ -72,9 +72,9 @@ gui-test suite="smoke" tags="":
     cd tests/{{ suite }} && behave features/ {{ if tags != "" { "--tags " + tags } else { "" } }}
 
 # Run the GUI tests inside an isolated headless Wayland session via
-# qecore-headless. This is what CI uses; safe to run on a machine with no
-# active GNOME session.
-gui-test-headless suite="smoke" tags="":
+# qecore-headless. This is what CI uses; DO NOT run on developer machines.
+# Use `just gui-test` instead to test against your actual GNOME session.
+_gui-test-headless suite="smoke" tags="":
     qecore-headless --session-type wayland --session-desktop gnome \
         "bash -lc 'cd tests/{{ suite }} && behave features/ {{ if tags != "" { "--tags " + tags } else { "" } }}'"
 

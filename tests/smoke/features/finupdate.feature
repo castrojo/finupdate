@@ -9,14 +9,13 @@ Feature: Finupdate smoke tests
 
   Background:
     * Start application "finupdate" via "command"
-    * Wait until "Finupdate" "frame" appears in "finupdate"
+    * Wait until window "Finupdate" appears in "finupdate"
 
   # ── Launch & main window ────────────────────────────────────────────────
 
   @launch
   Scenario: Application window appears with the main controls
     * Application "finupdate" is running
-    * Item "Finupdate" "frame" is "showing" in "finupdate"
     * Item "Check for Updates" "push button" is "showing" in "finupdate"
 
   # ── Menu access ─────────────────────────────────────────────────────────

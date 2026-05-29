@@ -74,6 +74,30 @@ def set_dev_scenario(context, app_id, scenario):
     ]))
 
 
+# ── Custom window detection ───────────────────────────────────────────────
+
+@step('Wait until window "{name}" appears in "{app_id}"')
+def wait_for_window(context, name, app_id):
+    """Wait for the application window to appear by name, regardless of role.
+
+    GTK4 windows may report as 'filler' or other roles, not 'frame'.
+    """
+    app = getattr(context, app_id)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        try:
+            # Look for any widget with this name, any role
+            matches = app.instance.findChildren(
+                lambda n: n.name == name
+            )
+            if matches:
+                return
+        except Exception:
+            pass
+        time.sleep(0.5)
+    assert False, f"Window {name!r} did not appear in {app_id}"
+
+
 # ── Friendlier wait-and-click ─────────────────────────────────────────────
 
 @step('Activate "{name}" "{role}" in "{app_id}"')

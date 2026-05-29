@@ -31,7 +31,7 @@ def before_all(context) -> None:
 
         # qecore knows how to launch a Flatpak by app-id.
         context.finupdate = context.sandbox.get_flatpak(
-            flatpak_name=APP_ID,
+            flatpak_id=[APP_ID],
             a11y_app_name=A11Y_APP_NAME,
         )
         # Ctrl+Q is the documented quit shortcut (see README).

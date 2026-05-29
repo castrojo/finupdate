@@ -172,7 +172,7 @@ impl SimpleComponent for App {
     view! {
         #[root]
         adw::ApplicationWindow {
-            set_title: Some("System Update"),
+            set_title: Some("Finupdate"),
             set_default_size: (750, 700),
             set_width_request: 400,
             set_height_request: 500,
@@ -381,15 +381,15 @@ impl SimpleComponent for App {
                     .build()
                     .expect("Failed to create tokio runtime");
                 rt.block_on(async move {
-                    // Use `bootc upgrade --check` to detect pending updates.
+                    // Use `pkexec bootc upgrade --check` to detect pending updates.
                     // Exit 0 = update available, 77 = up to date, other = unknown.
                     let mut cmd = if std::path::Path::new("/.flatpak-info").exists() {
                         let mut c = tokio::process::Command::new("flatpak-spawn");
-                        c.args(["--host", "bootc", "upgrade", "--check"]);
+                        c.args(["--host", "pkexec", "bootc", "upgrade", "--check"]);
                         c
                     } else {
-                        let mut c = tokio::process::Command::new("bootc");
-                        c.arg("upgrade").arg("--check");
+                        let mut c = tokio::process::Command::new("pkexec");
+                        c.args(["bootc", "upgrade", "--check"]);
                         c
                     };
                     let status = match cmd.status().await {
@@ -775,7 +775,7 @@ impl SimpleComponent for App {
                 };
                 if let Some(root) = self.status_view.widget().root() {
                     if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
-                        window.set_title(Some(&format!("System Update — {}", title)));
+                        window.set_title(Some(&format!("Finupdate — {}", title)));
                     }
                 }
                 self.back_btn.set_visible(page != "main");

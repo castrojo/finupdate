@@ -221,7 +221,7 @@ impl RegistryClient {
     /// Fetch all available versions for this stream in the last `days` days.
     ///
     /// - Round trip 1: tag list
-    /// - Round trip 2…N: manifest HEADs, up to 8 concurrent
+    /// - Round trip 2…N: manifest HEADs, up to 12 concurrent
     pub async fn fetch_versions(&self, days: u32) -> Result<Vec<ImageVersion>, RegistryError> {
         let token = self.get_token().await?;
         let client = self.client.clone();
@@ -255,41 +255,103 @@ impl RegistryClient {
             .collect();
 
         if candidate_tags.is_empty() {
+            // Fallback: no dated tags found — try fetching the latest tag directly.
+            // This handles images like Dakota that only publish a :latest tag.
+            let latest_tag = "latest";
+            if tag_resp.tags.contains(&latest_tag.to_string()) {
+                let today = Utc::now().date_naive();
+                let url = format!(
+                    "https://{}/v2/{}/{}/manifests/{}",
+                    self.registry, self.org, self.image, latest_tag
+                );
+                let full_ref = format!(
+                    "{}/{}/{}:{}",
+                    self.registry, self.org, self.image, latest_tag
+                );
+                if let Some(version) = fetch_version(&client, &url, &token, today, full_ref).await {
+                    return Ok(vec![version]);
+                }
+            }
             return Err(RegistryError::NoTags(self.stream.clone()));
         }
 
-        // Fetch manifests in parallel, capped at 8 concurrent requests.
+        // Fetch manifests concurrently with a limit of 12 — significantly
+        // faster than sequential chunking because slow manifests don't block
+        // the entire batch.
         let registry = self.registry.clone();
         let org = self.org.clone();
         let image = self.image.clone();
+        let concurrency = 12;
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
 
-        let chunk_size = 8;
-        let mut versions = Vec::new();
+        let futs: Vec<_> = candidate_tags
+            .into_iter()
+            .map(|(date, tag)| {
+                let url = format!(
+                    "https://{}/v2/{}/{}/manifests/{}",
+                    registry, org, image, tag
+                );
+                let full_ref = format!("{}/{}/{}:{}", registry, org, image, tag);
+                let client = client.clone();
+                let token = token.clone();
+                let permit = semaphore.clone();
+                async move {
+                    let _permit = permit.acquire().await.ok();
+                    fetch_version(&client, &url, &token, date, full_ref).await
+                }
+            })
+            .collect();
 
-        for chunk in candidate_tags.chunks(chunk_size) {
-            let futures: Vec<_> = chunk
-                .iter()
-                .map(|(date, tag)| {
-                    let url = format!(
-                        "https://{}/v2/{}/{}/manifests/{}",
-                        registry, org, image, tag
-                    );
-                    let full_ref = format!("{}/{}/{}:{}", registry, org, image, tag);
-                    let client = client.clone();
-                    let token = token.clone();
-                    let date = *date;
-                    async move { fetch_version(&client, &url, &token, date, full_ref).await }
-                })
-                .collect();
-
-            let results = futures::future::join_all(futures).await;
-            for result in results.into_iter().flatten() {
-                versions.push(result);
-            }
-        }
+        let mut versions: Vec<ImageVersion> = futures::future::join_all(futs)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
 
         versions.sort_by_key(|v| v.date);
         Ok(versions)
+    }
+
+    /// Return the tags available for this image, organised for the tag selector:
+    /// - non-dated "stream/channel" tags first (e.g. `latest`, `gts`)
+    /// - then dated tags for this stream, newest-first (e.g. `latest-20260527`)
+    pub async fn fetch_available_tags(&self) -> Result<Vec<String>, RegistryError> {
+        let token = self.get_token().await?;
+        let tags_url = format!(
+            "https://{}/v2/{}/{}/tags/list",
+            self.registry, self.org, self.image
+        );
+        let tag_resp: TagListResponse = self
+            .client
+            .get(&tags_url)
+            .bearer_auth(&token)
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        let mut stream_tags: Vec<String> = Vec::new();
+        let mut dated: Vec<(NaiveDate, String)> = Vec::new();
+
+        for tag in &tag_resp.tags {
+            // Skip OCI digest references and suspiciously long tokens.
+            if tag.starts_with("sha256:") || tag.len() > 80 {
+                continue;
+            }
+            if let Some(date) = parse_dated_tag(tag, &self.stream) {
+                dated.push((date, tag.clone()));
+            } else if strip_date_suffix(tag).is_none() {
+                // No date suffix → it's a stream / channel tag.
+                stream_tags.push(tag.clone());
+            }
+        }
+
+        stream_tags.sort();
+        dated.sort_by(|a, b| b.0.cmp(&a.0));
+
+        let mut result = stream_tags;
+        result.extend(dated.into_iter().take(30).map(|(_, t)| t));
+        Ok(result)
     }
 
     async fn get_token(&self) -> Result<String, RegistryError> {

@@ -217,16 +217,6 @@ fn start_version_fetch(
     stack.set_visible_child_name("loading");
     error_page.set_description(Some("Check your internet connection and try again."));
 
-    if dev_mode {
-        // In dev mode, use simulated data so the dialog is functional without bootc.
-        let versions = generate_mock_versions(variant);
-        glib::idle_add_local_once(move || {
-            build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions, dev_mode);
-            stack.set_visible_child_name("loaded");
-        });
-        return;
-    }
-
     let variant_str = variant.to_string();
     let result_slot: Arc<Mutex<Option<FetchResult>>> = Arc::new(Mutex::new(None));
     spawn_fetch_thread(result_slot.clone(), &variant_str);
@@ -892,72 +882,6 @@ fn run_rebase_simulated(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog
     });
 }
 
-/// Generate mock image versions for the last 60 days (dev mode).
-///
-/// Creates realistic dated versions reflecting Universal Blue build patterns.
-fn generate_mock_versions(variant: &str) -> Vec<ImageVersion> {
-    use chrono::{Duration, Utc};
-    use crate::registry_client::RegistryClient;
-
-    let (registry, org, image_base) = if let Some(client) = RegistryClient::detect_from_os_release() {
-        (client.registry().to_string(), client.org().to_string(), client.image().to_string())
-    } else {
-        ("ghcr.io".to_string(), "projectbluefin".to_string(), "dakota".to_string())
-    };
-
-    // Allow variant-specific image names (e.g., dakota-nvidia)
-    let image = if variant.is_empty() || variant == "default" {
-        image_base.clone()
-    } else if variant == "nvidia" || variant == "dakota-nvidia" {
-        format!("{}-nvidia", image_base)
-    } else {
-        // Support any custom variant suffix
-        format!("{}-{}", image_base, variant)
-    };
-
-    let today = Utc::now().date_naive();
-    let mut versions = Vec::new();
-
-    // Generate a version every 2-3 days over the last 60 days, matching Universal Blue patterns.
-    // Kernel versions are realistic based on Fedora kernel releases.
-    let kernel_versions = vec![
-        "6.12.13-200.fc41.x86_64",
-        "6.13.1-100.fc42.x86_64",
-        "6.13.3-100.fc42.x86_64",
-        "6.13.4-100.fc42.x86_64",
-        "6.13.5-100.fc42.x86_64",
-        "6.13.6-200.fc42.x86_64",
-        "6.13.7-200.fc42.x86_64",
-        "6.13.8-200.fc42.x86_64",
-        "6.13.9-200.fc42.x86_64",
-        "6.13.10-200.fc42.x86_64",
-    ];
-
-    let mut day_offset = 2i64;
-    let mut build_num = 1u32;
-    while day_offset <= 60 {
-        let date = today - Duration::days(day_offset);
-        let tag = format!("latest-{}", date.format("%Y%m%d"));
-        let kernel = kernel_versions
-            .get(build_num as usize % kernel_versions.len())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "6.13.10-200.fc42.x86_64".to_string());
-
-        versions.push(ImageVersion {
-            date,
-            full_ref: format!("{}/{}/{}:{}", registry, org, image, tag),
-            version: tag,
-            kernel,
-            revision: format!("{:08x}", 0xdeadbe00 + build_num),
-            created: date.and_hms_opt(4, 30, 0).unwrap().and_utc(),
-        });
-        day_offset += if build_num % 3 == 0 { 3 } else { 2 };
-        build_num += 1;
-    }
-
-    versions.sort_by_key(|v| v.date);
-    versions
-}
 
 fn days_in_month(date: NaiveDate) -> u32 {
     let next = if date.month() == 12 {
