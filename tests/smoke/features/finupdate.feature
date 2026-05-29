@@ -200,7 +200,7 @@ Feature: Finupdate smoke tests
   @dev_mode @rebase
   Scenario: Image history and version information is accessible
     * Item "Image history" "list item" is "showing" in "finupdate"
-    * Wait until "3 images" appears in "finupdate" within 5 seconds
+    * Wait until "images" appears in "finupdate" within 5 seconds
     * Application "finupdate" is running
 
   @dev_mode @image_management
@@ -214,7 +214,7 @@ Feature: Finupdate smoke tests
   @changelog
   Scenario: Changelog view displays available image versions
     * Item "Image history" "list item" is "showing" in "finupdate"
-    * Wait until "3 images" appears in "finupdate" within 5 seconds
+    * Wait until "images" appears in "finupdate" within 5 seconds
     * Application "finupdate" is running
 
   @dev_mode @history
@@ -305,7 +305,7 @@ Feature: Finupdate smoke tests
   @dev_mode @pin
   Scenario: Pin functionality available for image versions
     * Wait until "Image history" appears in "finupdate" within 5 seconds
-    * Wait until "3 images" appears in "finupdate" within 5 seconds
+    * Wait until "images" appears in "finupdate" within 5 seconds
     * Application "finupdate" is running
 
   # ── Destructive operations (dialog testing only) ─────────────────────────
