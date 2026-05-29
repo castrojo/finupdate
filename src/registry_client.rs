@@ -63,19 +63,41 @@ pub struct VariantRef {
     pub full_ref: String,
 }
 
-/// Known image families per registry org. Used by
-/// [`RegistryClient::discover_variants`] as the candidate set for HEAD probes
-/// — GHCR's `/v2/_catalog` endpoint isn't available for anonymous reads, so
-/// enumeration falls back to "try every well-known name and keep the hits".
+/// One coherent product family — a user-facing concept that groups a set of
+/// sibling image *names* (the GPU/hardware variants like `-nvidia`, `-dx`,
+/// `-deck`) and the tag streams (channels) under which they're published.
 ///
-/// Each tuple is `(org, &[siblings_in_one_family])`. An image can appear in
-/// at most one family entry; the entry is matched by membership of the
-/// current image name. Add new variants here as Universal Blue ships them.
-pub const KNOWN_FAMILIES: &[(&str, &[&str])] = &[
-    // Bluefin / Bluefin LTS — Fedora Workstation upstream.
-    (
-        "ublue-os",
-        &[
+/// A given GHCR image can belong to multiple families — Bluefin Stable and
+/// Bluefin LTS, for instance, share the `ublue-os/bluefin` image but use
+/// disjoint stream sets (`stable*` vs `lts*`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Family {
+    /// Display name for menus / dropdowns: "Bluefin Stable", "Bluefin LTS".
+    pub name: &'static str,
+    /// Registry org owning every image in this family.
+    pub org: &'static str,
+    /// Sibling image names — what the rebase dialog's variant chips render.
+    /// First entry is the canonical/default for chip rendering. Each entry
+    /// resolves to `ghcr.io/{org}/{name}:{stream}` at rebase time.
+    pub images: &'static [&'static str],
+    /// Tag streams this family publishes under. The rebase / changelog UI
+    /// can offer a stream picker. First entry is the canonical default.
+    pub streams: &'static [&'static str],
+}
+
+/// Catalogue of Universal Blue + Project Bluefin product families.
+///
+/// Used by [`RegistryClient::discover_variants`] as the candidate set for HEAD
+/// probes — GHCR's `/v2/_catalog` endpoint isn't available for anonymous reads,
+/// so enumeration falls back to "try every well-known name and keep the hits".
+///
+/// **Add new families / variants here as Universal Blue ships them.** Source
+/// of truth for the user-visible "family" concept across the app.
+pub const KNOWN_FAMILIES: &[Family] = &[
+    Family {
+        name: "Bluefin Stable",
+        org: "ublue-os",
+        images: &[
             "bluefin",
             "bluefin-nvidia",
             "bluefin-nvidia-open",
@@ -87,11 +109,24 @@ pub const KNOWN_FAMILIES: &[(&str, &[&str])] = &[
             "bluefin-surface",
             "bluefin-framework",
         ],
-    ),
-    // Aurora — KDE Plasma sibling of Bluefin.
-    (
-        "ublue-os",
-        &[
+        streams: &["latest", "stable", "stable-daily", "beta", "gts"],
+    },
+    Family {
+        name: "Bluefin LTS",
+        org: "ublue-os",
+        images: &[
+            "bluefin",
+            "bluefin-nvidia",
+            "bluefin-dx",
+            "bluefin-dx-nvidia",
+            "bluefin-gdx",
+        ],
+        streams: &["lts", "lts-hwe", "lts-amd64", "lts-arm64", "gdx"],
+    },
+    Family {
+        name: "Aurora",
+        org: "ublue-os",
+        images: &[
             "aurora",
             "aurora-nvidia",
             "aurora-nvidia-open",
@@ -99,11 +134,12 @@ pub const KNOWN_FAMILIES: &[(&str, &[&str])] = &[
             "aurora-dx-nvidia",
             "aurora-dx-nvidia-open",
         ],
-    ),
-    // Bazzite — gaming-focused KDE / Steam Deck variants.
-    (
-        "ublue-os",
-        &[
+        streams: &["latest", "stable", "stable-daily", "beta"],
+    },
+    Family {
+        name: "Bazzite KDE",
+        org: "ublue-os",
+        images: &[
             "bazzite",
             "bazzite-nvidia",
             "bazzite-nvidia-open",
@@ -112,15 +148,51 @@ pub const KNOWN_FAMILIES: &[(&str, &[&str])] = &[
             "bazzite-asus",
             "bazzite-framework",
         ],
-    ),
-    // ucore — server / container-host slim builds.
-    ("ublue-os", &["ucore", "ucore-hci", "ucore-zfs"]),
-    // Project Bluefin's own Dakota builds.
-    (
-        "projectbluefin",
-        &["dakota", "dakota-nvidia", "dakota-dx", "dakota-dx-nvidia"],
-    ),
+        streams: &["stable", "testing", "unstable", "latest"],
+    },
+    Family {
+        name: "Bazzite GNOME",
+        org: "ublue-os",
+        images: &["bazzite-gnome", "bazzite-gnome-nvidia"],
+        streams: &["stable", "testing", "unstable", "latest"],
+    },
+    Family {
+        name: "ucore",
+        org: "ublue-os",
+        images: &["ucore", "ucore-hci", "ucore-zfs"],
+        streams: &["stable", "testing", "latest"],
+    },
+    Family {
+        name: "Bluefin Dakota",
+        org: "projectbluefin",
+        images: &["dakota", "dakota-nvidia", "dakota-dx", "dakota-dx-nvidia"],
+        streams: &["latest"],
+    },
 ];
+
+impl Family {
+    /// Find every family that contains `image` under `org`. An image can
+    /// belong to more than one family (Bluefin's image is shared between
+    /// Bluefin Stable and Bluefin LTS; the stream tells them apart).
+    pub fn all_for_image(org: &str, image: &str) -> Vec<&'static Family> {
+        KNOWN_FAMILIES
+            .iter()
+            .filter(|f| f.org == org && f.images.iter().any(|i| *i == image))
+            .collect()
+    }
+
+    /// Pick the family that best matches an `(org, image, stream)` triple by
+    /// preferring families whose streams contain `stream` exactly. Falls back
+    /// to any family containing the image, then `None`.
+    pub fn best_match(org: &str, image: &str, stream: &str) -> Option<&'static Family> {
+        let candidates = Self::all_for_image(org, image);
+        candidates
+            .iter()
+            .find(|f| f.streams.iter().any(|s| *s == stream))
+            .copied()
+            .or_else(|| candidates.first().copied())
+    }
+}
 
 // ── Internal GHCR API types ───────────────────────────────────────────────────
 
@@ -343,13 +415,14 @@ impl RegistryClient {
             full_ref: format!("{}/{}/{}:{}", self.registry, self.org, image, self.stream),
         };
 
-        // Find the family group whose org matches AND which contains self.image.
-        let family = KNOWN_FAMILIES.iter().find(|(org, images)| {
-            *org == self.org && images.iter().any(|i| *i == self.image)
-        });
+        // Find the family group whose org matches AND which contains self.image,
+        // preferring the one whose streams include self.stream so Bluefin Stable
+        // and Bluefin LTS are correctly disambiguated even though they share
+        // the `ublue-os/bluefin` image.
+        let family = Family::best_match(&self.org, &self.image, &self.stream);
 
         let candidates: Vec<&str> = match family {
-            Some((_, images)) => images.iter().copied().collect(),
+            Some(f) => f.images.iter().copied().collect(),
             None => return vec![make_ref(&self.image)], // unknown family
         };
 
@@ -932,6 +1005,59 @@ mod tests {
     fn strip_date_suffix_bare_date_returns_none() {
         // Bare date has no stream prefix to return.
         assert_eq!(strip_date_suffix("20260114"), None);
+    }
+
+    // ── Family taxonomy disambiguation ──────────────────────────────────
+
+    #[test]
+    fn family_best_match_disambiguates_bluefin_stable_vs_lts_by_stream() {
+        // The image `ublue-os/bluefin` belongs to both Bluefin Stable and
+        // Bluefin LTS. The stream picks which family the user is on.
+        let stable = Family::best_match("ublue-os", "bluefin", "stable").unwrap();
+        assert_eq!(stable.name, "Bluefin Stable");
+
+        let lts = Family::best_match("ublue-os", "bluefin", "lts").unwrap();
+        assert_eq!(lts.name, "Bluefin LTS");
+
+        let lts_hwe = Family::best_match("ublue-os", "bluefin", "lts-hwe").unwrap();
+        assert_eq!(lts_hwe.name, "Bluefin LTS");
+    }
+
+    #[test]
+    fn family_best_match_falls_back_to_first_when_stream_unknown() {
+        // Unknown stream → first family containing the image wins.
+        let f = Family::best_match("ublue-os", "bluefin", "moonshot-fictional").unwrap();
+        // Bluefin Stable is declared first in KNOWN_FAMILIES.
+        assert_eq!(f.name, "Bluefin Stable");
+    }
+
+    #[test]
+    fn family_best_match_finds_aurora_by_image_alone() {
+        let f = Family::best_match("ublue-os", "aurora", "stable").unwrap();
+        assert_eq!(f.name, "Aurora");
+        assert!(f.images.contains(&"aurora-nvidia"));
+    }
+
+    #[test]
+    fn family_best_match_finds_bazzite_gnome_separately_from_kde() {
+        let kde = Family::best_match("ublue-os", "bazzite", "stable").unwrap();
+        assert_eq!(kde.name, "Bazzite KDE");
+
+        let gnome = Family::best_match("ublue-os", "bazzite-gnome", "stable").unwrap();
+        assert_eq!(gnome.name, "Bazzite GNOME");
+    }
+
+    #[test]
+    fn family_best_match_returns_none_for_unknown_image() {
+        assert!(Family::best_match("ublue-os", "totally-fake-image", "stable").is_none());
+    }
+
+    #[test]
+    fn family_all_for_image_returns_both_bluefin_families() {
+        let families = Family::all_for_image("ublue-os", "bluefin");
+        let names: Vec<&str> = families.iter().map(|f| f.name).collect();
+        assert!(names.contains(&"Bluefin Stable"));
+        assert!(names.contains(&"Bluefin LTS"));
     }
 
     #[test]
