@@ -354,12 +354,23 @@ impl SimpleComponent for App {
         group.add_action(sim_success_action);
         group.add_action(sim_failure_action);
         group.add_action(sim_uptodate_action);
+
+        let install_action: RelmAction<InstallAction> = {
+            let sender = sender.input_sender().clone();
+            RelmAction::new_stateless(move |_| {
+                sender.emit(AppMsg::InstallFromCheck);
+            })
+        };
+        group.add_action(install_action);
+
         group.register_for_widget(&root);
 
         // ─── Keyboard Shortcuts ─────────────────────────────────────────
         let app = relm4::main_application();
         app.set_accelerators_for_action::<QuitAction>(&["<primary>q"]);
         app.set_accelerators_for_action::<ShortcutsAction>(&["<primary>question"]);
+        app.set_accelerators_for_action::<PreferencesAction>(&["<primary>comma"]);
+        app.set_accelerators_for_action::<InstallAction>(&["<primary>i"]);
 
         // ─── Close Request Handler ──────────────────────────────────────
         // Intercept window close to warn if an update is in progress.
@@ -916,6 +927,7 @@ relm4::new_stateless_action!(RebaseAction, WindowActionGroup, "rebase-history");
 relm4::new_stateless_action!(SimSuccessAction, WindowActionGroup, "sim-success");
 relm4::new_stateless_action!(SimFailureAction, WindowActionGroup, "sim-failure");
 relm4::new_stateless_action!(SimUpToDateAction, WindowActionGroup, "sim-uptodate");
+relm4::new_stateless_action!(InstallAction, WindowActionGroup, "install");
 relm4::new_stateful_action!(DeveloperModeAction, WindowActionGroup, "dev-mode", (), bool);
 
 fn inject_app_css() {

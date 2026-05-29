@@ -70,7 +70,7 @@ def set_dev_scenario(context, app_id, scenario):
     # Re-launch with new settings in effect.
     context.execute_steps('\n'.join([
         '* Start application "finupdate" via "command"',
-        '* Wait until "Finupdate" "frame" appears in "finupdate"',
+        '* Wait until window "Finupdate" appears in "finupdate"',
     ]))
 
 
@@ -120,8 +120,8 @@ def wait_for_text(context, text, app_id, seconds):
     """Poll the AT-SPI tree for any node whose name or description contains
     `text`. Replaces noisy `findChild` regex with a bounded retry loop.
 
-    Useful for matching status-page strings ("Updates available", "Updates
-    complete", "Up to date", "failed") which may appear in any role.
+    Useful for matching status-page strings ("Ready to install", "Update
+    Complete", "Up to Date", "Update Failed") which may appear in any role.
     """
     app = getattr(context, app_id)
     deadline = time.time() + seconds
@@ -136,7 +136,20 @@ def wait_for_text(context, text, app_id, seconds):
         except Exception:
             pass  # AT-SPI tree may transiently not be queryable
         time.sleep(0.5)
-    assert False, f"Timed out after {seconds}s waiting for {text!r} in {app_id}"
+
+    # Debug: dump what IS in the tree
+    found_texts = []
+    try:
+        def collect(n):
+            name = n.name or ""
+            desc = n.description or ""
+            if name or desc:
+                found_texts.append(f"[{n.roleName}] name={name!r} desc={desc!r}")
+        app.instance.findChildren(lambda n: (collect(n), False)[1])
+    except Exception:
+        pass
+    found_summary = "\n      ".join(found_texts[:30]) if found_texts else "(nothing with name/desc found)"
+    assert False, f"Timed out after {seconds}s waiting for {text!r} in {app_id}.\n    Visible text nodes:\n      {found_summary}"
 
 
 # ── Diagnostics ───────────────────────────────────────────────────────────

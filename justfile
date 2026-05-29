@@ -63,6 +63,13 @@ reset-toolbox:
     toolbox rm -f {{ toolbox }} || true
     just setup
 
+# Install polkit rule for passwordless bootc pkexec (required for GUI tests).
+# Reads build-aux/49-finupdate.polkit.rules and copies to /etc.
+install-polkit:
+    sudo cp build-aux/49-finupdate.polkit.rules /etc/polkit-1/rules.d/49-finupdate.rules
+    sudo chmod 644 /etc/polkit-1/rules.d/49-finupdate.rules
+    @echo 
+
 # Run dogtail/behave GUI tests against the *currently installed* Flatpak,
 # inside the current GNOME Wayland session. Requires:
 #   - The Devel Flatpak is installed (`just flatpak` first).
@@ -77,6 +84,63 @@ gui-test suite="smoke" tags="":
 _gui-test-headless suite="smoke" tags="":
     qecore-headless --session-type wayland --session-desktop gnome \
         "bash -lc 'cd tests/{{ suite }} && behave features/ {{ if tags != "" { "--tags " + tags } else { "" } }}'"
+
+# Build & install gnome-ponytail-daemon + its Python module into ~/.local.
+# Dogtail needs this under Wayland to get accurate window-IDs for click/key
+# targeting.  Use this when the OS doesn't ship gnome-ponytail-daemon.
+#
+# Prerequisites: meson ninja gcc glib2-devel python3-dbus python3-gobject git
+install-ponytail:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    PREFIX="${HOME}/.local"
+    REPO="https://gitlab.gnome.org/ofourdan/gnome-ponytail-daemon.git"
+    BUILD_DIR="/tmp/gnome-ponytail-daemon-build"
+
+    echo "==> Cloning gnome-ponytail-daemon…"
+    rm -rf "${BUILD_DIR}"
+    git clone --depth 1 "${REPO}" "${BUILD_DIR}"
+    cd "${BUILD_DIR}"
+
+    # Make systemd pkg-config optional (not shipped on all images)
+    python3 - "$(pwd)/meson.build" << 'PYEOF'
+    import sys, re
+    path = sys.argv[1]
+    with open(path, 'r') as f:
+        content = f.read()
+    content = content.replace(
+        "systemd_dep = dependency('systemd')",
+        "systemd_dep = dependency('systemd', required: false)")
+    old = """servicedir = get_option('systemd_user_unit_dir')\nif servicedir == ''\n  servicedir = systemd_dep.get_pkgconfig_variable('systemduserunitdir')\nendif\n\nif servicedir == ''\n  error('Couldn\\'t determine systemd user unit service directory')\nendif"""
+    new = """servicedir = get_option('systemd_user_unit_dir')\nif systemd_dep.found()\n  if servicedir == ''\n    servicedir = systemd_dep.get_pkgconfig_variable('systemduserunitdir')\n  endif\nendif"""
+    content = content.replace(old, new)
+    with open(path, 'w') as f:
+        f.write(content)
+    PYEOF
+
+    echo "==> Building…"
+    meson setup build \
+        --prefix="${PREFIX}" \
+        -Dsystemd_user_unit_dir="${PREFIX}/share/systemd/user" \
+        -Dponytail_python=true \
+        --wrap-mode=nofallback
+    ninja -C build
+    ninja -C build install
+
+    # meson may drop the Python module into the wrong interpreter's
+    # site-packages.  Copy it to the system python3 that dogtail uses.
+    SYS_SITE=$(/usr/bin/python3 -c "import site; print(site.getusersitepackages())" 2>/dev/null || true)
+    if [ -n "${SYS_SITE}" ]; then
+        mkdir -p "${SYS_SITE}/ponytail"
+        cp ponytail/__init__.py "${SYS_SITE}/ponytail/"
+        cp ponytail/ponytail.py  "${SYS_SITE}/ponytail/"
+    fi
+
+    echo ""
+    echo "==> Done. Start the daemon with:"
+    echo "    systemctl --user daemon-reload"
+    echo "    systemctl --user enable --now gnome-ponytail-daemon.service"
+    echo "    loginctl enable-linger \$USER"
 
 # Dump the current AT-SPI tree of a running finupdate to /tmp/finupdate-tree.txt
 # Useful for writing new dogtail selectors. Run `just run` first, then this.
