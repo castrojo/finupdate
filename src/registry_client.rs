@@ -546,7 +546,7 @@ impl RegistryClient {
 
         // Fetch the full tag list.
         let tags_url = format!(
-            "https://{}/v2/{}/{}/tags/list",
+            "https://{}/v2/{}/{}/tags/list?n=1000",
             self.registry, self.org, self.image
         );
         let tag_resp: TagListResponse = client
@@ -645,7 +645,7 @@ impl RegistryClient {
     pub async fn fetch_available_tags(&self) -> Result<Vec<String>, RegistryError> {
         let token = self.get_token().await?;
         let tags_url = format!(
-            "https://{}/v2/{}/{}/tags/list",
+            "https://{}/v2/{}/{}/tags/list?n=1000",
             self.registry, self.org, self.image
         );
         let tag_resp: TagListResponse = self
