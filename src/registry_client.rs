@@ -192,6 +192,70 @@ impl Family {
             .copied()
             .or_else(|| candidates.first().copied())
     }
+
+    /// The first image name is treated as the family's *base* — every other
+    /// image in `images` is derived from it by adding feature suffixes.
+    /// E.g. Bluefin Stable's base is "bluefin"; "bluefin-nvidia" is "bluefin"
+    /// plus the {nvidia} feature; "bluefin-dx-nvidia" is base + {dx, nvidia}.
+    pub fn base_image(&self) -> &'static str {
+        self.images.first().copied().unwrap_or("")
+    }
+
+    /// Atomic feature suffixes available in this family — derived from the
+    /// image names by splitting each non-base image's suffix on '-'. Powers
+    /// the SwitchRow list in the rebase dialog: e.g. Bluefin Stable yields
+    /// `["asus", "dx", "framework", "nvidia", "open", "surface"]`.
+    ///
+    /// The order is alphabetical for stable UI rendering. Not every
+    /// combination is valid — call [`Family::select_image_for_features`] to
+    /// resolve a switch state to a concrete image (returns `None` if no
+    /// image in the family has that exact combination).
+    pub fn available_features(&self) -> Vec<&'static str> {
+        let base = self.base_image();
+        let mut set: std::collections::BTreeSet<&'static str> = Default::default();
+        for img in self.images {
+            if *img == base {
+                continue;
+            }
+            if let Some(suffix) = img.strip_prefix(&format!("{}-", base)) {
+                for atom in suffix.split('-') {
+                    set.insert(atom);
+                }
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Given a set of selected atomic features (`features`), find the image
+    /// name in this family whose suffix is exactly that set.
+    ///
+    /// Returns `Some(image_name)` when the combination matches a published
+    /// image (`"bluefin"` for `[]`, `"bluefin-nvidia"` for `["nvidia"]`,
+    /// `"bluefin-dx-nvidia"` for `["dx", "nvidia"]`), or `None` if no image
+    /// matches (e.g. `["open"]` alone — open driver requires nvidia).
+    pub fn select_image_for_features(&self, features: &[&str]) -> Option<&'static str> {
+        let base = self.base_image();
+        if features.is_empty() {
+            return self.images.iter().copied().find(|i| *i == base);
+        }
+        for img in self.images {
+            if *img == base {
+                continue;
+            }
+            let suffix = match img.strip_prefix(&format!("{}-", base)) {
+                Some(s) => s,
+                None => continue,
+            };
+            let mut have: Vec<&str> = suffix.split('-').collect();
+            have.sort();
+            let mut want: Vec<&str> = features.iter().copied().collect();
+            want.sort();
+            if have == want {
+                return Some(img);
+            }
+        }
+        None
+    }
 }
 
 // ── Internal GHCR API types ───────────────────────────────────────────────────
@@ -1050,6 +1114,83 @@ mod tests {
     #[test]
     fn family_best_match_returns_none_for_unknown_image() {
         assert!(Family::best_match("ublue-os", "totally-fake-image", "stable").is_none());
+    }
+
+    // ── Family feature switches ─────────────────────────────────────────
+
+    #[test]
+    fn family_base_image_is_first_in_list() {
+        let bluefin = Family::best_match("ublue-os", "bluefin", "stable").unwrap();
+        assert_eq!(bluefin.base_image(), "bluefin");
+        let dakota = Family::best_match("projectbluefin", "dakota", "latest").unwrap();
+        assert_eq!(dakota.base_image(), "dakota");
+    }
+
+    #[test]
+    fn family_available_features_lists_atomic_suffixes() {
+        let bluefin = Family::best_match("ublue-os", "bluefin", "stable").unwrap();
+        let feats = bluefin.available_features();
+        // From images like bluefin-nvidia / bluefin-nvidia-open / bluefin-dx /
+        // bluefin-dx-nvidia / bluefin-dx-nvidia-open / bluefin-asus / etc.
+        assert!(feats.contains(&"nvidia"));
+        assert!(feats.contains(&"open"));
+        assert!(feats.contains(&"dx"));
+        assert!(feats.contains(&"asus"));
+        assert!(feats.contains(&"surface"));
+        assert!(feats.contains(&"framework"));
+        // Alphabetical for stable UI rendering.
+        let mut sorted = feats.clone();
+        sorted.sort();
+        assert_eq!(feats, sorted);
+    }
+
+    #[test]
+    fn family_select_image_for_features_resolves_combinations() {
+        let bluefin = Family::best_match("ublue-os", "bluefin", "stable").unwrap();
+
+        // Empty features → base.
+        assert_eq!(bluefin.select_image_for_features(&[]), Some("bluefin"));
+        // Single feature.
+        assert_eq!(
+            bluefin.select_image_for_features(&["nvidia"]),
+            Some("bluefin-nvidia")
+        );
+        assert_eq!(bluefin.select_image_for_features(&["dx"]), Some("bluefin-dx"));
+        // Two features, order-independent.
+        assert_eq!(
+            bluefin.select_image_for_features(&["dx", "nvidia"]),
+            Some("bluefin-dx-nvidia")
+        );
+        assert_eq!(
+            bluefin.select_image_for_features(&["nvidia", "dx"]),
+            Some("bluefin-dx-nvidia")
+        );
+        // Three features — Bluefin Stable ships bluefin-dx-nvidia-open.
+        assert_eq!(
+            bluefin.select_image_for_features(&["dx", "nvidia", "open"]),
+            Some("bluefin-dx-nvidia-open")
+        );
+    }
+
+    #[test]
+    fn family_select_image_for_features_returns_none_for_invalid_combo() {
+        let bluefin = Family::best_match("ublue-os", "bluefin", "stable").unwrap();
+        // "open" alone (without nvidia) doesn't map to a published image.
+        assert!(bluefin.select_image_for_features(&["open"]).is_none());
+        // "dx" + "framework" isn't a real combination.
+        assert!(bluefin
+            .select_image_for_features(&["dx", "framework"])
+            .is_none());
+    }
+
+    #[test]
+    fn family_select_image_for_dakota_features() {
+        let dakota = Family::best_match("projectbluefin", "dakota", "latest").unwrap();
+        assert_eq!(dakota.select_image_for_features(&[]), Some("dakota"));
+        assert_eq!(
+            dakota.select_image_for_features(&["nvidia"]),
+            Some("dakota-nvidia")
+        );
     }
 
     #[test]
