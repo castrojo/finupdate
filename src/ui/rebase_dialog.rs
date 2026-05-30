@@ -258,11 +258,17 @@ fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>, variant: &st
             .expect("tokio runtime");
 
         rt.block_on(async move {
-            let result = match RegistryClient::detect().await {
-                None => FetchResult::DetectFailed,
-                Some(client) => match client.fetch_versions(90).await {
+            // Migrated from RegistryClient::detect + fetch_versions(90) to
+            // the service layer. current_image() honours mock_identity →
+            // bootc status → os-release; list_versions delegates to
+            // fetch_versions internally with the config-blob date harvest
+            // included. Same observable behaviour; future alternative
+            // frontends share the same code path.
+            let svc = service::global();
+            let result = match svc.current_image().await {
+                Err(_) => FetchResult::DetectFailed,
+                Ok(image) => match svc.list_versions(&image, 8).await {
                     Ok(mut versions) => {
-                        // Filter versions to the selected variant if specified
                         if !variant_str.is_empty() && variant_str != "default" {
                             versions.retain(|v| v.version.contains(&variant_str));
                         }
