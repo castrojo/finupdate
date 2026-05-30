@@ -435,3 +435,80 @@ fn pill_path(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.arc(x + r, y + r, r, PI, 3.0 * PI / 2.0);
     cr.close_path();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── module_to_seg ───────────────────────────────────────────────────
+    // Maps a uupd module key onto one of the three visible segments of the
+    // progress bar. brew + distrobox share segment 2 ("Developer Tools").
+
+    #[test]
+    fn system_maps_to_first_segment() {
+        assert_eq!(module_to_seg("system"), Some(0));
+    }
+
+    #[test]
+    fn flatpak_maps_to_second_segment() {
+        assert_eq!(module_to_seg("flatpak"), Some(1));
+    }
+
+    #[test]
+    fn brew_maps_to_third_segment() {
+        assert_eq!(module_to_seg("brew"), Some(2));
+    }
+
+    #[test]
+    fn distrobox_shares_third_segment_with_brew() {
+        // brew and distrobox both render under the "Developer Tools" pill.
+        assert_eq!(module_to_seg("distrobox"), Some(2));
+        assert_eq!(module_to_seg("distrobox"), module_to_seg("brew"));
+    }
+
+    #[test]
+    fn unknown_module_returns_none() {
+        assert!(module_to_seg("mystery").is_none());
+        assert!(module_to_seg("").is_none());
+    }
+
+    // ── same_segment ────────────────────────────────────────────────────
+    // Callers use this to skip the "complete previous module" transition
+    // when the previous and incoming module share a segment (e.g. brew →
+    // distrobox shouldn't visually "complete" before going to "running"
+    // again).
+
+    #[test]
+    fn same_segment_brew_and_distrobox() {
+        assert!(same_segment("brew", "distrobox"));
+        assert!(same_segment("distrobox", "brew"));
+    }
+
+    #[test]
+    fn same_segment_self() {
+        assert!(same_segment("system", "system"));
+    }
+
+    #[test]
+    fn same_segment_distinct_modules() {
+        assert!(!same_segment("system", "flatpak"));
+        assert!(!same_segment("flatpak", "brew"));
+    }
+
+    #[test]
+    fn same_segment_unknown_vs_known() {
+        // An unknown module should never share a segment with a known one.
+        assert!(!same_segment("mystery", "system"));
+        assert!(!same_segment("flatpak", "mystery"));
+    }
+
+    #[test]
+    fn same_segment_two_unknowns_reports_same() {
+        // Both unknowns map to None, so `Option::eq` returns true. The
+        // caller (UpdateList state machine) never actually feeds unknown
+        // modules into this — `detect_module_start` is the only producer
+        // and it returns Some for the 4 known modules or None. Pin the
+        // behaviour anyway so a future refactor doesn't quietly change it.
+        assert!(same_segment("mystery", "another-mystery"));
+    }
+}
