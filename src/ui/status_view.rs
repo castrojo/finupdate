@@ -905,8 +905,9 @@ impl SimpleComponent for StatusView {
 
         // Boxed List Settings Card (Left sidebar settings style)
         let check_row = adw::ActionRow::builder()
-            .title("Check for updates")
+            .title("_Check for updates")
             .subtitle("System image, Flatpak, Homebrew, and Distrobox")
+            .use_underline(true)
             .build();
         let check_btn = gtk::Button::with_label("Check");
         check_btn.add_css_class("pill");
@@ -918,7 +919,8 @@ impl SimpleComponent for StatusView {
         check_row.add_suffix(&check_btn);
 
         let auto_row = adw::ActionRow::builder()
-            .title("Automatic updates")
+            .title("_Automatic updates")
+            .use_underline(true)
             .build();
         let auto_update_switch = gtk::Switch::builder()
             .active(auto_updates_enabled)
@@ -932,8 +934,9 @@ impl SimpleComponent for StatusView {
 
         // Registry/Image source row
         let source_row = adw::ActionRow::builder()
-            .title("Image source")
+            .title("Image _source")
             .activatable(true)
+            .use_underline(true)
             .build();
         source_row.set_accessible_role(gtk::AccessibleRole::Button);
         let source_sub_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -951,8 +954,9 @@ impl SimpleComponent for StatusView {
 
         // Image history row
         let history_row = adw::ActionRow::builder()
-            .title("Image history")
+            .title("Image _history")
             .activatable(true)
+            .use_underline(true)
             .build();
         history_row.set_accessible_role(gtk::AccessibleRole::Button);
         let history_sub_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -985,9 +989,10 @@ impl SimpleComponent for StatusView {
         // action). Mirrors the CcListRow pattern from gnome-control-center
         // (accessible-role: button on every activatable Adw.ActionRow).
         let powerwash_row = adw::ActionRow::builder()
-            .title("Powerwash")
-            .subtitle("Reset settings and apps. Keep your files.")
+            .title("_Powerwash")
+            .subtitle("Reset settings and apps; keep files")
             .activatable(true)
+            .use_underline(true)
             .build();
         powerwash_row.set_accessible_role(gtk::AccessibleRole::Button);
         let pw_chev = gtk::Image::from_icon_name("go-next-symbolic");
@@ -999,9 +1004,10 @@ impl SimpleComponent for StatusView {
         });
 
         let factory_row = adw::ActionRow::builder()
-            .title("Factory reset")
-            .subtitle("Erase everything and start fresh.")
+            .title("_Factory reset")
+            .subtitle("Erase everything and start fresh")
             .activatable(true)
+            .use_underline(true)
             .build();
         factory_row.set_accessible_role(gtk::AccessibleRole::Button);
         factory_row.add_css_class("destructive-title");
