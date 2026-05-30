@@ -314,6 +314,32 @@ Feature: Finupdate smoke tests
       | aurora   | ghcr.io/ublue-os/aurora:stable        | aurora     |
       | dakota   | ghcr.io/projectbluefin/dakota:latest  | dakota     |
 
+  # ── Feature switches: rebase dialog shows the right family's atomic switches ─
+  # The rebase dialog populates one SwitchRow per Family::available_features()
+  # entry (populate_family_switches in src/ui/rebase_dialog.rs). Dakota has only
+  # the `nvidia` feature; Bluefin Stable has the full slate. Confirms the
+  # Iteration B wiring surfaces the correct labels per the booted family
+  # instead of the old hardcoded Dakota/Dakota-Nvidia ToggleButtons.
+
+  @live @mock_identity @features
+  Scenario: Dakota rebase dialog exposes only the NVIDIA feature switch
+    * Mock identity "ghcr.io/projectbluefin/dakota:latest" is configured
+    * Wait until "dakota" appears in "finupdate" within 15 seconds
+    * Key combo: "<Control><Shift>r"
+    * Wait until "NVIDIA drivers (proprietary)" appears in "finupdate" within 20 seconds
+    * Application "finupdate" is running
+    * Key combo: "Escape"
+
+  @live @mock_identity @features
+  Scenario: Bluefin Stable rebase dialog exposes the developer + NVIDIA switches
+    * Mock identity "ghcr.io/ublue-os/bluefin:stable" is configured
+    * Wait until "bluefin" appears in "finupdate" within 15 seconds
+    * Key combo: "<Control><Shift>r"
+    * Wait until "Developer extras (DX)" appears in "finupdate" within 20 seconds
+    * Wait until "NVIDIA drivers (proprietary)" appears in "finupdate" within 5 seconds
+    * Application "finupdate" is running
+    * Key combo: "Escape"
+
   # ── Changelog flow: app stays stable while real GHCR + GitHub data loads ─
   # We don't assert exact rendered strings (the changelog area's AT-SPI
   # exposure is patchy under GTK4) — we assert the home-page anchors stay

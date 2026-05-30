@@ -810,13 +810,30 @@ impl SimpleComponent for App {
             }
 
             AppMsg::ShowRebaseDialog => {
-                if let Some(root) = self.status_view.widget().root() {
-                    if let Some(window) = root.downcast_ref::<adw::ApplicationWindow>() {
-                        // Treat dry_run as equivalent to dev_mode for the rebase
-                        // dialog — both route to the simulated-rebase path that
-                        // prints `Would have called bootc switch`.
+                tracing::info!("ShowRebaseDialog handler reached");
+                let window_opt = self
+                    .status_view
+                    .widget()
+                    .root()
+                    .and_then(|r| r.downcast::<adw::ApplicationWindow>().ok())
+                    .or_else(|| {
+                        // Fallback: ask the GtkApplication for its active window.
+                        // status_view.widget().root() returns None when the
+                        // accelerator fires before the StatusView's gtk::Stack
+                        // has been parented into the toplevel.
+                        relm4::main_application()
+                            .active_window()
+                            .and_then(|w| w.downcast::<adw::ApplicationWindow>().ok())
+                    });
+                match window_opt {
+                    Some(window) => {
                         let suppress_real = self.settings.dev_mode || self.settings.dry_run;
-                        show_rebase_dialog(window, suppress_real);
+                        show_rebase_dialog(&window, suppress_real);
+                    }
+                    None => {
+                        tracing::warn!(
+                            "ShowRebaseDialog: no ApplicationWindow found via either status_view root or main_application active_window"
+                        );
                     }
                 }
             }
