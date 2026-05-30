@@ -785,16 +785,50 @@ fn update_details(
 // ── Rebase worker ────────────────────────────────────────────────────────────
 
 fn run_rebase(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog) {
-    // Show a simple progress page while rebasing.
+    // Build a progress page with a pulsing ProgressBar + elapsed-time label.
+    // A live `bootc switch` measured against ghcr.io took 2m28s for a full
+    // dakota-nvidia pull on a residential link — too long for a bare spinner.
+    // Pulse mode (no fraction) is the honest representation until we parse
+    // bootc's per-layer progress lines (task #24 phase 2).
+    let progress_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_top(12)
+        .margin_bottom(24)
+        .build();
+
+    let progress_bar = gtk::ProgressBar::new();
+    progress_bar.set_pulse_step(0.08);
+    progress_box.append(&progress_bar);
+
+    let elapsed_label = gtk::Label::new(Some("Elapsed: 0:00"));
+    elapsed_label.add_css_class("dim-label");
+    elapsed_label.add_css_class("caption");
+    progress_box.append(&elapsed_label);
+
     let progress_page = adw::StatusPage::builder()
         .title("Rebasing…")
-        .description("Switching to the selected image.\nThis may take a few minutes.")
+        .description("Pulling the new image layers. This typically takes 2–5 minutes.")
         .build();
-    let spinner = gtk::Spinner::new();
-    spinner.set_spinning(true);
-    progress_page.set_child(Some(&spinner));
+    progress_page.set_child(Some(&progress_box));
     stack.add_named(&progress_page, Some("rebasing"));
     stack.set_visible_child_name("rebasing");
+
+    // Animate the pulse + elapsed clock until the operation completes.
+    let start = std::time::Instant::now();
+    let bar_clone = progress_bar.clone();
+    let label_clone = elapsed_label.clone();
+    let pulse_handle: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let pulse_handle_store = pulse_handle.clone();
+    let id = glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        bar_clone.pulse();
+        let secs = start.elapsed().as_secs();
+        label_clone.set_text(&format!("Elapsed: {}:{:02}", secs / 60, secs % 60));
+        glib::ControlFlow::Continue
+    });
+    *pulse_handle_store.borrow_mut() = Some(id);
 
     let result_slot: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
     let result_bg = result_slot.clone();
@@ -815,6 +849,10 @@ fn run_rebase(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog) {
         let Some(result) = result_slot.lock().ok().and_then(|mut g| g.take()) else {
             return glib::ControlFlow::Continue;
         };
+        // Stop the pulse animation now that we have a final result.
+        if let Some(id) = pulse_handle.borrow_mut().take() {
+            id.remove();
+        }
         match result {
             Ok(()) => {
                 // Show success page — user needs to reboot.
