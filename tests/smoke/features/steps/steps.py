@@ -46,6 +46,34 @@ def _write_settings(**overrides) -> None:
     path.write_text(json.dumps(current, indent=2))
 
 
+def _force_close_finupdate(context) -> None:
+    """Tear down finupdate without relying on qecore's `close_via_shortcut`.
+
+    Ctrl+Q is bound (app.rs:414) but qecore's shortcut path waits 30s for the
+    AT-SPI process to vanish, and that wait races against the GTK main loop —
+    if a live GHCR fetch is mid-flight when Quit fires, the close can stall
+    long enough for qecore to assert-fail, marking the scenario broken even
+    when the test itself passed. SIGTERM via `pkill -x` is reliable; the next
+    `Start application "finupdate" via "command"` step creates a fresh
+    process either way.
+    """
+    import subprocess
+    subprocess.run(["pkill", "-x", "finupdate"], check=False)
+    # Wait briefly for the AT-SPI tree to drop the app so the next launch
+    # doesn't race against a still-disappearing handle.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            from dogtail.tree import root
+            root.application("finupdate")
+        except Exception:
+            break
+        time.sleep(0.2)
+    # Invalidate qecore's cached handle so the next launch is clean.
+    if getattr(context, "finupdate", None) and hasattr(context.finupdate, "instance"):
+        context.finupdate.instance = None
+
+
 # ── Dev-mode scenario setup ───────────────────────────────────────────────
 
 @step('Application "{app_id}" is in developer mode with scenario "{scenario}"')
@@ -62,8 +90,7 @@ def set_dev_scenario(context, app_id, scenario):
 
     # The app must not be running when we touch settings; otherwise it may
     # overwrite our changes when closing. qecore tracks this via context.
-    if context.finupdate.instance:
-        context.execute_steps('* Close application "finupdate" via "shortcut"')
+    _force_close_finupdate(context)
 
     _write_settings(dev_mode=True, sim_scenario=scenario)
 
@@ -169,8 +196,7 @@ def disable_dev_mode(context, app_id):
     """
     assert app_id == "finupdate", f"Unknown app_id: {app_id}"
 
-    if context.finupdate.instance:
-        context.execute_steps('* Close application "finupdate" via "shortcut"')
+    _force_close_finupdate(context)
 
     _write_settings(dev_mode=False, dry_run=True)
 
@@ -206,8 +232,7 @@ def configure_mock_identity(context, full_ref):
     org, rest = rest.split("/", 1)
     image, tag = rest.rsplit(":", 1)
 
-    if context.finupdate.instance:
-        context.execute_steps('* Close application "finupdate" via "shortcut"')
+    _force_close_finupdate(context)
 
     _write_settings(
         dev_mode=True,

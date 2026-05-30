@@ -47,6 +47,50 @@ preflight: check lint test
 bench-network ref:
     build-aux/bench-network.sh {{ ref }}
 
+# Iterate the @strict_count matrix one family at a time with a clean
+# finupdate process per scenario so AT-SPI state can't leak between runs,
+# and a per-family timeout (120s) so a stuck probe can't stall the loop.
+# Reports a pass/fail tally and exits non-zero if any failed.
+#
+# This is the testing loop for verifying every family publishes >= 8 dated
+# tags reachable via GHCR pagination (the n=1000 fix in registry_client.rs).
+#
+# Usage:
+#   just test-strict-count                     # all 12 families
+#   just test-strict-count bluefin             # one family
+#   just test-strict-count "aurora bazzite"    # subset
+test-strict-count families="":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    list="{{ families }}"
+    if [ -z "$list" ]; then
+        list="bluefin bluefin-nvidia-open bluefin-dx bluefin-dx-nvidia-open \
+              aurora aurora-dx \
+              bazzite bazzite-nvidia bazzite-deck bazzite-deck-nvidia \
+              dakota ucore"
+    fi
+    pass=()
+    fail=()
+    for f in $list; do
+        echo
+        echo "▶ strict_count: $f"
+        pkill -x finupdate 2>/dev/null || true
+        sleep 1
+        if (cd tests/smoke && timeout 120 behave features/finupdate.feature \
+                --tags @strict_count -n "for $f -- @" \
+                --no-capture --no-capture-stderr); then
+            pass+=("$f")
+        else
+            fail+=("$f")
+        fi
+    done
+    pkill -x finupdate 2>/dev/null || true
+    echo
+    echo "─────── strict_count tally ───────"
+    echo "PASSED (${#pass[@]}): ${pass[*]:-}"
+    echo "FAILED (${#fail[@]}): ${fail[*]:-}"
+    [ ${#fail[@]} -eq 0 ]
+
 # Run unit tests inside the toolbox
 test:
     toolbox run --container {{ toolbox }} cargo test --all-targets

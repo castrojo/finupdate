@@ -248,19 +248,19 @@ Feature: Finupdate smoke tests
     * Application "finupdate" is running
 
     Examples:
-      | family               | full_ref                                          | image_name            |
-      | bluefin              | ghcr.io/ublue-os/bluefin:stable                   | bluefin               |
-      | bluefin-nvidia       | ghcr.io/ublue-os/bluefin-nvidia:stable            | bluefin-nvidia        |
-      | bluefin-dx           | ghcr.io/ublue-os/bluefin-dx:stable                | bluefin-dx            |
-      | bluefin-dx-nvidia    | ghcr.io/ublue-os/bluefin-dx-nvidia:stable         | bluefin-dx-nvidia     |
-      | aurora               | ghcr.io/ublue-os/aurora:stable                    | aurora                |
-      | aurora-dx            | ghcr.io/ublue-os/aurora-dx:stable                 | aurora-dx             |
-      | bazzite              | ghcr.io/ublue-os/bazzite:stable                   | bazzite               |
-      | bazzite-nvidia       | ghcr.io/ublue-os/bazzite-nvidia:stable            | bazzite-nvidia        |
-      | bazzite-deck         | ghcr.io/ublue-os/bazzite-deck:stable              | bazzite-deck          |
-      | bazzite-deck-nvidia  | ghcr.io/ublue-os/bazzite-deck-nvidia:stable       | bazzite-deck-nvidia   |
-      | ucore                | ghcr.io/ublue-os/ucore:stable                     | ucore                 |
-      | dakota               | ghcr.io/projectbluefin/dakota:latest              | dakota                |
+      | family                  | full_ref                                            | image_name              |
+      | bluefin                 | ghcr.io/ublue-os/bluefin:stable                     | bluefin                 |
+      | bluefin-nvidia-open     | ghcr.io/ublue-os/bluefin-nvidia-open:stable         | bluefin-nvidia-open     |
+      | bluefin-dx              | ghcr.io/ublue-os/bluefin-dx:stable                  | bluefin-dx              |
+      | bluefin-dx-nvidia-open  | ghcr.io/ublue-os/bluefin-dx-nvidia-open:stable      | bluefin-dx-nvidia-open  |
+      | aurora                  | ghcr.io/ublue-os/aurora:stable                      | aurora                  |
+      | aurora-dx               | ghcr.io/ublue-os/aurora-dx:stable                   | aurora-dx               |
+      | bazzite                 | ghcr.io/ublue-os/bazzite:stable                     | bazzite                 |
+      | bazzite-nvidia          | ghcr.io/ublue-os/bazzite-nvidia:stable              | bazzite-nvidia          |
+      | bazzite-deck            | ghcr.io/ublue-os/bazzite-deck:stable                | bazzite-deck            |
+      | bazzite-deck-nvidia     | ghcr.io/ublue-os/bazzite-deck-nvidia:stable         | bazzite-deck-nvidia     |
+      | ucore                   | ghcr.io/ublue-os/ucore:stable                       | ucore                   |
+      | dakota                  | ghcr.io/projectbluefin/dakota:latest                | dakota                  |
 
   # ── Strict history population: each family must reach N entries ──────
   # `image history shows at least N` polls for "N images" labels in the
@@ -276,20 +276,20 @@ Feature: Finupdate smoke tests
     * Application "finupdate" is running
 
     Examples:
-      | family               | full_ref                                          | image_name            | min_count |
-      | bluefin              | ghcr.io/ublue-os/bluefin:stable                   | bluefin               |         8 |
-      | bluefin-nvidia       | ghcr.io/ublue-os/bluefin-nvidia:stable            | bluefin-nvidia        |         8 |
-      | bluefin-dx           | ghcr.io/ublue-os/bluefin-dx:stable                | bluefin-dx            |         8 |
-      | bluefin-dx-nvidia    | ghcr.io/ublue-os/bluefin-dx-nvidia:stable         | bluefin-dx-nvidia     |         8 |
-      | aurora               | ghcr.io/ublue-os/aurora:stable                    | aurora                |         8 |
-      | aurora-dx            | ghcr.io/ublue-os/aurora-dx:stable                 | aurora-dx             |         8 |
-      | bazzite              | ghcr.io/ublue-os/bazzite:stable                   | bazzite               |         8 |
-      | bazzite-nvidia       | ghcr.io/ublue-os/bazzite-nvidia:stable            | bazzite-nvidia        |         8 |
-      | bazzite-deck         | ghcr.io/ublue-os/bazzite-deck:stable              | bazzite-deck          |         8 |
-      | bazzite-deck-nvidia  | ghcr.io/ublue-os/bazzite-deck-nvidia:stable       | bazzite-deck-nvidia   |         8 |
-      | dakota               | ghcr.io/projectbluefin/dakota:latest              | dakota                |         8 |
+      | family                  | full_ref                                            | image_name              | min_count |
+      | bluefin                 | ghcr.io/ublue-os/bluefin:stable                     | bluefin                 |         8 |
+      | bluefin-nvidia-open     | ghcr.io/ublue-os/bluefin-nvidia-open:stable         | bluefin-nvidia-open     |         8 |
+      | bluefin-dx              | ghcr.io/ublue-os/bluefin-dx:stable                  | bluefin-dx              |         8 |
+      | bluefin-dx-nvidia-open  | ghcr.io/ublue-os/bluefin-dx-nvidia-open:stable      | bluefin-dx-nvidia-open  |         8 |
+      | aurora                  | ghcr.io/ublue-os/aurora:stable                      | aurora                  |         8 |
+      | aurora-dx               | ghcr.io/ublue-os/aurora-dx:stable                   | aurora-dx               |         8 |
+      | bazzite                 | ghcr.io/ublue-os/bazzite:stable                     | bazzite                 |         8 |
+      | bazzite-nvidia          | ghcr.io/ublue-os/bazzite-nvidia:stable              | bazzite-nvidia          |         8 |
+      | bazzite-deck            | ghcr.io/ublue-os/bazzite-deck:stable                | bazzite-deck            |         8 |
+      | bazzite-deck-nvidia     | ghcr.io/ublue-os/bazzite-deck-nvidia:stable         | bazzite-deck-nvidia     |         8 |
+      | dakota                  | ghcr.io/projectbluefin/dakota:latest                | dakota                  |         8 |
       # ucore's stable channel last published 2023-03-30 — accept 1 (latest fallback)
-      | ucore                | ghcr.io/ublue-os/ucore:stable                     | ucore                 |         1 |
+      | ucore                   | ghcr.io/ublue-os/ucore:stable                       | ucore                   |         1 |
 
   # ── Rollback flow: open the Rebase dialog and load real version history ─
   # Drives the rebase dialog (Ctrl+Shift+R), waits for a version-list signal
