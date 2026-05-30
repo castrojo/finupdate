@@ -156,16 +156,18 @@ pub const KNOWN_FAMILIES: &[Family] = &[
         images: &["bazzite-gnome", "bazzite-gnome-nvidia"],
         streams: &["stable", "testing", "unstable", "latest"],
     },
-    Family {
-        name: "ucore",
-        org: "ublue-os",
-        images: &["ucore", "ucore-hci", "ucore-zfs"],
-        streams: &["stable", "testing", "latest"],
-    },
+    // ucore intentionally omitted — server image, out of scope for the
+    // desktop bootc settings app. If you ever booted a finupdate user onto
+    // ucore by accident, the "Family not recognized" fallback in the rebase
+    // dialog catches it.
     Family {
         name: "Bluefin Dakota",
         org: "projectbluefin",
-        images: &["dakota", "dakota-nvidia", "dakota-dx", "dakota-dx-nvidia"],
+        // Only `dakota` and `dakota-nvidia` are published on GHCR (verified
+        // 2026-05-30). The Bluefin/Aurora-style -dx and -nvidia-open variants
+        // don't exist for Dakota — leaving them here would let the rebase
+        // dialog show feature switches that resolve to bogus refs.
+        images: &["dakota", "dakota-nvidia"],
         streams: &["latest"],
     },
 ];
@@ -560,26 +562,51 @@ impl RegistryClient {
         // Parse every dated tag for this stream. No date-window filter:
         // CANDIDATE_CAP below already bounds the work, and a window starves
         // stale variants of history (bluefin-nvidia stopped publishing
-        // stable-daily in 2025-10; ucore in 2023-03 — their last 8 tags
-        // are still the rollback targets users care about).
+        // stable-daily in 2025-10 — their last 8 tags are still the rollback
+        // targets users care about).
         let mut candidate_tags: Vec<(NaiveDate, String)> = tag_resp
             .tags
             .iter()
             .filter_map(|tag| parse_dated_tag(tag, &self.stream).map(|d| (d, tag.clone())))
             .collect();
 
-        // Sort by date DESC and cap at HISTORY_MAX, since the home page never
-        // displays more. Measured against live GHCR: 16 parallel manifest
-        // HEADs took ~8s for ublue-os/bluefin; 8 cuts that roughly in half
-        // and removes a real freeze on every launch. If we ever start showing
-        // more than 8 entries this needs to grow with it.
+        // Sort by date DESC, but DO NOT truncate yet — if we're short of
+        // CANDIDATE_CAP we'll supplement via the sha-tag config-blob harvest
+        // below, and a final sort+truncate happens after that.
         const CANDIDATE_CAP: usize = 8;
+        const SHA_PROBE_CAP: usize = 30;
         candidate_tags.sort_by(|a, b| b.0.cmp(&a.0));
+
+        // Slow path: dakota-nvidia and similar images publish via sha-only
+        // tags (40-hex commit shas) rather than dated names. parse_dated_tag
+        // can't surface them, so we probe up to SHA_PROBE_CAP sha-tagged
+        // manifests and ask their config blobs for `created` timestamps.
+        // Two HTTP calls per probe (manifest + config blob), bounded by an
+        // 8-way semaphore — measured at ~2-4s for 30 probes against
+        // ghcr.io. Only runs when dated tags came up short.
+        if candidate_tags.len() < CANDIDATE_CAP {
+            let sha_tags: Vec<String> = tag_resp
+                .tags
+                .iter()
+                .filter(|t| is_sha_only_tag(t))
+                .take(SHA_PROBE_CAP)
+                .cloned()
+                .collect();
+            if !sha_tags.is_empty() {
+                let probed = self
+                    .probe_sha_tag_dates(&sha_tags, &token, &client)
+                    .await;
+                candidate_tags.extend(probed);
+                candidate_tags.sort_by(|a, b| b.0.cmp(&a.0));
+            }
+        }
+
         candidate_tags.truncate(CANDIDATE_CAP);
 
         if candidate_tags.is_empty() {
-            // Fallback: no dated tags found — try fetching the latest tag directly.
-            // This handles images like Dakota that only publish a :latest tag.
+            // Fallback: nothing dated and nothing sha-probable — try the
+            // `latest` tag with today's date as a synthetic placeholder.
+            // Last resort for images that only ship :latest with no history.
             let latest_tag = "latest";
             if tag_resp.tags.contains(&latest_tag.to_string()) {
                 let today = Utc::now().date_naive();
@@ -633,6 +660,48 @@ impl RegistryClient {
 
         versions.sort_by_key(|v| v.date);
         Ok(versions)
+    }
+
+    /// For each sha-tagged manifest in `tags`, read the config blob's
+    /// `created` timestamp and pair it with the tag. Used as a fallback when
+    /// tag names don't carry a date — dakota-nvidia publishes via 40-hex
+    /// commit shas, so the config blob is the only reliable date source.
+    ///
+    /// Two HTTP calls per tag (manifest GET + config blob GET), bounded by
+    /// an 8-way semaphore so we don't fan out 60 calls against ghcr.io at
+    /// once. Probes that fail (network, missing config blob, unparseable
+    /// `created`) are silently dropped — the caller treats the result set
+    /// as best-effort.
+    async fn probe_sha_tag_dates(
+        &self,
+        tags: &[String],
+        token: &str,
+        client: &reqwest::Client,
+    ) -> Vec<(NaiveDate, String)> {
+        let sema = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+        let futs: Vec<_> = tags
+            .iter()
+            .map(|tag| {
+                let client = client.clone();
+                let registry = self.registry.clone();
+                let org = self.org.clone();
+                let image = self.image.clone();
+                let token = token.to_string();
+                let tag = tag.clone();
+                let sema = sema.clone();
+                async move {
+                    let _permit = sema.acquire().await.ok();
+                    probe_config_created(&client, &registry, &org, &image, &tag, &token)
+                        .await
+                        .map(|date| (date, tag))
+                }
+            })
+            .collect();
+        futures::future::join_all(futs)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// Return the tags available for this image, organised for the tag selector:
@@ -741,6 +810,69 @@ async fn fetch_version(
         revision,
         created,
     })
+}
+
+/// True for tags that look like a 40-char lowercase commit sha — the form
+/// dakota-nvidia and many CI-driven images use exclusively.
+fn is_sha_only_tag(tag: &str) -> bool {
+    tag.len() == 40
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+}
+
+/// Probe a single tag's config blob for its `created` timestamp.
+///
+/// Returns the date in UTC (truncated to a NaiveDate to match the rest of
+/// the version-list flow) or None on any failure: network error, an OCI
+/// index (multi-arch) where we can't single-out a platform manifest, a
+/// missing config digest, missing `created` field, or an unparseable
+/// RFC3339 timestamp. The caller treats None as "don't include this tag."
+///
+/// Used by `RegistryClient::probe_sha_tag_dates` to surface history for
+/// images that publish via sha-tagged manifests without dated tag names.
+async fn probe_config_created(
+    client: &reqwest::Client,
+    registry: &str,
+    org: &str,
+    image: &str,
+    tag: &str,
+    token: &str,
+) -> Option<NaiveDate> {
+    let manifest_url = format!("https://{registry}/v2/{org}/{image}/manifests/{tag}");
+    let resp = client
+        .get(&manifest_url)
+        .bearer_auth(token)
+        .header(
+            "Accept",
+            "application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let manifest: serde_json::Value = resp.json().await.ok()?;
+    let config_digest = manifest
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())?;
+
+    let blob_url = format!("https://{registry}/v2/{org}/{image}/blobs/{config_digest}");
+    let config: serde_json::Value = client
+        .get(&blob_url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+
+    let created_str = config.get("created").and_then(|v| v.as_str())?;
+    let dt = DateTime::parse_from_rfc3339(created_str).ok()?;
+    Some(dt.with_timezone(&Utc).date_naive())
 }
 
 /// Build a shared reqwest client with a reasonable timeout.
@@ -905,6 +1037,47 @@ fn strip_date_suffix(tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── is_sha_only_tag ──────────────────────────────────────────────────
+
+    #[test]
+    fn is_sha_only_tag_accepts_40_hex() {
+        assert!(is_sha_only_tag(
+            "fc308c8515de8b2f134bc0cbe756cc738c4870e1"
+        ));
+    }
+
+    #[test]
+    fn is_sha_only_tag_rejects_short_sha() {
+        assert!(!is_sha_only_tag("fc308c8"));
+    }
+
+    #[test]
+    fn is_sha_only_tag_rejects_long_sha() {
+        assert!(!is_sha_only_tag(&"a".repeat(41)));
+    }
+
+    #[test]
+    fn is_sha_only_tag_rejects_uppercase() {
+        // GHCR commit shas are lowercase hex; reject uppercase to avoid
+        // false matches on whatever else might sneak into a tag list.
+        assert!(!is_sha_only_tag(
+            "FC308C8515DE8B2F134BC0CBE756CC738C4870E1"
+        ));
+    }
+
+    #[test]
+    fn is_sha_only_tag_rejects_non_hex() {
+        // 40 chars but with a 'g' — not hex.
+        let mut t = "g".to_string();
+        t.push_str(&"0".repeat(39));
+        assert!(!is_sha_only_tag(&t));
+    }
+
+    #[test]
+    fn is_sha_only_tag_rejects_dated_form() {
+        assert!(!is_sha_only_tag("stable-daily-43.20260222"));
+    }
 
     // ── strip_date_suffix ────────────────────────────────────────────────
 

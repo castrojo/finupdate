@@ -67,7 +67,7 @@ test-strict-count families="":
         list="bluefin bluefin-nvidia-open bluefin-dx bluefin-dx-nvidia-open \
               aurora aurora-dx \
               bazzite bazzite-nvidia bazzite-deck bazzite-deck-nvidia \
-              dakota ucore"
+              dakota dakota-nvidia"
     fi
     pass=()
     fail=()

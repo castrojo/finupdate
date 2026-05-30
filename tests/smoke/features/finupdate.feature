@@ -259,8 +259,8 @@ Feature: Finupdate smoke tests
       | bazzite-nvidia          | ghcr.io/ublue-os/bazzite-nvidia:stable              | bazzite-nvidia          |
       | bazzite-deck            | ghcr.io/ublue-os/bazzite-deck:stable                | bazzite-deck            |
       | bazzite-deck-nvidia     | ghcr.io/ublue-os/bazzite-deck-nvidia:stable         | bazzite-deck-nvidia     |
-      | ucore                   | ghcr.io/ublue-os/ucore:stable                       | ucore                   |
       | dakota                  | ghcr.io/projectbluefin/dakota:latest                | dakota                  |
+      | dakota-nvidia           | ghcr.io/projectbluefin/dakota-nvidia:latest         | dakota-nvidia           |
 
   # ── Strict history population: each family must reach N entries ──────
   # `image history shows at least N` polls for "N images" labels in the
@@ -288,8 +288,10 @@ Feature: Finupdate smoke tests
       | bazzite-deck            | ghcr.io/ublue-os/bazzite-deck:stable                | bazzite-deck            |         8 |
       | bazzite-deck-nvidia     | ghcr.io/ublue-os/bazzite-deck-nvidia:stable         | bazzite-deck-nvidia     |         8 |
       | dakota                  | ghcr.io/projectbluefin/dakota:latest                | dakota                  |         8 |
-      # ucore's stable channel last published 2023-03-30 — accept 1 (latest fallback)
-      | ucore                   | ghcr.io/ublue-os/ucore:stable                       | ucore                   |         1 |
+      # dakota-nvidia publishes sha-tagged manifests, not dated names.
+      # probe_sha_tag_dates() reads the config blob `created` for up to
+      # SHA_PROBE_CAP=30 sha tags so we surface 8 here too.
+      | dakota-nvidia           | ghcr.io/projectbluefin/dakota-nvidia:latest         | dakota-nvidia           |         8 |
 
   # ── Rollback flow: open the Rebase dialog and load real version history ─
   # Drives the rebase dialog (Ctrl+Shift+R), waits for a version-list signal
