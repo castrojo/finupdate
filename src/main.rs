@@ -16,6 +16,7 @@ mod config;
 pub mod dbus_progress;
 mod orchestrator;
 mod registry_client;
+mod service;
 mod settings;
 mod ui;
 mod update_worker;
