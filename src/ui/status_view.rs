@@ -1609,6 +1609,16 @@ impl SimpleComponent for StatusView {
             }
 
             StatusViewInput::SelectTag(tag) => {
+                // Idempotency guard: AvailableTagsLoaded calls
+                // tag_combo.set_active_id() which fires the `changed` signal
+                // → emits SelectTag → would re-spawn the changelog fetch →
+                // populate AvailableTagsLoaded again. Without this early-return
+                // the home page spins on changelog fetches forever and burns
+                // GHCR + GitHub rate limit. Only re-fetch when the tag really
+                // changed.
+                if tag == self.selected_tag {
+                    return;
+                }
                 self.selected_tag = tag.clone();
                 let desc = match tag.as_str() {
                     "latest" => "Always the newest stable build",
