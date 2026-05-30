@@ -66,6 +66,15 @@ pub trait Registry: Send + Sync {
     /// bootc status → os-release in that order. Returns None when nothing
     /// in the chain produces a usable ref.
     async fn detect_booted_image(&self) -> Option<ImageRef>;
+
+    /// Return the tags the registry publishes for this image's stream,
+    /// ordered as the tag selector dropdown expects (stream tags first,
+    /// then dated tags newest-first). Used by the home page's "Image
+    /// source" subpage to populate the tag combo.
+    async fn list_available_tags(
+        &self,
+        image: &ImageRef,
+    ) -> Result<Vec<String>, ServiceError>;
 }
 
 /// Production Registry implementation backed by the existing
@@ -98,6 +107,22 @@ impl Registry for HttpRegistry {
             image: client.image().to_string(),
             tag: client.stream().to_string(),
         })
+    }
+
+    async fn list_available_tags(
+        &self,
+        image: &ImageRef,
+    ) -> Result<Vec<String>, ServiceError> {
+        let client = crate::registry_client::RegistryClient::new(
+            &image.registry,
+            &image.org,
+            &image.image,
+            &image.tag,
+        );
+        client
+            .fetch_available_tags()
+            .await
+            .map_err(|e| ServiceError::Registry(e.to_string()))
     }
 }
 
@@ -224,6 +249,14 @@ pub trait UpdaterService: Send + Sync {
         max: usize,
     ) -> Result<Vec<ImageVersion>, ServiceError>;
 
+    /// Return the tags published for this image's stream, ready to populate
+    /// the "Image source" tag dropdown. Stream tags come first (e.g.
+    /// `latest`, `stable`), then dated tags newest-first.
+    async fn list_available_tags(
+        &self,
+        image: &ImageRef,
+    ) -> Result<Vec<String>, ServiceError>;
+
     /// Compute the target image ref for a family + selected features. Returns
     /// None if the combination doesn't match a published image.
     fn resolve_target(&self, family: &FamilyInfo, features: &[String]) -> Option<ImageRef>;
@@ -342,6 +375,13 @@ impl UpdaterService for BootcUpdaterService {
         Ok(versions)
     }
 
+    async fn list_available_tags(
+        &self,
+        image: &ImageRef,
+    ) -> Result<Vec<String>, ServiceError> {
+        self.registry.list_available_tags(image).await
+    }
+
     fn resolve_target(&self, family: &FamilyInfo, features: &[String]) -> Option<ImageRef> {
         // Find the matching static Family for the resolution helper. We do
         // not carry &'static Family across the trait boundary so callers (and
@@ -454,8 +494,10 @@ mod tests {
     struct FixtureRegistry {
         booted: Option<ImageRef>,
         versions: std::collections::HashMap<String, Vec<ImageVersion>>,
+        tags: std::collections::HashMap<String, Vec<String>>,
         fetch_versions_calls: Mutex<u32>,
         detect_calls: Mutex<u32>,
+        list_tags_calls: Mutex<u32>,
     }
 
     impl FixtureRegistry {
@@ -463,8 +505,10 @@ mod tests {
             Self {
                 booted: None,
                 versions: std::collections::HashMap::new(),
+                tags: std::collections::HashMap::new(),
                 fetch_versions_calls: Mutex::new(0),
                 detect_calls: Mutex::new(0),
+                list_tags_calls: Mutex::new(0),
             }
         }
 
@@ -475,6 +519,12 @@ mod tests {
 
         fn with_versions(mut self, image: &ImageRef, versions: Vec<ImageVersion>) -> Self {
             self.versions.insert(image.as_string(), versions);
+            self
+        }
+
+        fn with_tags(mut self, image: &ImageRef, tags: Vec<&str>) -> Self {
+            self.tags
+                .insert(image.as_string(), tags.into_iter().map(String::from).collect());
             self
         }
     }
@@ -495,6 +545,17 @@ mod tests {
         async fn detect_booted_image(&self) -> Option<ImageRef> {
             *self.detect_calls.lock().unwrap() += 1;
             self.booted.clone()
+        }
+
+        async fn list_available_tags(
+            &self,
+            image: &ImageRef,
+        ) -> Result<Vec<String>, ServiceError> {
+            *self.list_tags_calls.lock().unwrap() += 1;
+            self.tags
+                .get(&image.as_string())
+                .cloned()
+                .ok_or_else(|| ServiceError::NotFound(format!("no tag fixture for {image}")))
         }
     }
 
@@ -706,6 +767,44 @@ mod tests {
             features: vec![],
         };
         assert!(svc.resolve_target(&family, &[]).is_none());
+    }
+
+    // ── list_available_tags: tag dropdown population ─────────────────────
+
+    #[tokio::test]
+    async fn list_available_tags_returns_fixture_data() {
+        let img = dakota_ref();
+        let reg = Arc::new(FixtureRegistry::new().with_tags(
+            &img,
+            vec!["latest", "stable", "latest.20260212", "latest.20260211"],
+        ));
+        let svc = BootcUpdaterService::with_registry(reg);
+        let tags = svc.list_available_tags(&img).await.unwrap();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[0], "latest");
+    }
+
+    #[tokio::test]
+    async fn list_available_tags_propagates_not_found() {
+        let img = dakota_ref();
+        let reg = Arc::new(FixtureRegistry::new());
+        let svc = BootcUpdaterService::with_registry(reg);
+        let err = svc.list_available_tags(&img).await.unwrap_err();
+        assert!(matches!(err, ServiceError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn list_available_tags_routes_through_registry_each_call() {
+        // No caching layer between service and registry yet — pin that
+        // assumption so a future cache addition is deliberate.
+        let img = dakota_ref();
+        let reg = Arc::new(FixtureRegistry::new().with_tags(&img, vec!["latest"]));
+        let reg_clone = reg.clone();
+        let svc = BootcUpdaterService::with_registry(reg);
+        let _ = svc.list_available_tags(&img).await.unwrap();
+        let _ = svc.list_available_tags(&img).await.unwrap();
+        let _ = svc.list_available_tags(&img).await.unwrap();
+        assert_eq!(*reg_clone.list_tags_calls.lock().unwrap(), 3);
     }
 
     // ── switch_image still unimplemented ─────────────────────────────────

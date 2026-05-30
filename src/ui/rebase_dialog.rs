@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crate::registry_client::{ImageVersion, RegistryClient};
+use crate::registry_client::ImageVersion;
 use crate::service::{self, FamilyInfo};
 use crate::update_worker::is_flatpak;
 

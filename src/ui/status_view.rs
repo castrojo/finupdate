@@ -2820,29 +2820,27 @@ fn spawn_changelog_fetch(
         rt.block_on(async move {
             println!("[debug] changelog: starting fetch for registry_uri={}", registry_uri);
 
-            // 1. Fetch registry versions
+            // Build an ImageRef from registry_uri + selected_tag for the
+            // service-layer calls. The stream-level tag (strip the date
+            // suffix so e.g. "stable-daily-43.20260527" becomes
+            // "stable-daily-43") drives both list_versions and
+            // list_available_tags.
             let parts: Vec<&str> = registry_uri.split('/').collect();
             if parts.len() >= 3 {
-                let registry = parts[0];
-                let org = parts[1];
-                let image = parts[2..].join("/");
-                
-                let separators = ['.', '-'];
-                let mut stream = selected_tag.clone();
-                for sep in &separators {
-                    if let Some(pos) = selected_tag.rfind(*sep) {
-                        let suffix = &selected_tag[pos + 1..];
-                        if suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_digit()) {
-                            stream = selected_tag[..pos].to_string();
-                            break;
-                        }
-                    }
-                }
+                let stream = strip_date_suffix(&selected_tag)
+                    .unwrap_or_else(|| selected_tag.clone());
+                let image_ref = crate::service::ImageRef {
+                    registry: parts[0].to_string(),
+                    org: parts[1].to_string(),
+                    image: parts[2..].join("/"),
+                    tag: stream,
+                };
+                let svc = crate::service::global();
 
-                let client = crate::registry_client::RegistryClient::new(registry, org, &image, &stream);
-
-                // Fetch the full tag list to populate the tag selector dropdown.
-                match client.fetch_available_tags().await {
+                // Migrated from direct registry_client calls to the
+                // UpdaterService trait. Same observable behaviour; future
+                // alt frontends share this path.
+                match svc.list_available_tags(&image_ref).await {
                     Ok(available) if !available.is_empty() => {
                         println!("[debug] changelog: fetched {} available tags", available.len());
                         let _ = sender.input(StatusViewInput::AvailableTagsLoaded(available));
@@ -2851,12 +2849,7 @@ fn spawn_changelog_fetch(
                     Err(e) => println!("[debug] changelog: failed to fetch tag list: {}", e),
                 }
 
-                // 180-day window — wide enough to surface 8 builds even for
-                // families that publish weekly or monthly (ucore, dakota),
-                // while still bounded so the manifest-HEAD fan-out is cheap.
-                // The home page caps display at HISTORY_MAX (8); this controls
-                // how large the candidate set is before the cap.
-                match client.fetch_versions(180).await {
+                match svc.list_versions(&image_ref, 8).await {
                     Ok(versions) => {
                         println!("[debug] changelog: fetched {} registry versions", versions.len());
                         sender.input(StatusViewInput::RegistryVersionsLoaded(versions));
