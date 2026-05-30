@@ -1047,10 +1047,55 @@ fn populate_family_switches(
                 .title("NVIDIA drivers")
                 .subtitle("Picks the open kernel modules where available, falls back to the proprietary driver")
                 .build();
+            // Guard prevents the warn-and-revert path from re-firing this
+            // handler when we programmatically flip the switch back to
+            // its previous state after a "Cancel" on the warning dialog.
+            let nvidia_guard: Rc<Cell<bool>> = Rc::new(Cell::new(false));
             let recompute_ = recompute.clone();
             let nvidia_state_ = nvidia_state.clone();
+            let guard_ = nvidia_guard.clone();
             row.connect_active_notify(move |sr| {
-                nvidia_state_.set(sr.is_active());
+                if guard_.get() {
+                    return;
+                }
+                let new_value = sr.is_active();
+                let prev_value = nvidia_state_.get();
+                let turning_off = prev_value && !new_value;
+                if turning_off && crate::gpu::has_nvidia_gpu() {
+                    let confirm = adw::AlertDialog::builder()
+                        .heading("NVIDIA hardware detected")
+                        .body("Your system has an NVIDIA GPU. Switching to a non-NVIDIA image will fall back to software rendering or the open Mesa driver — graphics performance will degrade significantly until you switch back.\n\nContinue?")
+                        .build();
+                    confirm.add_response("cancel", "_Cancel");
+                    confirm.add_response("disable", "_Disable anyway");
+                    confirm.set_response_appearance(
+                        "disable",
+                        adw::ResponseAppearance::Destructive,
+                    );
+                    confirm.set_default_response(Some("cancel"));
+                    confirm.set_close_response("cancel");
+
+                    let sr_clone = sr.clone();
+                    let nvidia_state_clone = nvidia_state_.clone();
+                    let recompute_clone = recompute_.clone();
+                    let guard_clone = guard_.clone();
+                    confirm.connect_response(None, move |_, response| {
+                        if response == "disable" {
+                            nvidia_state_clone.set(false);
+                            recompute_clone();
+                        } else {
+                            // Revert the switch back to on without re-firing
+                            // the handler (would re-trigger this dialog).
+                            guard_clone.set(true);
+                            sr_clone.set_active(true);
+                            guard_clone.set(false);
+                        }
+                    });
+                    confirm.present(None::<&gtk::Widget>);
+                    // Don't apply yet — wait for the response callback.
+                    return;
+                }
+                nvidia_state_.set(new_value);
                 recompute_();
             });
             features_group.add(&row);

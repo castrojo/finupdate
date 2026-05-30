@@ -14,6 +14,7 @@ mod app;
 mod sbom_diff;
 mod config;
 pub mod dbus_progress;
+mod gpu;
 mod orchestrator;
 mod registry_client;
 mod service;
