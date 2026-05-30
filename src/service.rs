@@ -36,7 +36,7 @@
 //! `&dyn UpdaterService`, the equivalent free function gets retired.
 
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
 // Re-export the existing concrete types so frontends only depend on this
@@ -178,6 +178,35 @@ pub trait UpdaterService: Send + Sync {
         &self,
         target: &ImageRef,
     ) -> Result<mpsc::Receiver<SwitchProgress>, ServiceError>;
+}
+
+/// Process-wide service singleton.
+///
+/// The GTK frontend grabs this from anywhere via `service::global()` rather
+/// than threading an `Arc<dyn UpdaterService>` through every closure. A CLI
+/// frontend doing the same thing would init() its own singleton; integration
+/// tests can swap a mock in by calling `init()` before any UI is constructed.
+///
+/// `OnceLock` lets us avoid the "did we initialise it?" check on every call
+/// site — the only path that needs `init()` is `main()`. Calling `init()`
+/// twice panics, since reinit would race with whatever's already running.
+static SERVICE: OnceLock<Arc<dyn UpdaterService>> = OnceLock::new();
+
+/// Install the process-wide UpdaterService. Call from `main()` exactly once
+/// before any UI components are built.
+pub fn init(svc: Arc<dyn UpdaterService>) {
+    if SERVICE.set(svc).is_err() {
+        panic!("service::init called twice");
+    }
+}
+
+/// Return the process-wide UpdaterService. Panics if `init()` hasn't been
+/// called yet — UI code that calls this should be reached only after `main()`.
+pub fn global() -> Arc<dyn UpdaterService> {
+    SERVICE
+        .get()
+        .expect("service::init() must be called before service::global()")
+        .clone()
 }
 
 /// Default in-process implementation backed by the existing registry_client

@@ -26,7 +26,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crate::registry_client::{Family, ImageVersion, RegistryClient};
+use crate::registry_client::{ImageVersion, RegistryClient};
+use crate::service::{self, FamilyInfo};
 use crate::update_worker::is_flatpak;
 
 /// Open the rebase history dialog as a child of `parent`.
@@ -55,7 +56,7 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     // page renders the full base-image history.
     let variant_state = Rc::new(RefCell::new(String::new()));
     let selected_features: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-    let current_family: Rc<RefCell<Option<&'static Family>>> = Rc::new(RefCell::new(None));
+    let current_family: Rc<RefCell<Option<FamilyInfo>>> = Rc::new(RefCell::new(None));
 
     let variant_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
     variant_box.set_margin_start(16);
@@ -196,7 +197,7 @@ fn start_version_fetch(
     error_page: adw::StatusPage,
     dev_mode: bool,
     variant: &str,
-    current_family: Rc<RefCell<Option<&'static Family>>>,
+    current_family: Rc<RefCell<Option<FamilyInfo>>>,
     selected_features: Rc<RefCell<Vec<String>>>,
 ) {
     stack.set_visible_child_name("loading");
@@ -285,7 +286,7 @@ fn build_loaded_page(
     parent: &adw::ApplicationWindow,
     versions: Vec<ImageVersion>,
     dev_mode: bool,
-    current_family: Rc<RefCell<Option<&'static Family>>>,
+    current_family: Rc<RefCell<Option<FamilyInfo>>>,
     selected_features: Rc<RefCell<Vec<String>>>,
 ) {
     while let Some(child) = container.first_child() {
@@ -511,11 +512,13 @@ fn build_loaded_page(
             // `nvidia` on bluefin → `bluefin-nvidia`). If the combination
             // isn't published, fall back to the booted image so the user
             // doesn't end up on a bogus ref.
+            let family_ref = current_family_rc.borrow();
             let target_full_ref = resolve_target_ref(
                 &version.full_ref,
-                *current_family_rc.borrow(),
+                family_ref.as_ref(),
                 &selected_features_rc.borrow(),
             );
+            drop(family_ref);
             let switching_image = target_full_ref != version.full_ref;
 
             let body = if switching_image {
@@ -565,26 +568,30 @@ fn build_loaded_page(
 /// resolved family + feature selection. Returns the original ref unchanged
 /// if no family was detected or the feature combination has no published
 /// image — keeps us from constructing refs the registry doesn't serve.
+///
+/// Delegates the family → image resolution to the service layer
+/// ([`UpdaterService::resolve_target`]) so a future alternative frontend can
+/// share the same logic without re-implementing it.
 fn resolve_target_ref(
     full_ref: &str,
-    family: Option<&'static Family>,
+    family: Option<&FamilyInfo>,
     selected_features: &[String],
 ) -> String {
     let Some(family) = family else {
         return full_ref.to_string();
     };
-    let want: Vec<&str> = selected_features.iter().map(|s| s.as_str()).collect();
-    let Some(target_image) = family.select_image_for_features(&want) else {
+    let Some(target) = service::global().resolve_target(family, selected_features) else {
         return full_ref.to_string();
     };
-    // full_ref = registry/org/image:tag — swap `image` only.
+    // full_ref = registry/org/image:tag — swap `image` only, preserving the
+    // tag the user picked from the calendar.
     let Some((before_tag, tag)) = full_ref.rsplit_once(':') else {
         return full_ref.to_string();
     };
     let Some((reg_org, _old_image)) = before_tag.rsplit_once('/') else {
         return full_ref.to_string();
     };
-    format!("{reg_org}/{target_image}:{tag}")
+    format!("{reg_org}/{}:{tag}", target.image)
 }
 
 // ── Grid redraw ──────────────────────────────────────────────────────────────
@@ -936,10 +943,10 @@ fn populate_family_switches(
     features_group: &adw::PreferencesGroup,
     family_label: &gtk::Label,
     target_row: &adw::ActionRow,
-    current_family: Rc<RefCell<Option<&'static Family>>>,
+    current_family: Rc<RefCell<Option<FamilyInfo>>>,
     selected_features: Rc<RefCell<Vec<String>>>,
 ) {
-    let slot: Arc<Mutex<Option<Option<&'static Family>>>> = Arc::new(Mutex::new(None));
+    let slot: Arc<Mutex<Option<Option<FamilyInfo>>>> = Arc::new(Mutex::new(None));
 
     {
         let slot = slot.clone();
@@ -949,9 +956,13 @@ fn populate_family_switches(
                 .build()
                 .expect("tokio runtime");
             let detected = rt.block_on(async move {
-                RegistryClient::detect()
-                    .await
-                    .and_then(|c| Family::best_match(c.org(), c.image(), c.stream()))
+                // Migrated from RegistryClient::detect() + Family::best_match
+                // to the service layer. Same observable behaviour (honours
+                // mock_identity, falls through to bootc status, then
+                // os-release) but the UI no longer reaches into the registry
+                // module directly — first step toward an alternative
+                // frontend being able to call the same code path.
+                service::global().current_family().await.ok().flatten()
             });
             *slot.lock().unwrap() = Some(detected);
         });
@@ -972,39 +983,39 @@ fn populate_family_switches(
             return glib::ControlFlow::Break;
         };
 
-        *current_family.borrow_mut() = Some(family);
         family_label.set_label(&format!("Family: {}", family.name));
+        target_row.set_subtitle(&format!("{} (no extras)", family.base_image));
 
-        // Initial preview = base image. SwitchRows start unchecked.
-        target_row.set_subtitle(&format!(
-            "{} (no extras)",
-            family.base_image()
-        ));
-
-        for feat in family.available_features() {
+        // Build one SwitchRow per feature. Each row's connect_active_notify
+        // closure captures a snapshot of the family (cheap clone) so it can
+        // resolve the target image via the service without re-borrowing
+        // current_family — that Rc<RefCell> is also being read by the
+        // Rebase button click handler at the same time.
+        for feature in &family.features {
             let row = adw::SwitchRow::builder()
-                .title(feature_display_name(feat))
-                .subtitle(feature_subtitle(feat))
+                .title(&feature.display_name)
+                .subtitle(&feature.subtitle)
                 .build();
 
-            let feat_owned = feat.to_string();
+            let feature_id = feature.id.clone();
             let selected_features = selected_features.clone();
-            let family_ref: &'static Family = family;
+            let family_snapshot = family.clone();
             let target_row = target_row.clone();
             row.connect_active_notify(move |sr| {
                 let active = sr.is_active();
                 let mut feats = selected_features.borrow_mut();
                 if active {
-                    if !feats.iter().any(|f| f == &feat_owned) {
-                        feats.push(feat_owned.clone());
+                    if !feats.iter().any(|f| f == &feature_id) {
+                        feats.push(feature_id.clone());
                     }
                 } else {
-                    feats.retain(|f| f != &feat_owned);
+                    feats.retain(|f| f != &feature_id);
                 }
-                let want: Vec<&str> = feats.iter().map(|s| s.as_str()).collect();
-                match family_ref.select_image_for_features(&want) {
-                    Some(img) => {
-                        target_row.set_subtitle(&format!("{img} (resolved)"));
+                let snapshot_feats = feats.clone();
+                drop(feats);
+                match service::global().resolve_target(&family_snapshot, &snapshot_feats) {
+                    Some(target) => {
+                        target_row.set_subtitle(&format!("{} (resolved)", target.image));
                     }
                     None => {
                         target_row.set_subtitle(
@@ -1017,41 +1028,14 @@ fn populate_family_switches(
             features_group.add(&row);
         }
 
+        *current_family.borrow_mut() = Some(family);
         glib::ControlFlow::Break
     });
 }
 
-/// Title shown on a feature SwitchRow. Maps the atomic suffix to a friendly
-/// name; unknown suffixes fall back to the suffix itself uppercased.
-fn feature_display_name(feat: &str) -> &'static str {
-    match feat {
-        "nvidia" => "NVIDIA drivers (proprietary)",
-        "open" => "NVIDIA open kernel modules",
-        "dx" => "Developer extras (DX)",
-        "hwe" => "Hardware-enablement kernel (HWE)",
-        "gdx" => "GNOME Developer extras (GDX)",
-        "deck" => "Steam Deck profile",
-        "asus" => "ASUS ROG tuning",
-        "surface" => "Microsoft Surface kernel",
-        "framework" => "Framework laptop tuning",
-        _ => "Variant feature",
-    }
-}
-
-fn feature_subtitle(feat: &str) -> &'static str {
-    match feat {
-        "nvidia" => "Use the closed-source NVIDIA driver",
-        "open" => "Use Mesa's NVK / NVIDIA open-source kernel driver",
-        "dx" => "Includes container tools, IDEs, and language SDKs",
-        "hwe" => "Newer kernel + drivers backported for fresh hardware",
-        "gdx" => "GNOME-focused developer toolchain",
-        "deck" => "Tuned for Steam Deck hardware (gamescope, Steam shell)",
-        "asus" => "Kernel patches for ASUS ROG Ally / Strix laptops",
-        "surface" => "Linux-surface kernel + camera fix-ups",
-        "framework" => "Power profiles + fingerprint reader support",
-        _ => "Additional ublue extras",
-    }
-}
+// feature_display_name / feature_subtitle moved to service::feature_display_name
+// and the FamilyInfo.features list carries them per Feature. Kept the comment
+// here as a forwarding pointer for archeologists.
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1151,17 +1135,34 @@ enum FetchResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry_client::KNOWN_FAMILIES;
+    use std::sync::Once;
 
-    fn bluefin_stable() -> &'static Family {
-        KNOWN_FAMILIES
-            .iter()
-            .find(|f| f.name == "Bluefin Stable")
-            .expect("Bluefin Stable family present")
+    static INIT: Once = Once::new();
+
+    /// Tests need a process-wide UpdaterService since resolve_target_ref calls
+    /// service::global(). Install the default BootcUpdaterService once;
+    /// service::init() will panic on the second call so guard with Once.
+    fn ensure_service() {
+        INIT.call_once(|| {
+            service::init(service::BootcUpdaterService::new());
+        });
+    }
+
+    fn bluefin_stable_info() -> FamilyInfo {
+        // The features list isn't consulted by resolve_target_ref — the
+        // service routes through KNOWN_FAMILIES via family.name — so we leave
+        // it empty here. Service-level tests in service::tests cover the
+        // feature-resolution paths.
+        FamilyInfo {
+            name: "Bluefin Stable".to_string(),
+            base_image: "bluefin".to_string(),
+            features: vec![],
+        }
     }
 
     #[test]
     fn resolve_passthrough_with_no_family() {
+        ensure_service();
         let r = resolve_target_ref(
             "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
             None,
@@ -1172,9 +1173,11 @@ mod tests {
 
     #[test]
     fn resolve_no_features_keeps_base_image() {
+        ensure_service();
+        let fam = bluefin_stable_info();
         let r = resolve_target_ref(
             "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
-            Some(bluefin_stable()),
+            Some(&fam),
             &[],
         );
         assert_eq!(r, "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527");
@@ -1182,9 +1185,11 @@ mod tests {
 
     #[test]
     fn resolve_swaps_image_to_nvidia_variant() {
+        ensure_service();
+        let fam = bluefin_stable_info();
         let r = resolve_target_ref(
             "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
-            Some(bluefin_stable()),
+            Some(&fam),
             &["nvidia".to_string()],
         );
         assert_eq!(r, "ghcr.io/ublue-os/bluefin-nvidia:stable-daily-43.20260527");
@@ -1192,9 +1197,11 @@ mod tests {
 
     #[test]
     fn resolve_combines_dx_and_nvidia() {
+        ensure_service();
+        let fam = bluefin_stable_info();
         let r = resolve_target_ref(
             "ghcr.io/ublue-os/bluefin:stable",
-            Some(bluefin_stable()),
+            Some(&fam),
             &["dx".to_string(), "nvidia".to_string()],
         );
         assert_eq!(r, "ghcr.io/ublue-os/bluefin-dx-nvidia:stable");
@@ -1202,23 +1209,23 @@ mod tests {
 
     #[test]
     fn resolve_unpublished_combination_falls_back() {
+        ensure_service();
         // "open" alone (without nvidia) isn't a published image — keep the
         // original ref so we don't pkexec a bogus bootc switch.
+        let fam = bluefin_stable_info();
         let original = "ghcr.io/ublue-os/bluefin:stable";
-        let r = resolve_target_ref(
-            original,
-            Some(bluefin_stable()),
-            &["open".to_string()],
-        );
+        let r = resolve_target_ref(original, Some(&fam), &["open".to_string()]);
         assert_eq!(r, original);
     }
 
     #[test]
     fn resolve_handles_missing_tag() {
+        ensure_service();
         // Defensive: a malformed ref with no ':' should pass through.
+        let fam = bluefin_stable_info();
         let r = resolve_target_ref(
             "ghcr.io/ublue-os/bluefin",
-            Some(bluefin_stable()),
+            Some(&fam),
             &["nvidia".to_string()],
         );
         assert_eq!(r, "ghcr.io/ublue-os/bluefin");

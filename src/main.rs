@@ -40,6 +40,11 @@ fn main() {
         config::VERSION
     );
 
+    // Install the process-wide UpdaterService before any UI builds — UI
+    // components grab it via service::global() rather than threading an Arc
+    // through every closure. Swap a mock here if integration-testing.
+    service::init(service::BootcUpdaterService::new());
+
     // relm4::RelmApp handles:
     // - Creating the adw::Application (because we enabled the "libadwaita" feature)
     // - Calling adw::init() which loads Adwaita CSS and enables color scheme support
