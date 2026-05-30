@@ -57,3 +57,11 @@ install_data(
   install_dir: iconsdir / 'hicolor' / 'symbolic' / 'apps',
   rename: application_id + '-symbolic.svg',
 )
+
+# Runner script — invoked as root via a single pkexec elevation.
+# Installed to /app/bin/ so the Flatpak sandbox can find it.
+install_data(
+  'finupdate-runner',
+  install_dir: bindir,
+  install_mode: 'rwxr-xr-x',
+)

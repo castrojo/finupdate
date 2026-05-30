@@ -11,12 +11,17 @@
 //! - libadwaita styles are loaded before any widgets are created
 
 mod app;
+mod sbom_diff;
 mod config;
 pub mod dbus_progress;
+mod gpu;
+mod orchestrator;
 mod registry_client;
+mod service;
 mod settings;
 mod ui;
 mod update_worker;
+mod uupd_compat;
 
 use app::App;
 
@@ -35,6 +40,11 @@ fn main() {
         config::APP_ID,
         config::VERSION
     );
+
+    // Install the process-wide UpdaterService before any UI builds — UI
+    // components grab it via service::global() rather than threading an Arc
+    // through every closure. Swap a mock here if integration-testing.
+    service::init(service::BootcUpdaterService::new());
 
     // relm4::RelmApp handles:
     // - Creating the adw::Application (because we enabled the "libadwaita" feature)

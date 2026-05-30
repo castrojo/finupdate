@@ -468,6 +468,39 @@ pub fn show_update_check_dialog(
                         let _ = line_tx.send(CheckEvent::Error(err));
                         break;
                     }
+                    UpdateEvent::ModuleStarted(module) => {
+                        let key = module.key().to_string();
+                        // Complete previous module if switching.
+                        if let Some(ref prev) = current_module {
+                            if prev != &key {
+                                let _ = line_tx.send(CheckEvent::ModuleComplete(prev.clone()));
+                            }
+                        }
+                        current_module = Some(key.clone());
+                        let _ = line_tx.send(CheckEvent::ModuleStart(key));
+                    }
+                    UpdateEvent::ModuleFinished(module, status) => {
+                        use crate::orchestrator::ModuleStatus;
+                        let key = module.key().to_string();
+                        match status {
+                            ModuleStatus::Success => {
+                                // System module success means a staged update.
+                                if module == crate::orchestrator::Module::System {
+                                    system_found = true;
+                                }
+                                let _ = line_tx.send(CheckEvent::ModuleComplete(key));
+                            }
+                            ModuleStatus::UpToDate
+                            | ModuleStatus::Skipped => {
+                                let _ = line_tx.send(CheckEvent::ModuleComplete(key));
+                            }
+                            ModuleStatus::Failed(code) => {
+                                let _ = line_tx.send(CheckEvent::Error(format!(
+                                    "{key} module failed (exit {code})"
+                                )));
+                            }
+                        }
+                    }
                 }
             }
         });
@@ -529,4 +562,84 @@ fn update_progress(state: &CheckState) {
     // Count checking as half-progress
     let fraction = (completed + checking * 0.5) / total;
     state.progress_bar.set_fraction(fraction);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── source_matches_key ──────────────────────────────────────────────
+    // Maps display labels shown in the check dialog ("System image",
+    // "Homebrew", etc.) to the module key uupd uses internally. Lets the
+    // dialog highlight whichever source corresponds to the running module.
+
+    #[test]
+    fn source_matches_system_image_for_system_key() {
+        assert!(source_matches_key("System image", "system"));
+    }
+
+    #[test]
+    fn source_matches_flatpak() {
+        assert!(source_matches_key("Flatpak", "flatpak"));
+    }
+
+    #[test]
+    fn source_matches_homebrew_for_brew_key() {
+        // uupd internally calls it "brew" but the user-facing label is the
+        // full "Homebrew" — pin both sides of the mapping.
+        assert!(source_matches_key("Homebrew", "brew"));
+    }
+
+    #[test]
+    fn source_matches_distrobox() {
+        assert!(source_matches_key("Distrobox", "distrobox"));
+    }
+
+    #[test]
+    fn source_rejects_wrong_label_for_key() {
+        assert!(!source_matches_key("Flatpak", "system"));
+        assert!(!source_matches_key("System image", "brew"));
+    }
+
+    #[test]
+    fn source_rejects_unknown_key() {
+        assert!(!source_matches_key("System image", "mystery"));
+    }
+
+    // ── extract_module_key_from_line ────────────────────────────────────
+
+    #[test]
+    fn extract_recognises_system() {
+        assert_eq!(
+            extract_module_key_from_line("time=2026-05-30 module_name=System level=INFO"),
+            Some("system")
+        );
+    }
+
+    #[test]
+    fn extract_recognises_flatpak() {
+        assert_eq!(
+            extract_module_key_from_line("module_name=Flatpak"),
+            Some("flatpak")
+        );
+    }
+
+    #[test]
+    fn extract_recognises_brew() {
+        assert_eq!(extract_module_key_from_line("module_name=Brew"), Some("brew"));
+    }
+
+    #[test]
+    fn extract_recognises_distrobox() {
+        assert_eq!(
+            extract_module_key_from_line("module_name=Distrobox"),
+            Some("distrobox")
+        );
+    }
+
+    #[test]
+    fn extract_returns_none_for_non_module_lines() {
+        assert!(extract_module_key_from_line("time=2026-05-30 level=INFO message=ready").is_none());
+        assert!(extract_module_key_from_line("").is_none());
+    }
 }

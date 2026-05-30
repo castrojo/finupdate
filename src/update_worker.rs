@@ -1,77 +1,35 @@
-//! Async subprocess worker for invoking `uupd`.
+//! Event types and the thin public façade over the update orchestrator.
 //!
-//! ## About uupd
+//! The real work lives in [`crate::orchestrator`], which spawns the bundled
+//! `finupdate-runner` shell script under a single `pkexec` elevation and
+//! parses its marker-line protocol into structured [`UpdateEvent`]s.
 //!
-//! `uupd` (Universal Update) is the system update daemon for Universal Blue / Bluefin.
-//! It coordinates updates across 4 independent modules:
+//! This module exists for two reasons:
+//! 1. It owns the [`UpdateEvent`] enum that both real and simulated runs emit.
+//! 2. It owns [`run_simulated`] — the dev-mode driver that walks through the
+//!    same event sequence without touching the host, used to exercise the UI
+//!    state machine without root or a real update.
 //!
-//! | Module | What it updates | Backend |
-//! |--------|----------------|---------|
-//! | System | The OS image (bootc/rpm-ostree) | `bootc upgrade` or `rpm-ostree upgrade` |
-//! | Flatpak | User + system Flatpak apps | `flatpak update` |
-//! | Brew | Homebrew packages in /home/linuxbrew | `brew upgrade` |
-//! | Distrobox | Container-based distro environments | `distrobox upgrade` |
-//!
-//! ### Key behaviors:
-//! - **Requires root** — must be run as `sudo uupd` (or via polkit/pkexec)
-//! - **Lock file** — only one instance can run at a time
-//! - **Exit codes** — 0 = success, non-zero = at least one module failed
-//! - **Logging** — uses Go's `slog`; default `info` level shows module progress
-//! - **Progress** — emits OSC terminal progress sequences (disabled with `--json`)
-//! - **Config** — reads `/etc/uupd/config.json` for module enable/disable
-//! - **Systemd** — normally runs via `uupd.timer` daily at 04:00
-//! - **update-check** — exits 0 if update available, 77 if not (useful for pre-checking)
-//!
-//! ### Useful flags for GUI integration:
-//! - `--verbose` / `-v` — shows command output from each module (more log lines)
-//! - `--dry-run` / `-n` — simulates without making changes
-//! - `--force` / `-f` — skips update-check, forces system module to run
-//! - `--json` — structured JSON log output (parseable but noisy)
-//! - `--disable-module-<name>` — skip a specific module
-//! - `--log-level debug` — very verbose, shows all subprocess output
-//!
-//! ### Output format (default info level):
-//! ```text
-//! time=... level=INFO msg="Hardware checks passed"
-//! time=... level=INFO msg="System" module_name=System
-//! time=... level=INFO msg="Flatpak" module_name=Flatpak
-//! time=... level=INFO msg="Updates Completed Successfully"
-//! ```
-//!
-//! On failure:
-//! ```text
-//! time=... level=ERROR msg="module_fail" module=System cli="bootc upgrade"
-//! time=... level=ERROR msg="Updates finished with errors!"
-//! ```
-//!
-//! ## Pattern: Subprocess streaming with Flatpak sandbox awareness
-//!
-//! - Detect if running inside a Flatpak sandbox (via /.flatpak-info)
-//! - If sandboxed, use `flatpak-spawn --host` to run commands on the host
-//! - Spawn the process with stdout/stderr piped
-//! - Read lines asynchronously via tokio
-//! - Send structured events back through an mpsc channel
-//! - The caller (relm4 component) receives events and updates UI state
-//!
-//! This decoupling means the UI never blocks on I/O, and the worker
-//! is testable in isolation (you can substitute a mock process).
+//! Sandbox awareness lives in [`is_flatpak`]; everywhere else that detects
+//! "are we in a Flatpak?" calls this helper.
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::mpsc;
 
 /// Events emitted by the update worker as the subprocess runs.
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
-    /// A line of stdout/stderr output from uupd.
+    /// A line of stdout/stderr output from the update process.
     Output(String),
     /// The process exited successfully (exit code 0).
     Complete,
     /// The process exited with code 77 — no update was needed.
-    /// `uupd update-check` uses this code to signal "already up to date".
     UpToDate,
     /// The process failed — includes a human-readable error description.
     Error(String),
+    /// A module has started running.
+    ModuleStarted(crate::orchestrator::Module),
+    /// A module has finished with a status.
+    ModuleFinished(crate::orchestrator::Module, crate::orchestrator::ModuleStatus),
 }
 
 /// What the simulated update run should end with.
@@ -91,164 +49,29 @@ pub fn is_flatpak() -> bool {
     std::path::Path::new("/.flatpak-info").exists()
 }
 
-/// Manages spawning and streaming output from the `uupd` process.
-/// Handles Flatpak sandbox transparency automatically.
-pub struct UpdateWorker {
-    /// The command to invoke. Defaults to "uupd" but can be overridden for testing.
-    command: String,
-    /// Arguments to pass. Default: empty (uupd runs a full update with no args).
-    args: Vec<String>,
-}
+/// Manages spawning and streaming output from the update process.
+pub struct UpdateWorker;
 
 impl UpdateWorker {
-    /// Create a new worker with default uupd invocation.
     pub fn new() -> Self {
-        Self {
-            command: "uupd".to_string(),
-            args: vec![],
-        }
+        Self
     }
 
-    /// Create a worker with a custom command (useful for testing/mocking).
+    /// Create a worker (custom command ignored — kept for API compatibility).
     #[allow(dead_code)]
-    pub fn with_command(command: impl Into<String>, args: Vec<String>) -> Self {
-        Self {
-            command: command.into(),
-            args,
-        }
-    }
-
-    /// Build the actual Command, wrapping with `flatpak-spawn --host` if sandboxed.
-    fn build_command(&self) -> Command {
-        if is_flatpak() {
-            // Inside Flatpak: use flatpak-spawn to escape the sandbox and
-            // run the command on the host system.
-            let mut cmd = Command::new("flatpak-spawn");
-            cmd.arg("--host");
-            cmd.arg(&self.command);
-            cmd.args(&self.args);
-            cmd
-        } else {
-            // Running natively: invoke the command directly.
-            let mut cmd = Command::new(&self.command);
-            cmd.args(&self.args);
-            cmd
-        }
+    pub fn with_command(_command: impl Into<String>, _args: Vec<String>) -> Self {
+        Self
     }
 
     /// Spawn the subprocess and return a receiver for streaming events.
     ///
-    /// `cancel_rx` is a oneshot channel. When the sender fires, the subprocess
-    /// is killed with SIGKILL and the channel closes. This ensures the real
-    /// process is always terminated, not just abandoned.
-    ///
-    /// # Design decision: mpsc over callbacks
-    /// Using a channel decouples the worker from relm4 entirely.
-    /// This means the worker can be unit-tested with a simple receiver
-    /// without needing a running GTK main loop.
+    /// Delegates to `orchestrator::run()` which invokes `finupdate-runner`
+    /// via a single pkexec elevation.
     pub async fn run(
         &mut self,
         cancel_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> mpsc::UnboundedReceiver<UpdateEvent> {
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        let command_display = if is_flatpak() {
-            format!("flatpak-spawn --host {}", self.command)
-        } else {
-            self.command.clone()
-        };
-
-        let mut cmd = self.build_command();
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        tokio::spawn(async move {
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(UpdateEvent::Error(format!(
-                        "Failed to start '{}': {}",
-                        command_display, e
-                    )));
-                    return;
-                }
-            };
-
-            // Stream stdout and stderr line-by-line, merging both into Output events.
-            let stdout = child.stdout.take();
-            let stderr = child.stderr.take();
-
-            let tx_err = tx.clone();
-            let stderr_task = stderr.map(|s| {
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(s).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if tx_err.send(UpdateEvent::Output(line)).is_err() {
-                            break;
-                        }
-                    }
-                })
-            });
-
-            let tx_out = tx.clone();
-            let stdout_future = async move {
-                if let Some(stdout) = stdout {
-                    let mut lines = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        if tx_out.send(UpdateEvent::Output(line)).is_err() {
-                            break;
-                        }
-                    }
-                }
-            };
-
-            // Race between reading all output and receiving a cancel signal.
-            let cancelled = tokio::select! {
-                _ = stdout_future => false,
-                _ = cancel_rx => true,
-            };
-
-            // Always clean up the stderr reader task.
-            if let Some(task) = stderr_task {
-                task.abort();
-                let _ = task.await;
-            }
-
-            if cancelled {
-                // Kill the subprocess so it doesn't linger in the background.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let _ = tx.send(UpdateEvent::Error("Update cancelled by user".to_string()));
-                return;
-            }
-
-            // Wait for the child to exit and check status.
-            match child.wait().await {
-                Ok(status) if status.success() => {
-                    let _ = tx.send(UpdateEvent::Complete);
-                }
-                Ok(status) if status.code() == Some(77) => {
-                    // Exit code 77 means "nothing to update" (used by uupd update-check
-                    // and potentially by the main uupd command when image is current).
-                    let _ = tx.send(UpdateEvent::UpToDate);
-                }
-                Ok(status) => {
-                    let code = status.code().unwrap_or(-1);
-                    let _ = tx.send(UpdateEvent::Error(format!(
-                        "Update process exited with code {}",
-                        code
-                    )));
-                }
-                Err(e) => {
-                    let _ = tx.send(UpdateEvent::Error(format!(
-                        "Error waiting for update process: {}",
-                        e
-                    )));
-                }
-            }
-        });
-
-        rx
+        crate::orchestrator::run(cancel_rx).await
     }
 }
 
@@ -282,132 +105,227 @@ pub async fn run_simulated(
     rx
 }
 
-/// Internal simulation: emits fake log lines for all four uupd modules.
+/// Internal simulation: emits structured module events for all four modules.
 async fn simulate_update(tx: &mpsc::UnboundedSender<UpdateEvent>, scenario: SimulationScenario) {
+    use crate::orchestrator::{Module, ModuleStatus};
     use tokio::time::{Duration, sleep};
 
-    // Helper: emit a log line and pause briefly.
     macro_rules! line {
         ($msg:expr) => {{
-            if tx.send(UpdateEvent::Output($msg.to_string())).is_err() {
-                return;
-            }
+            if tx.send(UpdateEvent::Output($msg.to_string())).is_err() { return; }
             sleep(Duration::from_millis(300)).await;
         }};
         ($msg:expr, $delay:expr) => {{
-            if tx.send(UpdateEvent::Output($msg.to_string())).is_err() {
-                return;
-            }
+            if tx.send(UpdateEvent::Output($msg.to_string())).is_err() { return; }
             sleep(Duration::from_millis($delay)).await;
         }};
     }
+    macro_rules! module_start {
+        ($m:expr) => {{
+            if tx.send(UpdateEvent::ModuleStarted($m)).is_err() { return; }
+        }};
+    }
+    macro_rules! module_done {
+        ($m:expr, $s:expr) => {{
+            if tx.send(UpdateEvent::ModuleFinished($m, $s)).is_err() { return; }
+        }};
+    }
 
-    let ts = "2026-05-26T04:00:00Z";
-
-    line!(format!(
-        "time={ts} level=INFO msg=\"[DEV MODE] Starting finupdate simulation\""
-    ));
-    line!(
-        format!("time={ts} level=INFO msg=\"Hardware checks passed\""),
-        500
-    );
+    line!("[DEV MODE] Starting finupdate simulation (DRY RUN)");
+    line!("[DEV MODE] No actual commands will be executed - this is a preview");
+    sleep(Duration::from_millis(400)).await;
 
     // ── System module ────────────────────────────────────────────────────
-    line!(format!(
-        "time={ts} level=INFO msg=\"System\" module_name=System"
-    ));
-    line!(
-        format!("time={ts} level=INFO msg=\"Checking for OS image updates...\""),
-        600
-    );
+    module_start!(Module::System);
+    line!("$ pkexec bootc upgrade --check", 300);
+    line!("Checking for OS image updates...", 600);
 
     if matches!(scenario, SimulationScenario::AlreadyUpToDate) {
-        line!(
-            format!("time={ts} level=INFO msg=\"Image is already up to date\""),
-            400
-        );
+        line!("Image is already up to date", 400);
+        module_done!(Module::System, ModuleStatus::UpToDate);
         let _ = tx.send(UpdateEvent::UpToDate);
         return;
     }
 
     if matches!(scenario, SimulationScenario::Failure) {
-        line!(
-            format!(
-                "time={ts} level=ERROR msg=\"module_fail\" module=System cli=\"bootc upgrade\""
-            ),
-            400
-        );
-        let _ = tx.send(UpdateEvent::Error(
-            "[DEV MODE] Simulated system module failure".to_string(),
-        ));
+        line!("[DRY RUN] Would execute: $ pkexec bootc upgrade", 300);
+        line!("bootc upgrade failed (simulated)", 400);
+        module_done!(Module::System, ModuleStatus::Failed(1));
+        let _ = tx.send(UpdateEvent::Error("[DEV MODE] Simulated system module failure".to_string()));
         return;
     }
 
-    line!(
-        format!("time={ts} level=INFO msg=\"bootc: Fetching image manifest...\""),
-        500
-    );
-    line!(
-        format!("time={ts} level=INFO msg=\"bootc: Pulling 3 new layers (42.1 MB)\""),
-        800
-    );
-    line!(
-        format!("time={ts} level=INFO msg=\"bootc: Staging complete — reboot to apply\""),
-        400
-    );
+    line!("[DRY RUN] Would execute: $ pkexec bootc upgrade", 300);
+    line!("bootc: Fetching image manifest...", 500);
+    line!("bootc: Pulling 3 new layers (42.1 MB)", 800);
+    line!("bootc: Staging complete — reboot to apply", 400);
+    module_done!(Module::System, ModuleStatus::Success);
 
     // ── Flatpak module ───────────────────────────────────────────────────
-    line!(format!(
-        "time={ts} level=INFO msg=\"Flatpak\" module_name=Flatpak"
-    ));
-    line!(
-        format!("time={ts} level=INFO msg=\"Checking for Flatpak updates...\""),
-        500
-    );
-    line!(
-        format!("time={ts} level=INFO msg=\"Updated: org.mozilla.firefox (130.0.1 → 131.0)\""),
-        400
-    );
-    line!(
-        format!("time={ts} level=INFO msg=\"Updated: com.spotify.Client (1.2.45 → 1.2.46)\""),
-        400
-    );
-    line!(
-        format!("time={ts} level=INFO msg=\"Flatpak: 2 apps updated\""),
-        300
-    );
+    module_start!(Module::Flatpak);
+    line!("$ flatpak remote-info --updates flathub", 300);
+    line!("Checking for Flatpak updates...", 500);
+    line!("[DRY RUN] Would execute: $ flatpak update -y", 300);
+    line!("Updated: org.mozilla.firefox (130.0.1 → 131.0)", 400);
+    line!("Updated: com.spotify.Client (1.2.45 → 1.2.46)", 400);
+    line!("Flatpak: 2 apps updated", 300);
+    module_done!(Module::Flatpak, ModuleStatus::Success);
 
     // ── Brew module ──────────────────────────────────────────────────────
-    line!(format!(
-        "time={ts} level=INFO msg=\"Brew\" module_name=Brew"
-    ));
-    line!(
-        format!("time={ts} level=INFO msg=\"Upgrading Homebrew packages...\""),
-        500
-    );
-    line!(
-        format!("time={ts} level=INFO msg=\"Already up-to-date: neovim, fzf, ripgrep\""),
-        300
-    );
+    module_start!(Module::Brew);
+    line!("$ brew upgrade --dry-run", 300);
+    line!("Upgrading Homebrew packages...", 500);
+    line!("[DRY RUN] Would execute: $ brew upgrade", 300);
+    line!("Already up-to-date: neovim, fzf, ripgrep", 300);
+    module_done!(Module::Brew, ModuleStatus::Success);
 
     // ── Distrobox module ─────────────────────────────────────────────────
-    line!(format!(
-        "time={ts} level=INFO msg=\"Distrobox\" module_name=Distrobox"
-    ));
-    line!(
-        format!("time={ts} level=INFO msg=\"Upgrading Distrobox containers...\""),
-        500
-    );
-    line!(
-        format!("time={ts} level=INFO msg=\"ubuntu-22: updated 5 packages\""),
-        400
-    );
+    module_start!(Module::Distrobox);
+    line!("$ distrobox list --json", 300);
+    line!("Upgrading Distrobox containers...", 500);
+    line!("[DRY RUN] Would execute: $ distrobox upgrade all", 300);
+    line!("ubuntu-22: updated 5 packages", 400);
+    module_done!(Module::Distrobox, ModuleStatus::Success);
 
     sleep(Duration::from_millis(300)).await;
-    line!(
-        format!("time={ts} level=INFO msg=\"Updates Completed Successfully\""),
-        200
-    );
-
     let _ = tx.send(UpdateEvent::Complete);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::{Module, ModuleStatus};
+
+    /// Drain a receiver into a Vec until the channel closes.
+    async fn drain(mut rx: mpsc::UnboundedReceiver<UpdateEvent>) -> Vec<UpdateEvent> {
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        events
+    }
+
+    fn module_events(events: &[UpdateEvent]) -> Vec<(&'static str, &str)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                UpdateEvent::ModuleStarted(m) => Some(("start", m.key())),
+                UpdateEvent::ModuleFinished(m, _) => Some(("end", m.key())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn success_scenario_emits_all_four_modules_then_complete() {
+        let (_tx_cancel, rx_cancel) = tokio::sync::oneshot::channel();
+        let rx = run_simulated(SimulationScenario::Success, rx_cancel).await;
+        let events = drain(rx).await;
+
+        // Last event must be Complete.
+        assert!(
+            matches!(events.last(), Some(UpdateEvent::Complete)),
+            "expected Complete at end, got {:?}",
+            events.last()
+        );
+
+        // Every module starts and finishes in order.
+        let module_seq = module_events(&events);
+        assert_eq!(
+            module_seq,
+            vec![
+                ("start", "system"),
+                ("end", "system"),
+                ("start", "flatpak"),
+                ("end", "flatpak"),
+                ("start", "brew"),
+                ("end", "brew"),
+                ("start", "distrobox"),
+                ("end", "distrobox"),
+            ]
+        );
+
+        // Every ModuleFinished should be Success in this scenario.
+        for ev in &events {
+            if let UpdateEvent::ModuleFinished(_, status) = ev {
+                assert_eq!(status, &ModuleStatus::Success);
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn already_up_to_date_short_circuits_after_system() {
+        let (_tx, rx_cancel) = tokio::sync::oneshot::channel();
+        let rx = run_simulated(SimulationScenario::AlreadyUpToDate, rx_cancel).await;
+        let events = drain(rx).await;
+
+        // Last event is UpToDate.
+        assert!(matches!(events.last(), Some(UpdateEvent::UpToDate)));
+
+        // Only the system module ran.
+        let module_seq = module_events(&events);
+        assert_eq!(module_seq, vec![("start", "system"), ("end", "system")]);
+
+        // System finished as UpToDate, not Success.
+        let system_finish = events
+            .iter()
+            .find_map(|e| match e {
+                UpdateEvent::ModuleFinished(Module::System, s) => Some(s),
+                _ => None,
+            })
+            .expect("expected ModuleFinished for system");
+        assert_eq!(system_finish, &ModuleStatus::UpToDate);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failure_scenario_emits_error_after_system() {
+        let (_tx, rx_cancel) = tokio::sync::oneshot::channel();
+        let rx = run_simulated(SimulationScenario::Failure, rx_cancel).await;
+        let events = drain(rx).await;
+
+        // Last event is Error with the dev-mode marker text.
+        match events.last() {
+            Some(UpdateEvent::Error(msg)) => {
+                assert!(msg.contains("[DEV MODE]"), "got: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // System started and finished as Failed(1).
+        let system_finish = events
+            .iter()
+            .find_map(|e| match e {
+                UpdateEvent::ModuleFinished(Module::System, s) => Some(s),
+                _ => None,
+            })
+            .expect("expected ModuleFinished for system");
+        assert_eq!(system_finish, &ModuleStatus::Failed(1));
+
+        // No other modules ran.
+        let other_modules = module_events(&events)
+            .into_iter()
+            .filter(|(_, key)| *key != "system")
+            .count();
+        assert_eq!(other_modules, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_emits_error_and_stops() {
+        let (tx_cancel, rx_cancel) = tokio::sync::oneshot::channel();
+        let rx = run_simulated(SimulationScenario::Success, rx_cancel).await;
+
+        // Cancel almost immediately.
+        let _ = tx_cancel.send(());
+        let events = drain(rx).await;
+
+        // The cancel message should land as an Error.
+        let last_is_cancel = matches!(
+            events.last(),
+            Some(UpdateEvent::Error(m)) if m.contains("cancelled")
+        );
+        assert!(last_is_cancel, "tail: {:?}", events.last());
+
+        // We should NOT see Complete after a cancel.
+        assert!(!events.iter().any(|e| matches!(e, UpdateEvent::Complete)));
+    }
 }

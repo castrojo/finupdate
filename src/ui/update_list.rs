@@ -336,3 +336,57 @@ fn detect_module_start(line: &str) -> Option<usize> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── detect_module_start ─────────────────────────────────────────────
+    // Parses uupd's structured log lines to figure out which module just
+    // started — drives the per-module status indicators in the update list.
+    // If uupd renames a module these tests fail loudly.
+
+    #[test]
+    fn detect_module_start_recognises_system() {
+        let idx = detect_module_start("time=2026-05-30 module_name=System message=starting")
+            .expect("System matched");
+        assert_eq!(MODULES[idx].0, "system");
+    }
+
+    #[test]
+    fn detect_module_start_recognises_flatpak() {
+        let idx =
+            detect_module_start("module_name=Flatpak module_state=running").expect("matched");
+        assert_eq!(MODULES[idx].0, "flatpak");
+    }
+
+    #[test]
+    fn detect_module_start_recognises_brew() {
+        let idx = detect_module_start("module_name=Brew").expect("matched");
+        assert_eq!(MODULES[idx].0, "brew");
+    }
+
+    #[test]
+    fn detect_module_start_recognises_distrobox() {
+        let idx = detect_module_start("module_name=Distrobox").expect("matched");
+        assert_eq!(MODULES[idx].0, "distrobox");
+    }
+
+    #[test]
+    fn detect_module_start_ignores_non_module_lines() {
+        assert!(detect_module_start("time=2026-05-30 level=INFO message=ready").is_none());
+    }
+
+    #[test]
+    fn detect_module_start_rejects_lowercase_module_name() {
+        // uupd emits the display-name capitalised; if it ever switches to
+        // lowercase the matcher needs to be updated — this test pins the
+        // current contract.
+        assert!(detect_module_start("module_name=system").is_none());
+    }
+
+    #[test]
+    fn detect_module_start_rejects_unknown_module() {
+        assert!(detect_module_start("module_name=Mystery").is_none());
+    }
+}

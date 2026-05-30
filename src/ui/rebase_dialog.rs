@@ -21,12 +21,13 @@
 use adw::prelude::*;
 use chrono::{Datelike, Local, NaiveDate};
 use gtk::glib;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use crate::registry_client::{ImageVersion, RegistryClient};
+use crate::registry_client::ImageVersion;
+use crate::service::{self, FamilyInfo};
 use crate::update_worker::is_flatpak;
 
 /// Open the rebase history dialog as a child of `parent`.
@@ -40,6 +41,49 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     let toolbar_view = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     toolbar_view.add_top_bar(&header);
+
+    // ── Feature-switch variant selector ───────────────────────────────────
+    //
+    // Replaces the hardcoded Dakota/Dakota-Nvidia pair with one SwitchRow
+    // per atomic feature available in the current Family — derived live from
+    // the Family taxonomy (KNOWN_FAMILIES). The user picks Nvidia / DX / HWE
+    // etc. by name rather than choosing a raw image; the resolved target
+    // image is shown in a preview row at the bottom of the group.
+    //
+    // The legacy `variant_state: Rc<RefCell<String>>` interface is preserved
+    // for the existing `start_version_fetch` API — we feed it an empty string
+    // when the user hasn't picked features (no extra filter), so the loaded
+    // page renders the full base-image history.
+    let variant_state = Rc::new(RefCell::new(String::new()));
+    let selected_features: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let current_family: Rc<RefCell<Option<FamilyInfo>>> = Rc::new(RefCell::new(None));
+
+    let variant_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    variant_box.set_margin_start(16);
+    variant_box.set_margin_end(16);
+    variant_box.set_margin_top(12);
+    variant_box.set_margin_bottom(12);
+
+    let family_label = gtk::Label::new(Some("Loading family info…"));
+    family_label.set_halign(gtk::Align::Start);
+    family_label.add_css_class("heading");
+    variant_box.append(&family_label);
+
+    // PreferencesGroup hosts the dynamic SwitchRow list. Populated once the
+    // initial fetch completes and we know which family we're on.
+    let features_group = adw::PreferencesGroup::new();
+    variant_box.append(&features_group);
+
+    let target_image_row = adw::ActionRow::builder()
+        .title("Target image")
+        .subtitle("(select features above)")
+        .build();
+    let target_chip = gtk::Image::from_icon_name("emblem-default-symbolic");
+    target_chip.add_css_class("dim-label");
+    target_image_row.add_suffix(&target_chip);
+    let target_image_group = adw::PreferencesGroup::new();
+    target_image_group.add(&target_image_row);
+    variant_box.append(&target_image_group);
 
     // ── Stack: loading / loaded / error ────────────────────────────────
     let stack = gtk::Stack::builder()
@@ -83,7 +127,12 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     loaded_scroll.set_child(Some(&loaded_box));
     stack.add_named(&loaded_scroll, Some("loaded"));
 
-    toolbar_view.set_content(Some(&stack));
+    let main_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    main_box.append(&variant_box);
+    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
+    main_box.append(&separator);
+    main_box.append(&stack);
+    toolbar_view.set_content(Some(&main_box));
     dialog.set_child(Some(&toolbar_view));
     stack.set_visible_child_name("loading");
 
@@ -92,7 +141,11 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     let dialog_for_retry = dialog.clone();
     let parent_for_retry = parent.clone();
     let error_page_for_retry = error_page.clone();
+    let variant_state_for_retry = variant_state.clone();
+    let current_family_for_retry = current_family.clone();
+    let selected_features_for_retry = selected_features.clone();
     retry_button.connect_clicked(move |_| {
+        let variant = variant_state_for_retry.borrow().clone();
         start_version_fetch(
             stack_for_retry.clone(),
             loaded_box_for_retry.clone(),
@@ -100,10 +153,28 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
             parent_for_retry.clone(),
             error_page_for_retry.clone(),
             dev_mode,
+            &variant,
+            current_family_for_retry.clone(),
+            selected_features_for_retry.clone(),
         );
     });
 
+    // Family + feature switches are populated AFTER the initial fetch
+    // completes (we need the detected RegistryClient to know which family
+    // we're on). Switches are wired to recompute the target_image_row
+    // suffix label as the user toggles them; restarting fetch on every
+    // toggle would thrash the network — instead the user clicks Rebase to
+    // commit a switch to a different image.
+    populate_family_switches(
+        &features_group,
+        &family_label,
+        &target_image_row,
+        current_family.clone(),
+        selected_features.clone(),
+    );
+
     dialog.present(Some(parent));
+    let initial_variant = variant_state.borrow().clone();
     start_version_fetch(
         stack.clone(),
         loaded_box.clone(),
@@ -111,9 +182,13 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
         parent.clone(),
         error_page.clone(),
         dev_mode,
+        &initial_variant,
+        current_family.clone(),
+        selected_features.clone(),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_version_fetch(
     stack: gtk::Stack,
     loaded_box: gtk::Box,
@@ -121,29 +196,32 @@ fn start_version_fetch(
     parent: adw::ApplicationWindow,
     error_page: adw::StatusPage,
     dev_mode: bool,
+    variant: &str,
+    current_family: Rc<RefCell<Option<FamilyInfo>>>,
+    selected_features: Rc<RefCell<Vec<String>>>,
 ) {
     stack.set_visible_child_name("loading");
     error_page.set_description(Some("Check your internet connection and try again."));
 
-    if dev_mode {
-        // In dev mode, use simulated data so the dialog is functional without bootc.
-        let versions = generate_mock_versions();
-        glib::idle_add_local_once(move || {
-            build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions, dev_mode);
-            stack.set_visible_child_name("loaded");
-        });
-        return;
-    }
-
+    let variant_str = variant.to_string();
     let result_slot: Arc<Mutex<Option<FetchResult>>> = Arc::new(Mutex::new(None));
-    spawn_fetch_thread(result_slot.clone());
+    spawn_fetch_thread(result_slot.clone(), &variant_str);
 
     let start_time = std::time::Instant::now();
     glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
         if let Some(result) = result_slot.lock().ok().and_then(|mut guard| guard.take()) {
             match result {
                 FetchResult::Ok(versions) => {
-                    build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions, dev_mode);
+                    build_loaded_page(
+                        &loaded_box,
+                        &stack,
+                        &dialog,
+                        &parent,
+                        versions,
+                        dev_mode,
+                        current_family.clone(),
+                        selected_features.clone(),
+                    );
                     stack.set_visible_child_name("loaded");
                 }
                 FetchResult::DetectFailed => {
@@ -171,7 +249,8 @@ fn start_version_fetch(
     });
 }
 
-fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>) {
+fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>, variant: &str) {
+    let variant_str = variant.to_string();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -179,10 +258,22 @@ fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>) {
             .expect("tokio runtime");
 
         rt.block_on(async move {
-            let result = match RegistryClient::detect().await {
-                None => FetchResult::DetectFailed,
-                Some(client) => match client.fetch_versions(90).await {
-                    Ok(versions) => FetchResult::Ok(versions),
+            // Migrated from RegistryClient::detect + fetch_versions(90) to
+            // the service layer. current_image() honours mock_identity →
+            // bootc status → os-release; list_versions delegates to
+            // fetch_versions internally with the config-blob date harvest
+            // included. Same observable behaviour; future alternative
+            // frontends share the same code path.
+            let svc = service::global();
+            let result = match svc.current_image().await {
+                Err(_) => FetchResult::DetectFailed,
+                Ok(image) => match svc.list_versions(&image, 8).await {
+                    Ok(mut versions) => {
+                        if !variant_str.is_empty() && variant_str != "default" {
+                            versions.retain(|v| v.version.contains(&variant_str));
+                        }
+                        FetchResult::Ok(versions)
+                    }
                     Err(e) => FetchResult::Err(e.to_string()),
                 },
             };
@@ -193,6 +284,7 @@ fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>) {
 
 // ── Loaded page builder ──────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_loaded_page(
     container: &gtk::Box,
     stack: &gtk::Stack,
@@ -200,6 +292,8 @@ fn build_loaded_page(
     parent: &adw::ApplicationWindow,
     versions: Vec<ImageVersion>,
     dev_mode: bool,
+    current_family: Rc<RefCell<Option<FamilyInfo>>>,
+    selected_features: Rc<RefCell<Vec<String>>>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -407,6 +501,8 @@ fn build_loaded_page(
         let dialog_rc = dialog.clone();
         let parent_rc = parent.clone();
         let stack_rc = stack.clone();
+        let current_family_rc = current_family.clone();
+        let selected_features_rc = selected_features.clone();
 
         rebase_btn.connect_clicked(move |_| {
             let Some(date) = *selected_rc.borrow() else {
@@ -416,13 +512,37 @@ fn build_loaded_page(
                 return;
             };
 
-            let confirm = adw::AlertDialog::builder()
-                .heading("Rebase System?")
-                .body(format!(
+            // Resolve the target image from the feature switches. If a family
+            // is detected, swap the image name in `version.full_ref` to the
+            // one whose suffix matches the selected features (e.g. flipping
+            // `nvidia` on bluefin → `bluefin-nvidia`). If the combination
+            // isn't published, fall back to the booted image so the user
+            // doesn't end up on a bogus ref.
+            let family_ref = current_family_rc.borrow();
+            let target_full_ref = resolve_target_ref(
+                &version.full_ref,
+                family_ref.as_ref(),
+                &selected_features_rc.borrow(),
+            );
+            drop(family_ref);
+            let switching_image = target_full_ref != version.full_ref;
+
+            let body = if switching_image {
+                format!(
+                    "Your system will be rebased to:\n\n{}\n\nThis is a different image variant than what you're currently running. A restart is required and the full image will be re-downloaded.",
+                    target_full_ref,
+                )
+            } else {
+                format!(
                     "Your system will be rebased to the {} build (version {}).\n\nThis requires a restart to take effect and will re-download the full image.",
                     date.format("%B %-d, %Y"),
                     version.version,
-                ))
+                )
+            };
+
+            let confirm = adw::AlertDialog::builder()
+                .heading("Rebase System?")
+                .body(body)
                 .build();
 
             confirm.add_response("cancel", "_Cancel");
@@ -431,7 +551,7 @@ fn build_loaded_page(
             confirm.set_default_response(Some("cancel"));
             confirm.set_close_response("cancel");
 
-            let full_ref = version.full_ref.clone();
+            let full_ref = target_full_ref;
             let stack = stack_rc.clone();
             let dialog_close = dialog_rc.clone();
 
@@ -448,6 +568,36 @@ fn build_loaded_page(
             confirm.present(Some(&parent_rc));
         });
     }
+}
+
+/// Substitute the image name in `registry/org/image:tag` based on the
+/// resolved family + feature selection. Returns the original ref unchanged
+/// if no family was detected or the feature combination has no published
+/// image — keeps us from constructing refs the registry doesn't serve.
+///
+/// Delegates the family → image resolution to the service layer
+/// ([`UpdaterService::resolve_target`]) so a future alternative frontend can
+/// share the same logic without re-implementing it.
+fn resolve_target_ref(
+    full_ref: &str,
+    family: Option<&FamilyInfo>,
+    selected_features: &[String],
+) -> String {
+    let Some(family) = family else {
+        return full_ref.to_string();
+    };
+    let Some(target) = service::global().resolve_target(family, selected_features) else {
+        return full_ref.to_string();
+    };
+    // full_ref = registry/org/image:tag — swap `image` only, preserving the
+    // tag the user picked from the calendar.
+    let Some((before_tag, tag)) = full_ref.rsplit_once(':') else {
+        return full_ref.to_string();
+    };
+    let Some((reg_org, _old_image)) = before_tag.rsplit_once('/') else {
+        return full_ref.to_string();
+    };
+    format!("{reg_org}/{}:{tag}", target.image)
 }
 
 // ── Grid redraw ──────────────────────────────────────────────────────────────
@@ -648,16 +798,50 @@ fn update_details(
 // ── Rebase worker ────────────────────────────────────────────────────────────
 
 fn run_rebase(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog) {
-    // Show a simple progress page while rebasing.
+    // Build a progress page with a pulsing ProgressBar + elapsed-time label.
+    // A live `bootc switch` measured against ghcr.io took 2m28s for a full
+    // dakota-nvidia pull on a residential link — too long for a bare spinner.
+    // Pulse mode (no fraction) is the honest representation until we parse
+    // bootc's per-layer progress lines (task #24 phase 2).
+    let progress_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_top(12)
+        .margin_bottom(24)
+        .build();
+
+    let progress_bar = gtk::ProgressBar::new();
+    progress_bar.set_pulse_step(0.08);
+    progress_box.append(&progress_bar);
+
+    let elapsed_label = gtk::Label::new(Some("Elapsed: 0:00"));
+    elapsed_label.add_css_class("dim-label");
+    elapsed_label.add_css_class("caption");
+    progress_box.append(&elapsed_label);
+
     let progress_page = adw::StatusPage::builder()
         .title("Rebasing…")
-        .description("Switching to the selected image.\nThis may take a few minutes.")
+        .description("Pulling the new image layers. This typically takes 2–5 minutes.")
         .build();
-    let spinner = gtk::Spinner::new();
-    spinner.set_spinning(true);
-    progress_page.set_child(Some(&spinner));
+    progress_page.set_child(Some(&progress_box));
     stack.add_named(&progress_page, Some("rebasing"));
     stack.set_visible_child_name("rebasing");
+
+    // Animate the pulse + elapsed clock until the operation completes.
+    let start = std::time::Instant::now();
+    let bar_clone = progress_bar.clone();
+    let label_clone = elapsed_label.clone();
+    let pulse_handle: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let pulse_handle_store = pulse_handle.clone();
+    let id = glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        bar_clone.pulse();
+        let secs = start.elapsed().as_secs();
+        label_clone.set_text(&format!("Elapsed: {}:{:02}", secs / 60, secs % 60));
+        glib::ControlFlow::Continue
+    });
+    *pulse_handle_store.borrow_mut() = Some(id);
 
     let result_slot: Arc<Mutex<Option<Result<(), String>>>> = Arc::new(Mutex::new(None));
     let result_bg = result_slot.clone();
@@ -678,6 +862,10 @@ fn run_rebase(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog) {
         let Some(result) = result_slot.lock().ok().and_then(|mut g| g.take()) else {
             return glib::ControlFlow::Continue;
         };
+        // Stop the pulse animation now that we have a final result.
+        if let Some(id) = pulse_handle.borrow_mut().take() {
+            id.remove();
+        }
         match result {
             Ok(()) => {
                 // Show success page — user needs to reboot.
@@ -747,6 +935,221 @@ async fn run_bootc_switch(full_ref: &str) -> Result<(), String> {
     }
 }
 
+// ── Family + feature-switch UI ──────────────────────────────────────────────
+
+/// Detect the booted (or mocked) image's Family and render one SwitchRow per
+/// atomic feature. As switches toggle, recompute the target image and write
+/// it into `target_row`'s subtitle. The dialog uses this to show the user
+/// the *resolved* image they'd land on without exposing the raw image names.
+///
+/// Runs the detection on a background thread (the same pattern as
+/// [`spawn_fetch_thread`]) so the dialog stays responsive while bootc/os-release
+/// IO completes.
+fn populate_family_switches(
+    features_group: &adw::PreferencesGroup,
+    family_label: &gtk::Label,
+    target_row: &adw::ActionRow,
+    current_family: Rc<RefCell<Option<FamilyInfo>>>,
+    selected_features: Rc<RefCell<Vec<String>>>,
+) {
+    let slot: Arc<Mutex<Option<Option<FamilyInfo>>>> = Arc::new(Mutex::new(None));
+
+    {
+        let slot = slot.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let detected = rt.block_on(async move {
+                // Migrated from RegistryClient::detect() + Family::best_match
+                // to the service layer. Same observable behaviour (honours
+                // mock_identity, falls through to bootc status, then
+                // os-release) but the UI no longer reaches into the registry
+                // module directly — first step toward an alternative
+                // frontend being able to call the same code path.
+                service::global().current_family().await.ok().flatten()
+            });
+            *slot.lock().unwrap() = Some(detected);
+        });
+    }
+
+    let features_group = features_group.clone();
+    let family_label = family_label.clone();
+    let target_row = target_row.clone();
+
+    glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+        let Some(detected) = slot.lock().ok().and_then(|mut g| g.take()) else {
+            return glib::ControlFlow::Continue;
+        };
+
+        let Some(family) = detected else {
+            family_label.set_label("Family not recognized");
+            target_row.set_subtitle("(this image isn't in the KNOWN_FAMILIES catalogue)");
+            return glib::ControlFlow::Break;
+        };
+
+        family_label.set_label(&format!("Family: {}", family.name));
+        target_row.set_subtitle(&format!("{} (no extras)", family.base_image));
+
+        // Two opinionated toggles instead of one-per-atomic-feature. Per user
+        // direction: "we should have toggle for Developer Mode and Nvidia".
+        // Granular features (hwe, deck, asus, surface, framework) aren't
+        // user-facing here — KNOWN_FAMILIES still lists them so the resolver
+        // can land on a published image if the user is currently booted on
+        // one, but the rebase dialog only exposes the two switches users
+        // think about.
+        let supports_dx = family.features.iter().any(|f| f.id == "dx");
+        let supports_nvidia =
+            family.features.iter().any(|f| f.id == "nvidia" || f.id == "open");
+
+        let dx_state = Rc::new(Cell::new(false));
+        let nvidia_state = Rc::new(Cell::new(false));
+
+        let recompute = {
+            let family = family.clone();
+            let selected_features = selected_features.clone();
+            let target_row = target_row.clone();
+            let dx_state = dx_state.clone();
+            let nvidia_state = nvidia_state.clone();
+            move || {
+                let (feats, target) = resolve_dx_nvidia(
+                    &family,
+                    dx_state.get(),
+                    nvidia_state.get(),
+                );
+                *selected_features.borrow_mut() = feats;
+                match target {
+                    Some(t) => target_row.set_subtitle(&format!("{} (resolved)", t.image)),
+                    None => target_row.set_subtitle(
+                        "(combination doesn't match any published image)",
+                    ),
+                }
+            }
+        };
+
+        if supports_dx {
+            let row = adw::SwitchRow::builder()
+                .title("Developer Mode")
+                .subtitle("Container tools, IDEs, and language SDKs")
+                .build();
+            let recompute_ = recompute.clone();
+            let dx_state_ = dx_state.clone();
+            row.connect_active_notify(move |sr| {
+                dx_state_.set(sr.is_active());
+                recompute_();
+            });
+            features_group.add(&row);
+        }
+
+        if supports_nvidia {
+            let row = adw::SwitchRow::builder()
+                .title("NVIDIA drivers")
+                .subtitle("Picks the open kernel modules where available, falls back to the proprietary driver")
+                .build();
+            // Guard prevents the warn-and-revert path from re-firing this
+            // handler when we programmatically flip the switch back to
+            // its previous state after a "Cancel" on the warning dialog.
+            let nvidia_guard: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+            let recompute_ = recompute.clone();
+            let nvidia_state_ = nvidia_state.clone();
+            let guard_ = nvidia_guard.clone();
+            row.connect_active_notify(move |sr| {
+                if guard_.get() {
+                    return;
+                }
+                let new_value = sr.is_active();
+                let prev_value = nvidia_state_.get();
+                let turning_off = prev_value && !new_value;
+                if turning_off && crate::gpu::has_nvidia_gpu() {
+                    let confirm = adw::AlertDialog::builder()
+                        .heading("NVIDIA hardware detected")
+                        .body("Your system has an NVIDIA GPU. Switching to a non-NVIDIA image will fall back to software rendering or the open Mesa driver — graphics performance will degrade significantly until you switch back.\n\nContinue?")
+                        .build();
+                    confirm.add_response("cancel", "_Cancel");
+                    confirm.add_response("disable", "_Disable anyway");
+                    confirm.set_response_appearance(
+                        "disable",
+                        adw::ResponseAppearance::Destructive,
+                    );
+                    confirm.set_default_response(Some("cancel"));
+                    confirm.set_close_response("cancel");
+
+                    let sr_clone = sr.clone();
+                    let nvidia_state_clone = nvidia_state_.clone();
+                    let recompute_clone = recompute_.clone();
+                    let guard_clone = guard_.clone();
+                    confirm.connect_response(None, move |_, response| {
+                        if response == "disable" {
+                            nvidia_state_clone.set(false);
+                            recompute_clone();
+                        } else {
+                            // Revert the switch back to on without re-firing
+                            // the handler (would re-trigger this dialog).
+                            guard_clone.set(true);
+                            sr_clone.set_active(true);
+                            guard_clone.set(false);
+                        }
+                    });
+                    confirm.present(None::<&gtk::Widget>);
+                    // Don't apply yet — wait for the response callback.
+                    return;
+                }
+                nvidia_state_.set(new_value);
+                recompute_();
+            });
+            features_group.add(&row);
+        }
+
+        *current_family.borrow_mut() = Some(family);
+        glib::ControlFlow::Break
+    });
+}
+
+/// Compute the selected feature set + target image for the current toggle
+/// state. The fallback chain is what makes the single "NVIDIA drivers" switch
+/// usable across the families:
+///
+///   nvidia on, prefer -nvidia-open first (current Bluefin / Bluefin LTS
+///   convention) → fall back to plain -nvidia (Bazzite / deprecated Bluefin
+///   variant). The user just toggles "NVIDIA"; we resolve to whichever
+///   variant their family actually publishes.
+///
+/// Returns (selected_features, resolved_image). The features list flows into
+/// the Rebase button click handler so the bootc-switch ref matches what the
+/// preview shows.
+fn resolve_dx_nvidia(
+    family: &FamilyInfo,
+    dx_on: bool,
+    nvidia_on: bool,
+) -> (Vec<String>, Option<service::ImageRef>) {
+    let svc = service::global();
+    let base: Vec<String> = if dx_on { vec!["dx".to_string()] } else { vec![] };
+
+    if nvidia_on {
+        // Prefer the -open variant (current for Bluefin / Bluefin LTS).
+        let mut with_open = base.clone();
+        with_open.push("nvidia".to_string());
+        with_open.push("open".to_string());
+        if let Some(img) = svc.resolve_target(family, &with_open) {
+            return (with_open, Some(img));
+        }
+        // Fall back to plain -nvidia (Bazzite / Dakota / Bluefin's
+        // pre-migration variant the user might currently be booted on).
+        let mut plain = base.clone();
+        plain.push("nvidia".to_string());
+        let img = svc.resolve_target(family, &plain);
+        return (plain, img);
+    }
+
+    let img = svc.resolve_target(family, &base);
+    (base, img)
+}
+
+// feature_display_name / feature_subtitle moved to service::feature_display_name
+// and the FamilyInfo.features list carries them per Feature. Kept the comment
+// here as a forwarding pointer for archeologists.
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Simulated rebase for dev mode — shows the progress UI then succeeds after a delay.
@@ -792,36 +1195,6 @@ fn run_rebase_simulated(full_ref: String, stack: gtk::Stack, dialog: adw::Dialog
     });
 }
 
-/// Generate mock image versions for the last 30 days (dev mode).
-fn generate_mock_versions() -> Vec<ImageVersion> {
-    use chrono::{Duration, Utc};
-
-    let today = Utc::now().date_naive();
-    let mut versions = Vec::new();
-
-    // Generate a version every 2-3 days over the last 60 days.
-    let mut day_offset = 2i64;
-    let mut build_num = 1u32;
-    while day_offset <= 60 {
-        let date = today - Duration::days(day_offset);
-        versions.push(ImageVersion {
-            date,
-            full_ref: format!(
-                "ghcr.io/ublue-os/bluefin:stable-daily-43.{}",
-                date.format("%Y%m%d")
-            ),
-            version: format!("43.{}", date.format("%Y%m%d")),
-            kernel: format!("6.12.{}-200.fc42.x86_64", build_num),
-            revision: format!("{:08x}", 0xdeadbe00 + build_num),
-            created: date.and_hms_opt(4, 30, 0).unwrap().and_utc(),
-        });
-        day_offset += if build_num % 3 == 0 { 3 } else { 2 };
-        build_num += 1;
-    }
-
-    versions.sort_by_key(|v| v.date);
-    versions
-}
 
 fn days_in_month(date: NaiveDate) -> u32 {
     let next = if date.month() == 12 {
@@ -870,4 +1243,194 @@ enum FetchResult {
     Ok(Vec<ImageVersion>),
     Err(String),
     DetectFailed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+
+    /// Tests need a process-wide UpdaterService since resolve_target_ref calls
+    /// service::global(). Install the default BootcUpdaterService once;
+    /// service::init() will panic on the second call so guard with Once.
+    fn ensure_service() {
+        INIT.call_once(|| {
+            service::init(service::BootcUpdaterService::new());
+        });
+    }
+
+    fn bluefin_stable_info() -> FamilyInfo {
+        // The features list isn't consulted by resolve_target_ref — the
+        // service routes through KNOWN_FAMILIES via family.name — so we leave
+        // it empty here. Service-level tests in service::tests cover the
+        // feature-resolution paths.
+        FamilyInfo {
+            name: "Bluefin Stable".to_string(),
+            base_image: "bluefin".to_string(),
+            features: vec![],
+        }
+    }
+
+    #[test]
+    fn resolve_passthrough_with_no_family() {
+        ensure_service();
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
+            None,
+            &[],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527");
+    }
+
+    #[test]
+    fn resolve_no_features_keeps_base_image() {
+        ensure_service();
+        let fam = bluefin_stable_info();
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
+            Some(&fam),
+            &[],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527");
+    }
+
+    #[test]
+    fn resolve_swaps_image_to_nvidia_variant() {
+        ensure_service();
+        let fam = bluefin_stable_info();
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
+            Some(&fam),
+            &["nvidia".to_string()],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin-nvidia:stable-daily-43.20260527");
+    }
+
+    #[test]
+    fn resolve_combines_dx_and_nvidia() {
+        ensure_service();
+        let fam = bluefin_stable_info();
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin:stable",
+            Some(&fam),
+            &["dx".to_string(), "nvidia".to_string()],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin-dx-nvidia:stable");
+    }
+
+    #[test]
+    fn resolve_unpublished_combination_falls_back() {
+        ensure_service();
+        // "open" alone (without nvidia) isn't a published image — keep the
+        // original ref so we don't pkexec a bogus bootc switch.
+        let fam = bluefin_stable_info();
+        let original = "ghcr.io/ublue-os/bluefin:stable";
+        let r = resolve_target_ref(original, Some(&fam), &["open".to_string()]);
+        assert_eq!(r, original);
+    }
+
+    #[test]
+    fn resolve_handles_missing_tag() {
+        ensure_service();
+        // Defensive: a malformed ref with no ':' should pass through.
+        let fam = bluefin_stable_info();
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin",
+            Some(&fam),
+            &["nvidia".to_string()],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin");
+    }
+
+    // ── resolve_dx_nvidia ────────────────────────────────────────────────
+    // Pins the toggle-to-features fallback chain so the two-switch UI
+    // (Developer Mode + NVIDIA) lands on the right image per family.
+
+    fn dakota_info() -> FamilyInfo {
+        FamilyInfo {
+            name: "Bluefin Dakota".to_string(),
+            base_image: "dakota".to_string(),
+            features: vec![],
+        }
+    }
+
+    fn bazzite_kde_info() -> FamilyInfo {
+        FamilyInfo {
+            name: "Bazzite KDE".to_string(),
+            base_image: "bazzite".to_string(),
+            features: vec![],
+        }
+    }
+
+    #[test]
+    fn dx_nvidia_both_off_returns_base() {
+        ensure_service();
+        let (feats, img) = resolve_dx_nvidia(&bluefin_stable_info(), false, false);
+        assert_eq!(feats, Vec::<String>::new());
+        assert_eq!(img.unwrap().image, "bluefin");
+    }
+
+    #[test]
+    fn dx_nvidia_dx_only_resolves_dx() {
+        ensure_service();
+        let (feats, img) = resolve_dx_nvidia(&bluefin_stable_info(), true, false);
+        assert_eq!(feats, vec!["dx".to_string()]);
+        assert_eq!(img.unwrap().image, "bluefin-dx");
+    }
+
+    #[test]
+    fn dx_nvidia_nvidia_only_on_bluefin_prefers_open() {
+        ensure_service();
+        // Bluefin's plain -nvidia is deprecated; the toggle should land on
+        // -nvidia-open (the current variant).
+        let (feats, img) = resolve_dx_nvidia(&bluefin_stable_info(), false, true);
+        assert_eq!(feats, vec!["nvidia".to_string(), "open".to_string()]);
+        assert_eq!(img.unwrap().image, "bluefin-nvidia-open");
+    }
+
+    #[test]
+    fn dx_nvidia_both_on_bluefin_yields_dx_nvidia_open() {
+        ensure_service();
+        let (feats, img) = resolve_dx_nvidia(&bluefin_stable_info(), true, true);
+        assert_eq!(
+            feats,
+            vec!["dx".to_string(), "nvidia".to_string(), "open".to_string()]
+        );
+        assert_eq!(img.unwrap().image, "bluefin-dx-nvidia-open");
+    }
+
+    #[test]
+    fn dx_nvidia_nvidia_on_dakota_falls_back_to_plain_nvidia() {
+        ensure_service();
+        // Dakota has no -nvidia-open variant published; the first probe
+        // (`["nvidia", "open"]`) misses, the fallback (`["nvidia"]`)
+        // lands on dakota-nvidia.
+        let (feats, img) = resolve_dx_nvidia(&dakota_info(), false, true);
+        assert_eq!(feats, vec!["nvidia".to_string()]);
+        assert_eq!(img.unwrap().image, "dakota-nvidia");
+    }
+
+    #[test]
+    fn dx_nvidia_nvidia_on_bazzite_prefers_open() {
+        ensure_service();
+        // Bazzite KDE publishes both bazzite-nvidia AND bazzite-nvidia-open.
+        // The resolver's -open-first preference picks the latter. Pin this
+        // so a future KNOWN_FAMILIES trim (dropping plain -nvidia) doesn't
+        // silently change which variant new users land on.
+        let (feats, img) = resolve_dx_nvidia(&bazzite_kde_info(), false, true);
+        assert_eq!(feats, vec!["nvidia".to_string(), "open".to_string()]);
+        assert_eq!(img.unwrap().image, "bazzite-nvidia-open");
+    }
+
+    #[test]
+    fn dx_nvidia_dx_on_dakota_has_no_published_image() {
+        ensure_service();
+        // Dakota has no -dx variant — the resolver returns None, the UI
+        // shows the "doesn't match any published image" subtitle.
+        let (feats, img) = resolve_dx_nvidia(&dakota_info(), true, false);
+        assert_eq!(feats, vec!["dx".to_string()]);
+        assert!(img.is_none());
+    }
 }
