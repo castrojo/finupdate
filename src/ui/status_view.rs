@@ -2949,3 +2949,265 @@ fn spawn_changelog_fetch(
         });
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── strip_date_suffix ────────────────────────────────────────────────
+    // Mirror of the parser in registry_client::strip_date_suffix but a
+    // separate implementation lives here for the home page's tag parsing.
+    // Tests guard against the two diverging.
+
+    #[test]
+    fn strip_date_suffix_dot_form() {
+        assert_eq!(
+            strip_date_suffix("stable-daily-43.20260527"),
+            Some("stable-daily-43".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_date_suffix_dash_form() {
+        assert_eq!(
+            strip_date_suffix("lts-hwe-20260224"),
+            Some("lts-hwe".to_string())
+        );
+    }
+
+    #[test]
+    fn strip_date_suffix_rejects_too_short() {
+        assert_eq!(strip_date_suffix("stable-2026"), None);
+    }
+
+    #[test]
+    fn strip_date_suffix_rejects_non_digits() {
+        assert_eq!(strip_date_suffix("stable-20260abc"), None);
+    }
+
+    #[test]
+    fn strip_date_suffix_rejects_no_separator() {
+        assert_eq!(strip_date_suffix("stable20260527"), None);
+    }
+
+    #[test]
+    fn strip_date_suffix_bare_date_returns_none() {
+        // 20260527 alone is 8 digits but has no separator — so strip can't
+        // detect where to split. The bare-date case is owned by
+        // parse_dated_tag with stream==""; strip_date_suffix only handles
+        // prefixed forms.
+        assert_eq!(strip_date_suffix("20260527"), None);
+    }
+
+    // ── parse_image_ref_parts ────────────────────────────────────────────
+
+    #[test]
+    fn parse_image_ref_parts_full_dated() {
+        let r = parse_image_ref_parts("ghcr.io/ublue-os/bluefin:stable-daily-43.20260527");
+        assert_eq!(
+            r,
+            Some((
+                "ghcr.io".to_string(),
+                "ublue-os".to_string(),
+                "bluefin".to_string(),
+                "stable-daily-43".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_image_ref_parts_undated_tag_passes_through() {
+        let r = parse_image_ref_parts("ghcr.io/projectbluefin/dakota:latest");
+        assert_eq!(
+            r,
+            Some((
+                "ghcr.io".to_string(),
+                "projectbluefin".to_string(),
+                "dakota".to_string(),
+                "latest".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_image_ref_parts_rejects_missing_tag() {
+        assert!(parse_image_ref_parts("ghcr.io/ublue-os/bluefin").is_none());
+    }
+
+    #[test]
+    fn parse_image_ref_parts_rejects_two_components() {
+        // Only "registry/image:tag" without an org segment — splitn(3) yields
+        // 2 parts, which the impl rejects to avoid mis-categorising the
+        // registry as the org.
+        assert!(parse_image_ref_parts("ublue-os/bluefin:stable").is_none());
+    }
+
+    // ── parse_image_ref_fields ───────────────────────────────────────────
+
+    #[test]
+    fn parse_image_ref_fields_empty_returns_placeholders() {
+        let (name, tag, org) = parse_image_ref_fields("");
+        assert_eq!(name, "Unknown");
+        assert_eq!(tag, "latest");
+        assert_eq!(org, "unknown");
+    }
+
+    #[test]
+    fn parse_image_ref_fields_full_ref() {
+        let (name, tag, org) = parse_image_ref_fields("ghcr.io/ublue-os/bluefin:stable");
+        assert_eq!(name, "bluefin");
+        assert_eq!(tag, "stable");
+        assert_eq!(org, "ublue-os");
+    }
+
+    #[test]
+    fn parse_image_ref_fields_no_colon_defaults_to_latest() {
+        let (name, tag, org) = parse_image_ref_fields("ghcr.io/projectbluefin/dakota");
+        assert_eq!(name, "dakota");
+        assert_eq!(tag, "latest");
+        assert_eq!(org, "projectbluefin");
+    }
+
+    #[test]
+    fn parse_image_ref_fields_single_segment() {
+        let (name, tag, org) = parse_image_ref_fields("standalone");
+        assert_eq!(name, "standalone");
+        assert_eq!(tag, "latest");
+        assert_eq!(org, "unknown");
+    }
+
+    // ── parse_org_repo ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_org_repo_ghcr_three_parts() {
+        let r = parse_org_repo("ghcr.io/ublue-os/bluefin");
+        assert_eq!(r, Some(("ublue-os".to_string(), "bluefin".to_string())));
+    }
+
+    #[test]
+    fn parse_org_repo_two_parts() {
+        // No registry prefix — treat as org/repo directly.
+        let r = parse_org_repo("ublue-os/bluefin");
+        assert_eq!(r, Some(("ublue-os".to_string(), "bluefin".to_string())));
+    }
+
+    #[test]
+    fn parse_org_repo_strips_docker_prefix() {
+        let r = parse_org_repo("docker://ghcr.io/ublue-os/bluefin");
+        assert_eq!(r, Some(("ublue-os".to_string(), "bluefin".to_string())));
+    }
+
+    #[test]
+    fn parse_org_repo_handles_nested_path() {
+        // GHCR allows nested paths like /org/sub/image. We keep everything
+        // past the first split as the repo so downstream code can construct
+        // a valid GitHub URL.
+        let r = parse_org_repo("ghcr.io/ublue-os/sub/bluefin");
+        assert_eq!(r, Some(("ublue-os".to_string(), "sub/bluefin".to_string())));
+    }
+
+    #[test]
+    fn parse_org_repo_rejects_single_segment() {
+        assert!(parse_org_repo("bluefin").is_none());
+    }
+
+    // ── get_real_deployments_from_json ───────────────────────────────────
+    // Validates the parsing that turns a bootc-status JSON blob into a
+    // list of MockDeployment rows for the history page.
+
+    #[test]
+    fn deployments_parses_booted_only() {
+        // get_real_deployments_from_json uses the "current"/"previous"/
+        // "staged" labels — matching the home-page UI's history row badges
+        // — instead of the raw bootc terms. The mapping:
+        //    status.booted   → state="current"  (the row badged "Active")
+        //    status.rollback → state="previous"
+        //    status.staged   → state="staged"
+        let json: Value = serde_json::from_str(r#"{
+            "status": {
+                "booted": {
+                    "image": {
+                        "image": {"image": "ghcr.io/projectbluefin/dakota:latest"},
+                        "timestamp": "2026-05-28T16:14:49Z",
+                        "imageDigest": "sha256:baea47c64413bc61a6901e99ceb052bee843d05d406fe33513497863074d84ef"
+                    }
+                }
+            }
+        }"#).unwrap();
+        let deps = get_real_deployments_from_json(&json).expect("parses");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].state, "current");
+        assert_eq!(deps[0].title, "dakota");
+        assert_eq!(deps[0].tag, "latest");
+    }
+
+    #[test]
+    fn deployments_parses_booted_and_rollback() {
+        let json: Value = serde_json::from_str(r#"{
+            "status": {
+                "booted": {
+                    "image": {
+                        "image": {"image": "ghcr.io/projectbluefin/dakota:latest"},
+                        "timestamp": "2026-05-28T16:14:49Z",
+                        "imageDigest": "sha256:aaaa"
+                    }
+                },
+                "rollback": {
+                    "image": {
+                        "image": {"image": "ghcr.io/projectbluefin/dakota:latest"},
+                        "timestamp": "2026-05-27T14:21:59Z",
+                        "imageDigest": "sha256:bbbb"
+                    }
+                }
+            }
+        }"#).unwrap();
+        let deps = get_real_deployments_from_json(&json).expect("parses");
+        let states: Vec<&str> = deps.iter().map(|d| d.state.as_str()).collect();
+        assert!(states.contains(&"current"), "states: {states:?}");
+        assert!(states.contains(&"previous"), "states: {states:?}");
+        assert_eq!(deps.len(), 2);
+    }
+
+    #[test]
+    fn deployments_parses_staged_first() {
+        // The function emits in fixed order: staged, current, previous. So
+        // even though staged represents "the next boot", it appears first
+        // in the result vector. Verify that ordering.
+        let json: Value = serde_json::from_str(r#"{
+            "status": {
+                "staged": {
+                    "image": {
+                        "image": {"image": "ghcr.io/projectbluefin/dakota-nvidia:latest"},
+                        "timestamp": "2026-05-30T02:20:28Z",
+                        "imageDigest": "sha256:cccc"
+                    }
+                },
+                "booted": {
+                    "image": {
+                        "image": {"image": "ghcr.io/projectbluefin/dakota:latest"},
+                        "timestamp": "2026-05-28T16:14:49Z",
+                        "imageDigest": "sha256:aaaa"
+                    }
+                }
+            }
+        }"#).unwrap();
+        let deps = get_real_deployments_from_json(&json).expect("parses");
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0].state, "staged");
+        assert_eq!(deps[0].title, "dakota-nvidia");
+        assert_eq!(deps[1].state, "current");
+    }
+
+    #[test]
+    fn deployments_returns_none_for_empty_status() {
+        let json: Value = serde_json::from_str(r#"{"status": {}}"#).unwrap();
+        // No booted entry → can't surface anything useful.
+        assert!(get_real_deployments_from_json(&json).is_none());
+    }
+
+    #[test]
+    fn deployments_returns_none_when_status_missing() {
+        let json: Value = serde_json::from_str(r#"{"apiVersion": "v1"}"#).unwrap();
+        assert!(get_real_deployments_from_json(&json).is_none());
+    }
+}
