@@ -540,7 +540,7 @@ impl RegistryClient {
         }
     }
 
-    pub async fn fetch_versions(&self, days: u32) -> Result<Vec<ImageVersion>, RegistryError> {
+    pub async fn fetch_versions(&self, _days: u32) -> Result<Vec<ImageVersion>, RegistryError> {
         let token = self.get_token().await?;
         let client = self.client.clone();
 
@@ -557,19 +557,15 @@ impl RegistryClient {
             .json()
             .await?;
 
-        // Filter to dated tags for this stream within the window.
-        let cutoff = Utc::now().date_naive() - chrono::Duration::days(days as i64);
+        // Parse every dated tag for this stream. No date-window filter:
+        // CANDIDATE_CAP below already bounds the work, and a window starves
+        // stale variants of history (bluefin-nvidia stopped publishing
+        // stable-daily in 2025-10; ucore in 2023-03 — their last 8 tags
+        // are still the rollback targets users care about).
         let mut candidate_tags: Vec<(NaiveDate, String)> = tag_resp
             .tags
             .iter()
-            .filter_map(|tag| {
-                let date = parse_dated_tag(tag, &self.stream)?;
-                if date >= cutoff {
-                    Some((date, tag.clone()))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|tag| parse_dated_tag(tag, &self.stream).map(|d| (d, tag.clone())))
             .collect();
 
         // Sort by date DESC and cap at HISTORY_MAX, since the home page never
@@ -713,7 +709,11 @@ async fn fetch_version(
         .ok()?;
 
     let manifest: ManifestResponse = resp.json().await.ok()?;
-    let ann = manifest.annotations?;
+    // Older / docker-v2 manifests (e.g. ucore's stable-zfs-* tags) have no
+    // OCI annotations. Treat that as "no metadata" rather than "skip this
+    // version" — we still know the date and ref, which is enough for the
+    // history list to render and for rollback targeting to work.
+    let ann = manifest.annotations.unwrap_or_default();
 
     let version = ann
         .get("org.opencontainers.image.version")
