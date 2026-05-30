@@ -141,6 +141,8 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
     let parent_for_retry = parent.clone();
     let error_page_for_retry = error_page.clone();
     let variant_state_for_retry = variant_state.clone();
+    let current_family_for_retry = current_family.clone();
+    let selected_features_for_retry = selected_features.clone();
     retry_button.connect_clicked(move |_| {
         let variant = variant_state_for_retry.borrow().clone();
         start_version_fetch(
@@ -151,6 +153,8 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
             error_page_for_retry.clone(),
             dev_mode,
             &variant,
+            current_family_for_retry.clone(),
+            selected_features_for_retry.clone(),
         );
     });
 
@@ -178,9 +182,12 @@ pub fn show_rebase_dialog(parent: &adw::ApplicationWindow, dev_mode: bool) {
         error_page.clone(),
         dev_mode,
         &initial_variant,
+        current_family.clone(),
+        selected_features.clone(),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_version_fetch(
     stack: gtk::Stack,
     loaded_box: gtk::Box,
@@ -189,6 +196,8 @@ fn start_version_fetch(
     error_page: adw::StatusPage,
     dev_mode: bool,
     variant: &str,
+    current_family: Rc<RefCell<Option<&'static Family>>>,
+    selected_features: Rc<RefCell<Vec<String>>>,
 ) {
     stack.set_visible_child_name("loading");
     error_page.set_description(Some("Check your internet connection and try again."));
@@ -202,7 +211,16 @@ fn start_version_fetch(
         if let Some(result) = result_slot.lock().ok().and_then(|mut guard| guard.take()) {
             match result {
                 FetchResult::Ok(versions) => {
-                    build_loaded_page(&loaded_box, &stack, &dialog, &parent, versions, dev_mode);
+                    build_loaded_page(
+                        &loaded_box,
+                        &stack,
+                        &dialog,
+                        &parent,
+                        versions,
+                        dev_mode,
+                        current_family.clone(),
+                        selected_features.clone(),
+                    );
                     stack.set_visible_child_name("loaded");
                 }
                 FetchResult::DetectFailed => {
@@ -259,6 +277,7 @@ fn spawn_fetch_thread(result_slot: Arc<Mutex<Option<FetchResult>>>, variant: &st
 
 // ── Loaded page builder ──────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_loaded_page(
     container: &gtk::Box,
     stack: &gtk::Stack,
@@ -266,6 +285,8 @@ fn build_loaded_page(
     parent: &adw::ApplicationWindow,
     versions: Vec<ImageVersion>,
     dev_mode: bool,
+    current_family: Rc<RefCell<Option<&'static Family>>>,
+    selected_features: Rc<RefCell<Vec<String>>>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -473,6 +494,8 @@ fn build_loaded_page(
         let dialog_rc = dialog.clone();
         let parent_rc = parent.clone();
         let stack_rc = stack.clone();
+        let current_family_rc = current_family.clone();
+        let selected_features_rc = selected_features.clone();
 
         rebase_btn.connect_clicked(move |_| {
             let Some(date) = *selected_rc.borrow() else {
@@ -482,13 +505,35 @@ fn build_loaded_page(
                 return;
             };
 
-            let confirm = adw::AlertDialog::builder()
-                .heading("Rebase System?")
-                .body(format!(
+            // Resolve the target image from the feature switches. If a family
+            // is detected, swap the image name in `version.full_ref` to the
+            // one whose suffix matches the selected features (e.g. flipping
+            // `nvidia` on bluefin → `bluefin-nvidia`). If the combination
+            // isn't published, fall back to the booted image so the user
+            // doesn't end up on a bogus ref.
+            let target_full_ref = resolve_target_ref(
+                &version.full_ref,
+                *current_family_rc.borrow(),
+                &selected_features_rc.borrow(),
+            );
+            let switching_image = target_full_ref != version.full_ref;
+
+            let body = if switching_image {
+                format!(
+                    "Your system will be rebased to:\n\n{}\n\nThis is a different image variant than what you're currently running. A restart is required and the full image will be re-downloaded.",
+                    target_full_ref,
+                )
+            } else {
+                format!(
                     "Your system will be rebased to the {} build (version {}).\n\nThis requires a restart to take effect and will re-download the full image.",
                     date.format("%B %-d, %Y"),
                     version.version,
-                ))
+                )
+            };
+
+            let confirm = adw::AlertDialog::builder()
+                .heading("Rebase System?")
+                .body(body)
                 .build();
 
             confirm.add_response("cancel", "_Cancel");
@@ -497,7 +542,7 @@ fn build_loaded_page(
             confirm.set_default_response(Some("cancel"));
             confirm.set_close_response("cancel");
 
-            let full_ref = version.full_ref.clone();
+            let full_ref = target_full_ref;
             let stack = stack_rc.clone();
             let dialog_close = dialog_rc.clone();
 
@@ -514,6 +559,32 @@ fn build_loaded_page(
             confirm.present(Some(&parent_rc));
         });
     }
+}
+
+/// Substitute the image name in `registry/org/image:tag` based on the
+/// resolved family + feature selection. Returns the original ref unchanged
+/// if no family was detected or the feature combination has no published
+/// image — keeps us from constructing refs the registry doesn't serve.
+fn resolve_target_ref(
+    full_ref: &str,
+    family: Option<&'static Family>,
+    selected_features: &[String],
+) -> String {
+    let Some(family) = family else {
+        return full_ref.to_string();
+    };
+    let want: Vec<&str> = selected_features.iter().map(|s| s.as_str()).collect();
+    let Some(target_image) = family.select_image_for_features(&want) else {
+        return full_ref.to_string();
+    };
+    // full_ref = registry/org/image:tag — swap `image` only.
+    let Some((before_tag, tag)) = full_ref.rsplit_once(':') else {
+        return full_ref.to_string();
+    };
+    let Some((reg_org, _old_image)) = before_tag.rsplit_once('/') else {
+        return full_ref.to_string();
+    };
+    format!("{reg_org}/{target_image}:{tag}")
 }
 
 // ── Grid redraw ──────────────────────────────────────────────────────────────
@@ -1037,4 +1108,81 @@ enum FetchResult {
     Ok(Vec<ImageVersion>),
     Err(String),
     DetectFailed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry_client::KNOWN_FAMILIES;
+
+    fn bluefin_stable() -> &'static Family {
+        KNOWN_FAMILIES
+            .iter()
+            .find(|f| f.name == "Bluefin Stable")
+            .expect("Bluefin Stable family present")
+    }
+
+    #[test]
+    fn resolve_passthrough_with_no_family() {
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
+            None,
+            &[],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527");
+    }
+
+    #[test]
+    fn resolve_no_features_keeps_base_image() {
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
+            Some(bluefin_stable()),
+            &[],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527");
+    }
+
+    #[test]
+    fn resolve_swaps_image_to_nvidia_variant() {
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin:stable-daily-43.20260527",
+            Some(bluefin_stable()),
+            &["nvidia".to_string()],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin-nvidia:stable-daily-43.20260527");
+    }
+
+    #[test]
+    fn resolve_combines_dx_and_nvidia() {
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin:stable",
+            Some(bluefin_stable()),
+            &["dx".to_string(), "nvidia".to_string()],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin-dx-nvidia:stable");
+    }
+
+    #[test]
+    fn resolve_unpublished_combination_falls_back() {
+        // "open" alone (without nvidia) isn't a published image — keep the
+        // original ref so we don't pkexec a bogus bootc switch.
+        let original = "ghcr.io/ublue-os/bluefin:stable";
+        let r = resolve_target_ref(
+            original,
+            Some(bluefin_stable()),
+            &["open".to_string()],
+        );
+        assert_eq!(r, original);
+    }
+
+    #[test]
+    fn resolve_handles_missing_tag() {
+        // Defensive: a malformed ref with no ':' should pass through.
+        let r = resolve_target_ref(
+            "ghcr.io/ublue-os/bluefin",
+            Some(bluefin_stable()),
+            &["nvidia".to_string()],
+        );
+        assert_eq!(r, "ghcr.io/ublue-os/bluefin");
+    }
 }
