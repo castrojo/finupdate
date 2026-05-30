@@ -44,6 +44,63 @@ use tokio::sync::mpsc;
 // re-exports change to use the new path — single point of update.
 pub use crate::registry_client::ImageVersion;
 
+/// Registry I/O surface that `BootcUpdaterService` depends on.
+///
+/// Lifting this to a trait lets tests inject a fixture-backed implementation
+/// (see `FixtureRegistry` in this module's tests) so we can verify
+/// list_versions / current_image edge cases without hitting live ghcr.io.
+/// The single production impl, `HttpRegistry`, wraps the existing
+/// `registry_client` free functions and is a 1:1 behavioural replacement
+/// for the direct calls that were inline in BootcUpdaterService.
+#[async_trait::async_trait]
+pub trait Registry: Send + Sync {
+    /// Fetch the recent ImageVersions for an image, newest-first, capped at
+    /// CANDIDATE_CAP=8 by the underlying implementation. Honours the
+    /// config-blob date harvest fallback for sha-only-tagged images.
+    async fn fetch_versions(
+        &self,
+        image: &ImageRef,
+    ) -> Result<Vec<ImageVersion>, ServiceError>;
+
+    /// Detect the currently-booted image, honouring mock_identity →
+    /// bootc status → os-release in that order. Returns None when nothing
+    /// in the chain produces a usable ref.
+    async fn detect_booted_image(&self) -> Option<ImageRef>;
+}
+
+/// Production Registry implementation backed by the existing
+/// `registry_client` module (live ghcr.io + bootc + os-release).
+pub struct HttpRegistry;
+
+#[async_trait::async_trait]
+impl Registry for HttpRegistry {
+    async fn fetch_versions(
+        &self,
+        image: &ImageRef,
+    ) -> Result<Vec<ImageVersion>, ServiceError> {
+        let client = crate::registry_client::RegistryClient::new(
+            &image.registry,
+            &image.org,
+            &image.image,
+            &image.tag,
+        );
+        client
+            .fetch_versions(0)
+            .await
+            .map_err(|e| ServiceError::Registry(e.to_string()))
+    }
+
+    async fn detect_booted_image(&self) -> Option<ImageRef> {
+        let client = crate::registry_client::RegistryClient::detect().await?;
+        Some(ImageRef {
+            registry: "ghcr.io".to_string(),
+            org: client.org().to_string(),
+            image: client.image().to_string(),
+            tag: client.stream().to_string(),
+        })
+    }
+}
+
 /// A reference to an OCI image as `registry/org/image:tag`.
 ///
 /// Mirrors the canonical bootc spec format. Frontends construct one of these
@@ -211,43 +268,50 @@ pub fn global() -> Arc<dyn UpdaterService> {
 
 /// Default in-process implementation backed by the existing registry_client
 /// and orchestrator modules. Constructed once at app startup and passed to
-/// UI components as `Arc<dyn UpdaterService>`.
-pub struct BootcUpdaterService;
+/// UI components as `Arc<dyn UpdaterService>`. The Registry dependency is
+/// injected so tests can swap a fixture-backed impl in.
+pub struct BootcUpdaterService {
+    registry: Arc<dyn Registry>,
+}
 
 impl BootcUpdaterService {
     pub fn new() -> Arc<dyn UpdaterService> {
-        Arc::new(Self)
+        Self::with_registry(Arc::new(HttpRegistry))
+    }
+
+    /// Construct a service with a caller-supplied Registry. Used by tests
+    /// to inject a fixture, and by future frontends that might want to
+    /// front a non-OCI source (a local cache, a different registry, etc.).
+    pub fn with_registry(registry: Arc<dyn Registry>) -> Arc<dyn UpdaterService> {
+        Arc::new(Self { registry })
     }
 }
 
 impl Default for BootcUpdaterService {
     fn default() -> Self {
-        Self
+        Self {
+            registry: Arc::new(HttpRegistry),
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl UpdaterService for BootcUpdaterService {
     async fn current_image(&self) -> Result<ImageRef, ServiceError> {
-        let client = crate::registry_client::RegistryClient::detect()
+        self.registry
+            .detect_booted_image()
             .await
-            .ok_or_else(|| ServiceError::NotFound("no booted image detected".into()))?;
-        Ok(ImageRef {
-            registry: "ghcr.io".to_string(),
-            org: client.org().to_string(),
-            image: client.image().to_string(),
-            tag: client.stream().to_string(),
-        })
+            .ok_or_else(|| ServiceError::NotFound("no booted image detected".into()))
     }
 
     async fn current_family(&self) -> Result<Option<FamilyInfo>, ServiceError> {
-        let Some(client) = crate::registry_client::RegistryClient::detect().await else {
+        let Some(image) = self.registry.detect_booted_image().await else {
             return Ok(None);
         };
         let Some(fam) = crate::registry_client::Family::best_match(
-            client.org(),
-            client.image(),
-            client.stream(),
+            &image.org,
+            &image.image,
+            &image.tag,
         ) else {
             return Ok(None);
         };
@@ -272,16 +336,7 @@ impl UpdaterService for BootcUpdaterService {
         image: &ImageRef,
         max: usize,
     ) -> Result<Vec<ImageVersion>, ServiceError> {
-        let client = crate::registry_client::RegistryClient::new(
-            &image.registry,
-            &image.org,
-            &image.image,
-            &image.tag,
-        );
-        let mut versions = client
-            .fetch_versions(0)
-            .await
-            .map_err(|e| ServiceError::Registry(e.to_string()))?;
+        let mut versions = self.registry.fetch_versions(image).await?;
         versions.sort_by(|a, b| b.date.cmp(&a.date));
         versions.truncate(max);
         Ok(versions)
@@ -355,6 +410,10 @@ fn feature_subtitle(feat: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{NaiveDate, TimeZone};
+    use std::sync::Mutex;
+
+    // ── ImageRef ─────────────────────────────────────────────────────────
 
     #[test]
     fn image_ref_parse_roundtrip() {
@@ -379,30 +438,282 @@ mod tests {
         assert!(ImageRef::parse("ublue-os/bluefin:stable").is_none());
     }
 
+    #[test]
+    fn image_ref_handles_image_with_slashes() {
+        // GHCR allows nested namespaces like ghcr.io/org/sub/image:tag.
+        // ImageRef::parse should keep the whole "sub/image" segment as image.
+        let r = ImageRef::parse("ghcr.io/projectbluefin/dakota:latest").unwrap();
+        assert_eq!(r.image, "dakota");
+    }
+
+    // ── Fixture Registry for service-layer tests ─────────────────────────
+
+    /// In-memory Registry impl that returns whatever the test put in. The
+    /// records counter lets tests assert that a method was actually invoked
+    /// — useful for confirming caching paths or default-image fallthrough.
+    struct FixtureRegistry {
+        booted: Option<ImageRef>,
+        versions: std::collections::HashMap<String, Vec<ImageVersion>>,
+        fetch_versions_calls: Mutex<u32>,
+        detect_calls: Mutex<u32>,
+    }
+
+    impl FixtureRegistry {
+        fn new() -> Self {
+            Self {
+                booted: None,
+                versions: std::collections::HashMap::new(),
+                fetch_versions_calls: Mutex::new(0),
+                detect_calls: Mutex::new(0),
+            }
+        }
+
+        fn with_booted(mut self, image: ImageRef) -> Self {
+            self.booted = Some(image);
+            self
+        }
+
+        fn with_versions(mut self, image: &ImageRef, versions: Vec<ImageVersion>) -> Self {
+            self.versions.insert(image.as_string(), versions);
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Registry for FixtureRegistry {
+        async fn fetch_versions(
+            &self,
+            image: &ImageRef,
+        ) -> Result<Vec<ImageVersion>, ServiceError> {
+            *self.fetch_versions_calls.lock().unwrap() += 1;
+            self.versions
+                .get(&image.as_string())
+                .cloned()
+                .ok_or_else(|| ServiceError::NotFound(format!("no fixture for {image}")))
+        }
+
+        async fn detect_booted_image(&self) -> Option<ImageRef> {
+            *self.detect_calls.lock().unwrap() += 1;
+            self.booted.clone()
+        }
+    }
+
+    fn dummy_version(date: &str, version: &str, full_ref: &str) -> ImageVersion {
+        let d = NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("valid date");
+        ImageVersion {
+            date: d,
+            full_ref: full_ref.to_string(),
+            version: version.to_string(),
+            kernel: String::new(),
+            revision: String::new(),
+            created: chrono::Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0).unwrap()),
+        }
+    }
+
+    fn dakota_ref() -> ImageRef {
+        ImageRef {
+            registry: "ghcr.io".to_string(),
+            org: "projectbluefin".to_string(),
+            image: "dakota".to_string(),
+            tag: "latest".to_string(),
+        }
+    }
+
+    // ── current_image: routes through Registry::detect_booted_image ──────
+
+    #[tokio::test]
+    async fn current_image_returns_booted_from_registry() {
+        let reg = Arc::new(
+            FixtureRegistry::new().with_booted(dakota_ref()),
+        );
+        let svc = BootcUpdaterService::with_registry(reg.clone());
+        let got = svc.current_image().await.unwrap();
+        assert_eq!(got, dakota_ref());
+    }
+
+    #[tokio::test]
+    async fn current_image_not_found_when_registry_has_none() {
+        let reg = Arc::new(FixtureRegistry::new());
+        let svc = BootcUpdaterService::with_registry(reg);
+        let err = svc.current_image().await.unwrap_err();
+        assert!(
+            matches!(err, ServiceError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    // ── current_family: maps detection → FamilyInfo via KNOWN_FAMILIES ───
+
+    #[tokio::test]
+    async fn current_family_matches_dakota() {
+        let reg = Arc::new(
+            FixtureRegistry::new().with_booted(dakota_ref()),
+        );
+        let svc = BootcUpdaterService::with_registry(reg);
+        let fam = svc.current_family().await.unwrap().expect("dakota in KNOWN");
+        assert_eq!(fam.name, "Bluefin Dakota");
+        assert_eq!(fam.base_image, "dakota");
+        // Dakota has a single feature: nvidia (per the trimmed KNOWN_FAMILIES).
+        let ids: Vec<&str> = fam.features.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, vec!["nvidia"]);
+        assert_eq!(fam.features[0].display_name, "NVIDIA drivers (proprietary)");
+    }
+
+    #[tokio::test]
+    async fn current_family_matches_bluefin_stable_with_full_feature_slate() {
+        let reg = Arc::new(FixtureRegistry::new().with_booted(ImageRef {
+            registry: "ghcr.io".to_string(),
+            org: "ublue-os".to_string(),
+            image: "bluefin".to_string(),
+            tag: "stable".to_string(),
+        }));
+        let svc = BootcUpdaterService::with_registry(reg);
+        let fam = svc.current_family().await.unwrap().expect("bluefin in KNOWN");
+        assert_eq!(fam.name, "Bluefin Stable");
+        // Should include at least nvidia, open, dx (alphabetical from
+        // Family::available_features).
+        let ids: Vec<&str> = fam.features.iter().map(|f| f.id.as_str()).collect();
+        assert!(ids.contains(&"nvidia"), "features missing nvidia: {ids:?}");
+        assert!(ids.contains(&"open"), "features missing open: {ids:?}");
+        assert!(ids.contains(&"dx"), "features missing dx: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn current_family_returns_none_for_unknown_image() {
+        let reg = Arc::new(FixtureRegistry::new().with_booted(ImageRef {
+            registry: "ghcr.io".to_string(),
+            org: "some-other-org".to_string(),
+            image: "random-image".to_string(),
+            tag: "latest".to_string(),
+        }));
+        let svc = BootcUpdaterService::with_registry(reg);
+        assert!(svc.current_family().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn current_family_returns_none_when_nothing_booted() {
+        let reg = Arc::new(FixtureRegistry::new());
+        let svc = BootcUpdaterService::with_registry(reg);
+        assert!(svc.current_family().await.unwrap().is_none());
+    }
+
+    // ── list_versions: sort + truncate + Registry pass-through ───────────
+
+    #[tokio::test]
+    async fn list_versions_returns_sorted_newest_first() {
+        let img = dakota_ref();
+        let reg = Arc::new(FixtureRegistry::new().with_versions(
+            &img,
+            vec![
+                dummy_version("2026-02-10", "0.1", "ghcr.io/projectbluefin/dakota:latest.20260210"),
+                dummy_version("2026-02-12", "0.3", "ghcr.io/projectbluefin/dakota:latest.20260212"),
+                dummy_version("2026-02-11", "0.2", "ghcr.io/projectbluefin/dakota:latest.20260211"),
+            ],
+        ));
+        let svc = BootcUpdaterService::with_registry(reg);
+        let got = svc.list_versions(&img, 8).await.unwrap();
+        let dates: Vec<&str> = got.iter().map(|v| v.version.as_str()).collect();
+        assert_eq!(dates, vec!["0.3", "0.2", "0.1"]);
+    }
+
+    #[tokio::test]
+    async fn list_versions_truncates_to_max() {
+        let img = dakota_ref();
+        let mut versions = vec![];
+        for day in 1..=15u32 {
+            versions.push(dummy_version(
+                &format!("2026-02-{:02}", day),
+                &format!("0.{day}"),
+                &format!("ghcr.io/projectbluefin/dakota:latest.202602{:02}", day),
+            ));
+        }
+        let reg = Arc::new(FixtureRegistry::new().with_versions(&img, versions));
+        let svc = BootcUpdaterService::with_registry(reg);
+        let got = svc.list_versions(&img, 8).await.unwrap();
+        assert_eq!(got.len(), 8);
+        // Confirm we got the 8 *newest* (days 8..=15), not the first 8.
+        assert_eq!(got[0].version, "0.15");
+        assert_eq!(got[7].version, "0.8");
+    }
+
+    #[tokio::test]
+    async fn list_versions_propagates_registry_error() {
+        let img = dakota_ref();
+        // FixtureRegistry returns NotFound for unset images.
+        let reg = Arc::new(FixtureRegistry::new());
+        let svc = BootcUpdaterService::with_registry(reg);
+        let err = svc.list_versions(&img, 8).await.unwrap_err();
+        assert!(matches!(err, ServiceError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn list_versions_handles_empty_result() {
+        let img = dakota_ref();
+        let reg = Arc::new(FixtureRegistry::new().with_versions(&img, vec![]));
+        let svc = BootcUpdaterService::with_registry(reg);
+        let got = svc.list_versions(&img, 8).await.unwrap();
+        assert_eq!(got.len(), 0);
+    }
+
+    // ── resolve_target ───────────────────────────────────────────────────
+
     #[tokio::test]
     async fn resolve_target_routes_to_known_family() {
-        let svc = BootcUpdaterService;
+        let svc = BootcUpdaterService::default();
         let family = FamilyInfo {
             name: "Bluefin Stable".to_string(),
             base_image: "bluefin".to_string(),
             features: vec![],
         };
-        let r = svc.resolve_target(&family, &["nvidia".to_string()]);
-        assert!(r.is_some());
-        let r = r.unwrap();
+        let r = svc.resolve_target(&family, &["nvidia".to_string()]).unwrap();
         assert_eq!(r.image, "bluefin-nvidia");
     }
 
     #[tokio::test]
     async fn resolve_target_returns_none_for_unpublished_combo() {
-        let svc = BootcUpdaterService;
+        let svc = BootcUpdaterService::default();
         let family = FamilyInfo {
             name: "Bluefin Stable".to_string(),
             base_image: "bluefin".to_string(),
             features: vec![],
         };
         // "open" alone (without nvidia) isn't a published Bluefin image.
-        let r = svc.resolve_target(&family, &["open".to_string()]);
-        assert!(r.is_none());
+        assert!(svc.resolve_target(&family, &["open".to_string()]).is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_target_handles_dakota_nvidia_combo() {
+        // Verify the trimmed Dakota family resolves correctly — only
+        // dakota and dakota-nvidia exist on GHCR.
+        let svc = BootcUpdaterService::default();
+        let family = FamilyInfo {
+            name: "Bluefin Dakota".to_string(),
+            base_image: "dakota".to_string(),
+            features: vec![],
+        };
+        let r = svc.resolve_target(&family, &["nvidia".to_string()]).unwrap();
+        assert_eq!(r.image, "dakota-nvidia");
+        // dakota-dx is a ghost variant, must not resolve.
+        assert!(svc.resolve_target(&family, &["dx".to_string()]).is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_target_returns_none_for_unknown_family_name() {
+        let svc = BootcUpdaterService::default();
+        let family = FamilyInfo {
+            name: "Fictional Family".to_string(),
+            base_image: "imaginary".to_string(),
+            features: vec![],
+        };
+        assert!(svc.resolve_target(&family, &[]).is_none());
+    }
+
+    // ── switch_image still unimplemented ─────────────────────────────────
+
+    #[tokio::test]
+    async fn switch_image_is_unsupported_until_phase2() {
+        let svc = BootcUpdaterService::default();
+        let err = svc.switch_image(&dakota_ref()).await.unwrap_err();
+        assert!(matches!(err, ServiceError::Unsupported(_)));
     }
 }
