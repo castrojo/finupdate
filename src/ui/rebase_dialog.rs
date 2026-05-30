@@ -21,7 +21,7 @@
 use adw::prelude::*;
 use chrono::{Datelike, Local, NaiveDate};
 use gtk::glib;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -992,51 +992,113 @@ fn populate_family_switches(
         family_label.set_label(&format!("Family: {}", family.name));
         target_row.set_subtitle(&format!("{} (no extras)", family.base_image));
 
-        // Build one SwitchRow per feature. Each row's connect_active_notify
-        // closure captures a snapshot of the family (cheap clone) so it can
-        // resolve the target image via the service without re-borrowing
-        // current_family — that Rc<RefCell> is also being read by the
-        // Rebase button click handler at the same time.
-        for feature in &family.features {
-            let row = adw::SwitchRow::builder()
-                .title(&feature.display_name)
-                .subtitle(&feature.subtitle)
-                .build();
+        // Two opinionated toggles instead of one-per-atomic-feature. Per user
+        // direction: "we should have toggle for Developer Mode and Nvidia".
+        // Granular features (hwe, deck, asus, surface, framework) aren't
+        // user-facing here — KNOWN_FAMILIES still lists them so the resolver
+        // can land on a published image if the user is currently booted on
+        // one, but the rebase dialog only exposes the two switches users
+        // think about.
+        let supports_dx = family.features.iter().any(|f| f.id == "dx");
+        let supports_nvidia =
+            family.features.iter().any(|f| f.id == "nvidia" || f.id == "open");
 
-            let feature_id = feature.id.clone();
+        let dx_state = Rc::new(Cell::new(false));
+        let nvidia_state = Rc::new(Cell::new(false));
+
+        let recompute = {
+            let family = family.clone();
             let selected_features = selected_features.clone();
-            let family_snapshot = family.clone();
             let target_row = target_row.clone();
-            row.connect_active_notify(move |sr| {
-                let active = sr.is_active();
-                let mut feats = selected_features.borrow_mut();
-                if active {
-                    if !feats.iter().any(|f| f == &feature_id) {
-                        feats.push(feature_id.clone());
-                    }
-                } else {
-                    feats.retain(|f| f != &feature_id);
+            let dx_state = dx_state.clone();
+            let nvidia_state = nvidia_state.clone();
+            move || {
+                let (feats, target) = resolve_dx_nvidia(
+                    &family,
+                    dx_state.get(),
+                    nvidia_state.get(),
+                );
+                *selected_features.borrow_mut() = feats;
+                match target {
+                    Some(t) => target_row.set_subtitle(&format!("{} (resolved)", t.image)),
+                    None => target_row.set_subtitle(
+                        "(combination doesn't match any published image)",
+                    ),
                 }
-                let snapshot_feats = feats.clone();
-                drop(feats);
-                match service::global().resolve_target(&family_snapshot, &snapshot_feats) {
-                    Some(target) => {
-                        target_row.set_subtitle(&format!("{} (resolved)", target.image));
-                    }
-                    None => {
-                        target_row.set_subtitle(
-                            "(combination doesn't match any published image)",
-                        );
-                    }
-                }
-            });
+            }
+        };
 
+        if supports_dx {
+            let row = adw::SwitchRow::builder()
+                .title("Developer Mode")
+                .subtitle("Container tools, IDEs, and language SDKs")
+                .build();
+            let recompute_ = recompute.clone();
+            let dx_state_ = dx_state.clone();
+            row.connect_active_notify(move |sr| {
+                dx_state_.set(sr.is_active());
+                recompute_();
+            });
+            features_group.add(&row);
+        }
+
+        if supports_nvidia {
+            let row = adw::SwitchRow::builder()
+                .title("NVIDIA drivers")
+                .subtitle("Picks the open kernel modules where available, falls back to the proprietary driver")
+                .build();
+            let recompute_ = recompute.clone();
+            let nvidia_state_ = nvidia_state.clone();
+            row.connect_active_notify(move |sr| {
+                nvidia_state_.set(sr.is_active());
+                recompute_();
+            });
             features_group.add(&row);
         }
 
         *current_family.borrow_mut() = Some(family);
         glib::ControlFlow::Break
     });
+}
+
+/// Compute the selected feature set + target image for the current toggle
+/// state. The fallback chain is what makes the single "NVIDIA drivers" switch
+/// usable across the families:
+///
+///   nvidia on, prefer -nvidia-open first (current Bluefin / Bluefin LTS
+///   convention) → fall back to plain -nvidia (Bazzite / deprecated Bluefin
+///   variant). The user just toggles "NVIDIA"; we resolve to whichever
+///   variant their family actually publishes.
+///
+/// Returns (selected_features, resolved_image). The features list flows into
+/// the Rebase button click handler so the bootc-switch ref matches what the
+/// preview shows.
+fn resolve_dx_nvidia(
+    family: &FamilyInfo,
+    dx_on: bool,
+    nvidia_on: bool,
+) -> (Vec<String>, Option<service::ImageRef>) {
+    let svc = service::global();
+    let base: Vec<String> = if dx_on { vec!["dx".to_string()] } else { vec![] };
+
+    if nvidia_on {
+        // Prefer the -open variant (current for Bluefin / Bluefin LTS).
+        let mut with_open = base.clone();
+        with_open.push("nvidia".to_string());
+        with_open.push("open".to_string());
+        if let Some(img) = svc.resolve_target(family, &with_open) {
+            return (with_open, Some(img));
+        }
+        // Fall back to plain -nvidia (Bazzite / Dakota / Bluefin's
+        // pre-migration variant the user might currently be booted on).
+        let mut plain = base.clone();
+        plain.push("nvidia".to_string());
+        let img = svc.resolve_target(family, &plain);
+        return (plain, img);
+    }
+
+    let img = svc.resolve_target(family, &base);
+    (base, img)
 }
 
 // feature_display_name / feature_subtitle moved to service::feature_display_name
@@ -1235,5 +1297,95 @@ mod tests {
             &["nvidia".to_string()],
         );
         assert_eq!(r, "ghcr.io/ublue-os/bluefin");
+    }
+
+    // ── resolve_dx_nvidia ────────────────────────────────────────────────
+    // Pins the toggle-to-features fallback chain so the two-switch UI
+    // (Developer Mode + NVIDIA) lands on the right image per family.
+
+    fn dakota_info() -> FamilyInfo {
+        FamilyInfo {
+            name: "Bluefin Dakota".to_string(),
+            base_image: "dakota".to_string(),
+            features: vec![],
+        }
+    }
+
+    fn bazzite_kde_info() -> FamilyInfo {
+        FamilyInfo {
+            name: "Bazzite KDE".to_string(),
+            base_image: "bazzite".to_string(),
+            features: vec![],
+        }
+    }
+
+    #[test]
+    fn dx_nvidia_both_off_returns_base() {
+        ensure_service();
+        let (feats, img) = resolve_dx_nvidia(&bluefin_stable_info(), false, false);
+        assert_eq!(feats, Vec::<String>::new());
+        assert_eq!(img.unwrap().image, "bluefin");
+    }
+
+    #[test]
+    fn dx_nvidia_dx_only_resolves_dx() {
+        ensure_service();
+        let (feats, img) = resolve_dx_nvidia(&bluefin_stable_info(), true, false);
+        assert_eq!(feats, vec!["dx".to_string()]);
+        assert_eq!(img.unwrap().image, "bluefin-dx");
+    }
+
+    #[test]
+    fn dx_nvidia_nvidia_only_on_bluefin_prefers_open() {
+        ensure_service();
+        // Bluefin's plain -nvidia is deprecated; the toggle should land on
+        // -nvidia-open (the current variant).
+        let (feats, img) = resolve_dx_nvidia(&bluefin_stable_info(), false, true);
+        assert_eq!(feats, vec!["nvidia".to_string(), "open".to_string()]);
+        assert_eq!(img.unwrap().image, "bluefin-nvidia-open");
+    }
+
+    #[test]
+    fn dx_nvidia_both_on_bluefin_yields_dx_nvidia_open() {
+        ensure_service();
+        let (feats, img) = resolve_dx_nvidia(&bluefin_stable_info(), true, true);
+        assert_eq!(
+            feats,
+            vec!["dx".to_string(), "nvidia".to_string(), "open".to_string()]
+        );
+        assert_eq!(img.unwrap().image, "bluefin-dx-nvidia-open");
+    }
+
+    #[test]
+    fn dx_nvidia_nvidia_on_dakota_falls_back_to_plain_nvidia() {
+        ensure_service();
+        // Dakota has no -nvidia-open variant published; the first probe
+        // (`["nvidia", "open"]`) misses, the fallback (`["nvidia"]`)
+        // lands on dakota-nvidia.
+        let (feats, img) = resolve_dx_nvidia(&dakota_info(), false, true);
+        assert_eq!(feats, vec!["nvidia".to_string()]);
+        assert_eq!(img.unwrap().image, "dakota-nvidia");
+    }
+
+    #[test]
+    fn dx_nvidia_nvidia_on_bazzite_prefers_open() {
+        ensure_service();
+        // Bazzite KDE publishes both bazzite-nvidia AND bazzite-nvidia-open.
+        // The resolver's -open-first preference picks the latter. Pin this
+        // so a future KNOWN_FAMILIES trim (dropping plain -nvidia) doesn't
+        // silently change which variant new users land on.
+        let (feats, img) = resolve_dx_nvidia(&bazzite_kde_info(), false, true);
+        assert_eq!(feats, vec!["nvidia".to_string(), "open".to_string()]);
+        assert_eq!(img.unwrap().image, "bazzite-nvidia-open");
+    }
+
+    #[test]
+    fn dx_nvidia_dx_on_dakota_has_no_published_image() {
+        ensure_service();
+        // Dakota has no -dx variant — the resolver returns None, the UI
+        // shows the "doesn't match any published image" subtitle.
+        let (feats, img) = resolve_dx_nvidia(&dakota_info(), true, false);
+        assert_eq!(feats, vec!["dx".to_string()]);
+        assert!(img.is_none());
     }
 }
